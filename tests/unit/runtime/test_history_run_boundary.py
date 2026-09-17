@@ -299,6 +299,11 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "all rewrite that outbound copy and leave persist untouched, so what "
         "this reads is the whole of what goes on the wire"
     ),
+    "protocore/runtime/history_persist.py::persist_history": _whole(
+        "hands the session store what changed in the session transcript: what "
+        "is persisted is the whole of what the session has said, because that "
+        "is what the next process reads back when it seeds an engine"
+    ),
     "protocore/runtime/result_eviction.py::evict_history_for_llm": _whole(
         "prompt assembly over the sequence it is handed: replaces unmarked "
         "Read/Grep results in the outbound copy"
