@@ -151,7 +151,7 @@ from protocore.runtime.answer_narration import leading_narration_span
 from protocore.runtime.context.compaction import (
     CompactionExhaustedError,
     current_tool_batch_protect_index,
-    estimate_history_tokens,
+    estimate_history_tokens_uncalibrated,
 )
 from protocore.runtime.context.manager import ContextBundle
 from protocore.runtime.error_kinds import (
@@ -159,6 +159,7 @@ from protocore.runtime.error_kinds import (
     # reports a run's terminal kind reads it from the driver it drives.
 )
 from protocore.runtime.events import BlockVisibility, EventType, TurnEvent
+from protocore.runtime.history_persist import persist_history
 from protocore.runtime.intent import (
     RESERVED,
     SETTLED,
@@ -206,7 +207,6 @@ from protocore.runtime.skill_index import (
     render_skills_catalog,
 )
 from protocore.runtime.subagent_budget import SubagentTreeBudget, SubagentTreePermit
-from protocore.runtime.token_counting import estimate_tokens
 from protocore.runtime.tool_arguments import argument_names, string_argument
 from protocore.runtime.tool_dispatch import (
     DISPATCH_POST_TOOL_OUTPUT_MODIFIED_METADATA_KEY,
@@ -224,6 +224,12 @@ from protocore.runtime.tool_dispatch import (
     _record_tool_call_soft_cap_warning,
 )
 from protocore.runtime.tool_permission import ToolPermissionGate
+from protocore.runtime.tool_surface import (
+    note_surface_described,
+    read_tool_surface,
+    surface_needs_describing,
+    tool_surface_tokens,
+)
 from protocore.runtime.turn_policies import (
     RunCounter,
     TurnPolicyRegistry,
@@ -1251,9 +1257,7 @@ async def _maybe_place_background_wakes(
             content_blocks=[TextBlock(text=text)],
         )
     )
-    persister = getattr(engine, "persist_session_history", None)
-    if callable(persister):
-        persister(engine)
+    persist_history(engine)
     return _BackgroundWakeOutcome(
         task_ids=tuple(ids), detached_reason=detached_reason
     )
@@ -1546,10 +1550,20 @@ def _provider_call_category(engine: QueryEngine) -> str:
     return "agent_call"
 
 
+@dataclass(frozen=True)
+class _ToolSurfaceAdvert:
+    """One advertisement, and what claiming it would cost if it is delivered."""
+
+    payload: dict[str, object]
+    digest: str
+    audience: str
+    describes: bool
+
+
 def _tool_surface_advertised_payload(
     engine: QueryEngine,
     context: ContextBundle,
-) -> dict[str, object]:
+) -> _ToolSurfaceAdvert:
     """The exact tool list sent to the provider, and what each of those tools does.
 
     The roles ride along because the runtime is no longer the only reader that
@@ -1560,6 +1574,24 @@ def _tool_surface_advertised_payload(
     scope that renamed its shell tool got a destructive command drawn as
     something harmless. The map is the host's answer to that question, so it is
     the thing to publish, rather than leaving every reader to guess again.
+
+    What each tool DOES, though, is the same answer on every run of a
+    deployment, and publishing it per run made a store of these events a store
+    of one description repeated: 36 KB apiece, and the descriptions were all of
+    it. So the surface is named by ``tool_surface_digest``, and the
+    descriptions travel with the first advertisement of that digest to reach
+    each reader — the session, which is the unit a host fans events out over,
+    so the runs of one session share one description and a client that
+    connected for a later session still gets its own.
+    ``tool_surface_described`` says which kind of advertisement this is; a
+    reader keeps the descriptions against the digest, looks them up when they
+    are absent, and can ask the host for them by digest if it has none. What is
+    run-specific — which tools are on the surface, why each is there, what
+    roles they carry — is in every advertisement, because that is what changes.
+
+    Nothing is claimed here. The advertisement says what it says, and the
+    caller records the claim once the event has actually been handed to the
+    stream.
     """
 
     policy = engine.effective_tool_policy
@@ -1567,7 +1599,10 @@ def _tool_surface_advertised_payload(
     toolsearch_pins = frozenset(engine.context_manager.pinned_tool_names())
     forced_pins = frozenset(policy.forced_pinned)
     configured_pins = frozenset(policy.pinned) - toolsearch_pins
-    tool_names = [tool.name for tool in context.tools]
+    surface = read_tool_surface(context.tools)
+    audience = engine.config.session_id or engine.config.run_id
+    describe = surface_needs_describing(surface.digest, audience)
+    tool_names = list(surface.names)
     tools: list[dict[str, object]] = []
     for tool in context.tools:
         sources: list[str] = []
@@ -1579,18 +1614,20 @@ def _tool_surface_advertised_payload(
             sources.append("forced_pin")
         if not sources:
             sources.append("retrieved_or_visible")
-        tools.append(
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "sources": sources,
-                "roles": sorted(role.value for role in roles.roles_of(tool.name)),
-            }
-        )
-    return {
+        entry: dict[str, object] = {
+            "name": tool.name,
+            "sources": sources,
+            "roles": sorted(role.value for role in roles.roles_of(tool.name)),
+        }
+        if describe:
+            entry["description"] = tool.description
+        tools.append(entry)
+    payload: dict[str, object] = {
         "turn_id": engine.turn_id(),
         "tool_count": len(tool_names),
         "tool_names": tool_names,
+        "tool_surface_digest": surface.digest,
+        "tool_surface_described": describe,
         "toolsearch_pinned_tool_names": sorted(toolsearch_pins),
         "configured_pinned_tool_names": sorted(configured_pins),
         "forced_pinned_tool_names": sorted(forced_pins),
@@ -1601,6 +1638,12 @@ def _tool_surface_advertised_payload(
         },
         "tools": tools,
     }
+    return _ToolSurfaceAdvert(
+        payload=payload,
+        digest=surface.digest,
+        audience=audience,
+        describes=describe,
+    )
 
 
 async def resume(
@@ -1962,9 +2005,7 @@ async def _drive_turn(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
     # Per-turn block index reset
     engine.reset_block_idx()
     engine.total_usage.reset_turn()
-    persister = getattr(engine, "persist_session_history", None)
-    if callable(persister):
-        persister(engine)
+    persist_history(engine)
     await _populate_discovered_rules(engine)
     # Before this turn drives anything, close out any call this run was in the
     # middle of when it last stopped. A run rehydrated on another pod has to
@@ -2012,9 +2053,13 @@ async def _drive_turn(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
         )
         if ckpt is not None:
             engine.compact_checkpoint = ckpt
-            persister = getattr(engine, "persist_session_history", None)
-            if callable(persister):
-                persister(engine)
+            # A checkpoint is read out of the history without altering it, so
+            # the hand-over below has to be told the session changed — gated on
+            # the message sequence alone it would find nothing and say nothing,
+            # and a store that keeps the checkpoint would never hear it was
+            # taken.
+            engine.note_session_state_changed()
+            persist_history(engine)
             from protocore.runtime.correctness_bind import commit_usage
 
             usage_evt = commit_usage(
@@ -4448,11 +4493,17 @@ async def _drive_one_stream(
                 else:
                     _pending_reads.charge_forced_attempt(engine)
                     forced_tool_choice = readback_tool
+    advert = _tool_surface_advertised_payload(engine, context)
     yield TurnEvent(
         type=EventType.TOOL_SURFACE_ADVERTISED,
         run_id=engine.config.run_id,
-        payload=_tool_surface_advertised_payload(engine, context),
+        payload=advert.payload,
     )
+    # Claimed only once the event has been handed to the stream. A run
+    # cancelled at that yield would otherwise have spent its reader's one
+    # description on an event nobody received.
+    if advert.describes:
+        note_surface_described(advert.digest, advert.audience)
     request = build_llm_request(
         model=engine.effective_model_name,
         messages=full_messages,
@@ -4916,15 +4967,19 @@ def _calibrate_token_estimate(engine: QueryEngine, request: LLMRequest, observed
     with does too: the messages as sent (system prompt included) and the tool
     definitions. Moves are damped, and a change too small to matter is not
     written, so the estimate cache is not invalidated on every call.
+
+    Neither half of the raw estimate is recomputed from nothing. The messages
+    are read through the same per-message cache the calibrated readings use —
+    the factor is a multiplier applied where the number is handed out, so the
+    two readings share entries instead of evicting each other — and the tool
+    definitions are costed once per surface digest, which for a deployment
+    whose registry is not changing is once.
     """
     rc = engine.config.rc
     if not rc.token_estimate_calibration_enabled or observed <= 0:
         return
-    uncalibrated = rc.model_copy(update={"token_estimate_calibration": 1.0})
-    raw = estimate_history_tokens(list(request.messages), uncalibrated)
-    for tool in request.tools:
-        dump = getattr(tool, "model_dump_json", None)
-        raw += estimate_tokens(dump() if dump is not None else str(tool), uncalibrated)
+    raw = estimate_history_tokens_uncalibrated(list(request.messages), rc)
+    raw += tool_surface_tokens(read_tool_surface(request.tools), rc)
     if raw <= 0:
         return
     measured = min(max(observed / raw, 1.0), 4.0)
