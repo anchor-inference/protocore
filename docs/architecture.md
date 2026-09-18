@@ -1039,6 +1039,29 @@ the matching RC field says otherwise.
 - `runtime/correctness_bind.py` — glue so intent, ledger, typed hooks, and
   recovery run inside `_drive_turn` (`commit_usage`, `fire_lifecycle`,
   `mark_intent_recovery`, `persist_correctness`).
+- `runtime/history_persist.py` — the one call site for every place the loop
+  hands the working history to the session store (`HistoryDelta`,
+  `HistoryPersister`, `persist_history`). The engine remembers the prefix the
+  store already holds, weakly and by object identity, so a round that appended
+  two messages hands over two rather than the whole transcript. A store that
+  attaches only `persist_session_history` is driven as before; one that also
+  attaches `persist_history_delta` is handed the delta and promises, by
+  returning, that the write landed — the marker advances only after the call
+  returns, and `QueryEngine.forget_persisted_history()` takes the promise back.
+  `QueryEngine.note_session_state_changed()` covers a session that changed in a
+  way its messages do not show, such as a compaction checkpoint. Not in the
+  snapshot: a run picked up on another process cannot know what the store took
+  from the one before it, so its first hand-over rewrites.
+- `runtime/tool_surface.py` — the advertised tool surface, named rather than
+  quoted. `read_tool_surface` serialises and digests the definitions;
+  `tool_surface_tokens` costs them once per digest instead of once per LLM
+  call; `surface_needs_describing` / `note_surface_described` decide whether
+  `tool_surface_advertised` carries each tool's `description`, per reader (the
+  session) rather than per process, and `surface_descriptions(digest)` answers
+  a reader that kept none. Process-global, bounded by
+  `MAX_TOOL_SURFACE_CACHE_ENTRIES` and `MAX_TOOL_SURFACE_AUDIENCES`, and holds
+  nothing a run depends on. The request manifest still records the definitions
+  in full, so what the provider was sent stays recoverable.
 - `runtime/live_control.py` — steer / follow-up queues (`QueuedPrompt`,
   `enqueue`, `place_items`), live model/thinking overrides, and the settled
   helper. Gated by `steer_follow_up_enabled` (default `False`).

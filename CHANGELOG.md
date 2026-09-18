@@ -8,6 +8,31 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 
+- **A session store can be told what a round added.** The loop used to hand the
+  store the whole working history once per round to record the one or two
+  messages the round appended, so the cost of writing a turn down grew with the
+  length of the conversation rather than with what the conversation just did.
+  The engine now remembers the prefix the store already holds and compares the
+  current history against it by object identity — `Message` is frozen, so an
+  append leaves every earlier object where it was and a compaction, checkpoint
+  or eviction builds new ones. `persist_session_history(engine)` is unchanged
+  and is still the only method a store must have; a store that can write
+  incrementally also attaches `persist_history_delta(engine, delta)` and is
+  handed a `HistoryDelta` (`protocore.runtime.history_persist`) naming what was
+  appended, or the whole history when the sequence was rewritten.
+  `HistoryPersister` carries a default for the second that calls the first.
+  Returning is the store's promise that the write landed: the marker advances
+  only after the call returns, so a store that raises is offered the same
+  messages again, and a store that defers a write it then drops calls
+  `QueryEngine.forget_persisted_history()` — which is honoured even from inside
+  the write. A hand-over with nothing to say is not made at all, and
+  `QueryEngine.note_session_state_changed()` raises the notice for a session
+  that changed in a way its messages do not show, such as a checkpoint.
+- **The advertised tool surface is named by a digest.**
+  `tool_surface_advertised` carries `tool_surface_digest` and
+  `tool_surface_described`, and `protocore.runtime.tool_surface` answers
+  `surface_descriptions(digest)` for a reader that has nothing kept against a
+  digest it met.
 - **A third compaction pass, for what the first two cannot touch.** Tier 2
   leaves one summary per tool batch and never re-summarises one, and it now
   refuses operator turns outright, so a long session ends up with a window made
@@ -29,6 +54,36 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
+- **`tool_surface_advertised` no longer repeats every tool's description on
+  every run.** This is a wire change. The descriptions are decided by the
+  registry and are the same on every run of a deployment, and they were nearly
+  the whole event; they now travel with the first advertisement of a digest to
+  reach each reader — the session, which is the unit a host fans events out
+  over — and `tool_surface_described` says which kind of advertisement this is.
+  A reader keeps the descriptions against `tool_surface_digest` and treats a
+  missing `description` as "look it up", not "there is none";
+  `protocore.runtime.tool_surface.surface_descriptions(digest)` answers a
+  reader that has none. What is run-specific — `name`, `sources`, `roles`, and
+  which tools are on the surface at all — is on every advertisement. The claim
+  that a reader has been described to is recorded only once the event has been
+  handed to the stream, so a run cancelled at that point does not spend its
+  reader's one description on an event nobody received. The request manifest
+  still records the tool definitions in full, so what was sent to the provider
+  remains recoverable from the durable record.
+- **Tool definitions are costed for tokens once per surface, not once per
+  call.** The estimate is cached by digest and by the chars-per-token ratios it
+  was computed under. The digest itself is recomputed every call on purpose:
+  `ToolDefinition` is frozen but its parameter schema holds a plain `dict`, so
+  a surface remembered against object identity would be handed back a digest
+  that had stopped describing a schema edited in place.
+- **The token estimate cache is no longer split by the calibration factor.**
+  `token_estimate_calibration` is a single multiplier over the whole
+  per-message partition; it was folded in before the number was cached and then
+  keyed on, so the loop's calibrated reading and the calibrator's uncalibrated
+  one evicted each other's entries and an alternating pair both walked every
+  character of every message. The partition is now cached as the heuristic
+  computes it and the factor is applied where the number is handed out, which
+  is the same arithmetic for every caller.
 - **Compaction summaries keep exact identifiers.** The summariser is told to
   carry every path, id, port, URL, number and error code through verbatim
   rather than substituting a plausible value, and to state an outcome with no
