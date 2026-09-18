@@ -4,7 +4,14 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.0a5]
+
+The repository moved to `https://github.com/anchor-inference/protocore` and is
+now the single home of the core; the package on PyPI is still `protocore` and
+the import path is unchanged. Everything else in this release is the loop
+spending less per round: a session store hears what a round appended instead of
+being handed the conversation again, the tool surface travels by digest, and
+compaction gains a third pass over what the first two cannot shrink.
 
 ### Added
 
@@ -103,6 +110,12 @@ All notable changes to this project are recorded here. The format follows
   the prompt scales with the unit being replaced rather than being a fixed
   sentence count. A reply that carries no usable summary is logged with its
   head, so the next one can be diagnosed rather than guessed at.
+
+### Fixed
+
+- **`protocore.__version__` reports the installed version.** It had been left
+  at the string the first pre-release was cut with, so a host reading it back
+  was told `2.0.0-alpha.1` whatever it had installed.
 
 ## [2.0.0a4]
 
@@ -306,8 +319,9 @@ describe the boundary rather than the company.
 - 2964 tests, a 90% coverage floor, strict typing, lint, and a security scan,
   all gated on Python 3.12, 3.13, and 3.14.
 
-[Unreleased]: https://github.com/ascorblack-labs/protocore-community/compare/v2.0.0a4...HEAD
-[2.0.0a4]: https://github.com/ascorblack-labs/protocore-community/releases/tag/v2.0.0a4
-[2.0.0a3]: https://github.com/ascorblack-labs/protocore-community/releases/tag/v2.0.0a3
-[2.0.0a2]: https://github.com/ascorblack-labs/protocore-community/releases/tag/v2.0.0a2
-[2.0.0a1]: https://github.com/ascorblack-labs/protocore-community/releases/tag/v2.0.0a1
+[Unreleased]: https://github.com/anchor-inference/protocore/compare/v2.0.0a5...HEAD
+[2.0.0a5]: https://github.com/anchor-inference/protocore/releases/tag/v2.0.0a5
+[2.0.0a4]: https://github.com/anchor-inference/protocore/releases/tag/v2.0.0a4
+[2.0.0a3]: https://github.com/anchor-inference/protocore/releases/tag/v2.0.0a3
+[2.0.0a2]: https://github.com/anchor-inference/protocore/releases/tag/v2.0.0a2
+[2.0.0a1]: https://github.com/anchor-inference/protocore/releases/tag/v2.0.0a1
