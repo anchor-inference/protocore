@@ -4,6 +4,17 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0a9]
+
+### Fixed
+
+- **Near-limit requests now keep enough headroom for additive provider
+  framing.** The default request margin is 512 tokens, covering chat-template
+  and tokenizer overhead that a content-based local estimate cannot see while
+  using less than one percent of a 65,536-token context window. Installations
+  can still tune the margin, and boundary-focused synthetic tests can disable
+  it explicitly.
+
 ## [2.0.0a8]
 
 ### Fixed
