@@ -24,13 +24,17 @@ def fit_max_tokens(
     prompt_tokens: int,
     requested_max_tokens: int,
     context_window: int,
+    safety_tokens: int = 0,
 ) -> int:
-    """Return the largest safe output cap, accepting exact window equality."""
-    if prompt_tokens >= context_window:
+    """Return the largest output cap after a provider-framing safety margin."""
+    usable_window = context_window - safety_tokens
+    if prompt_tokens >= usable_window:
         raise LLMContextWindowExceeded(
-            f"estimated prompt fills the model context window ({prompt_tokens} >= {context_window})"
+            "estimated prompt fills the usable model context window "
+            f"({prompt_tokens} >= {usable_window}; context={context_window}, "
+            f"safety={safety_tokens})"
         )
-    return min(requested_max_tokens, context_window - prompt_tokens)
+    return min(requested_max_tokens, usable_window - prompt_tokens)
 
 
 def estimate_request_prompt_tokens(
@@ -51,6 +55,7 @@ def fit_request_to_context(
         prompt_tokens=prompt_tokens,
         requested_max_tokens=request.max_tokens,
         context_window=rc.model_context_window,
+        safety_tokens=rc.request_context_safety_tokens,
     )
     if max_tokens == request.max_tokens:
         return request

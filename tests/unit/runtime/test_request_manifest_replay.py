@@ -226,7 +226,9 @@ async def test_manifest_records_the_hard_fitted_output_cap(
     rc = LoopConstants(model_context_window=8_192)
     monkeypatch.setattr(
         "protocore.runtime.request_budget.estimate_request_prompt_tokens",
-        lambda request, constants, **kwargs: constants.model_context_window - 1,
+        lambda request, constants, **kwargs: (
+            constants.model_context_window - constants.request_context_safety_tokens - 1
+        ),
     )
 
     await _drive(_build_engine(llm=llm, sink=sink, rc=rc))

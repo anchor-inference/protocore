@@ -238,6 +238,10 @@ def _declared_values(**delta: object) -> dict[str, object]:
 #: the constant on its own — only the relationship refuses it.
 REFUSED_VALUES: tuple[tuple[str, dict[str, object]], ...] = (
     ("loop.compaction_trigger_below_emergency", {"compaction_trigger_ratio": 0.95}),
+    (
+        "loop.request_context_safety_below_window",
+        {"request_context_safety_tokens": 49_152},
+    ),
     ("loop.overhead_leaves_room_for_history", {"system_prompt_max_ratio": 0.9}),
     ("loop.stall_below_idle", {"llm_stream_stall_threshold_seconds": 90.0}),
     ("loop.reasoning_idle_only_widens", {"llm_stream_reasoning_idle_timeout_seconds": 89.0}),

@@ -2720,6 +2720,14 @@ class LoopConstants(BaseModel):
         gt=0,
         description="Compact when context tokens exceed the window minus this reserve.",
     )
+    request_context_safety_tokens: int = Field(
+        default=1,
+        ge=0,
+        description=(
+            "Tokens kept unused when fitting a complete provider request to the model "
+            "context window, covering provider-side framing and tokenizer differences."
+        ),
+    )
     compaction_manual_enabled: bool = Field(
         default=False,
         description=(
@@ -2836,6 +2844,10 @@ class LoopConstants(BaseModel):
 
     @model_validator(mode="after")
     def _validate_relationships(self) -> Self:
+        if self.request_context_safety_tokens >= self.model_context_window:
+            raise ValueError(
+                "request_context_safety_tokens must be < model_context_window"
+            )
  # routine trigger must be strictly below emergency cliff
         if self.compaction_trigger_ratio >= self.compaction_emergency_ratio:
             raise ValueError(

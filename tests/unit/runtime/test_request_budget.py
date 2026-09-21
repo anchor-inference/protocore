@@ -49,6 +49,28 @@ def test_fit_max_tokens_rejects_prompt_when_even_one_output_token_cannot_fit() -
         )
 
 
+def test_fit_max_tokens_keeps_provider_framing_margin_unused() -> None:
+    assert (
+        fit_max_tokens(
+            prompt_tokens=57_344,
+            requested_max_tokens=8_192,
+            context_window=65_536,
+            safety_tokens=64,
+        )
+        == 8_128
+    )
+
+
+def test_fit_max_tokens_rejects_prompt_that_fills_usable_window() -> None:
+    with pytest.raises(LLMContextWindowExceeded):
+        fit_max_tokens(
+            prompt_tokens=65_472,
+            requested_max_tokens=1,
+            context_window=65_536,
+            safety_tokens=64,
+        )
+
+
 def test_estimate_covers_calibrated_messages_and_tools() -> None:
     rc = LoopConstants(model_context_window=8_192, token_estimate_calibration=2.0)
     message = Message(
@@ -80,12 +102,40 @@ def test_fit_request_returns_copy_with_hard_ceiling() -> None:
         max_tokens=50,
     )
     prompt_tokens = estimate_request_prompt_tokens(request, base_rc)
-    rc = base_rc.model_copy(update={"model_context_window": prompt_tokens + 10})
+    rc = base_rc.model_copy(
+        update={
+            "model_context_window": prompt_tokens + 10,
+            "request_context_safety_tokens": 0,
+        }
+    )
 
     fitted = fit_request_to_context(request, rc)
 
     assert fitted.max_tokens == 10
     assert request.max_tokens == 50
+
+
+def test_fit_request_applies_configured_provider_margin() -> None:
+    base_rc = LoopConstants(model_context_window=8_192)
+    request = LLMRequest(
+        model="test-model",
+        messages=[Message(role=MessageRole.user, content_blocks=[TextBlock(text="hello")])],
+        max_tokens=50,
+    )
+    prompt_tokens = estimate_request_prompt_tokens(request, base_rc)
+    rc = base_rc.model_copy(
+        update={
+            "model_context_window": prompt_tokens + 10,
+            "request_context_safety_tokens": 7,
+        }
+    )
+
+    assert fit_request_to_context(request, rc).max_tokens == 3
+
+
+def test_constants_reject_margin_that_consumes_the_context_window() -> None:
+    with pytest.raises(ValueError, match="request_context_safety_tokens"):
+        LoopConstants(model_context_window=64, request_context_safety_tokens=64)
 
 
 def test_hard_ceiling_clips_a_larger_terminal_reserve() -> None:
@@ -96,7 +146,12 @@ def test_hard_ceiling_clips_a_larger_terminal_reserve() -> None:
         max_tokens=40,
     )
     prompt_tokens = estimate_request_prompt_tokens(reserved_request, base_rc)
-    rc = base_rc.model_copy(update={"model_context_window": prompt_tokens + 10})
+    rc = base_rc.model_copy(
+        update={
+            "model_context_window": prompt_tokens + 10,
+            "request_context_safety_tokens": 0,
+        }
+    )
 
     fitted = fit_request_to_context(reserved_request, rc)
 
@@ -137,7 +192,9 @@ async def test_local_overflow_compacts_once_without_calling_provider(
     )
     monkeypatch.setattr(
         "protocore.runtime.request_budget.estimate_request_prompt_tokens",
-        lambda request, constants: constants.model_context_window,
+        lambda request, constants: (
+            constants.model_context_window - constants.request_context_safety_tokens
+        ),
     )
 
     events = [
