@@ -27,6 +27,7 @@ LONG = "x" * 6_000
 def _compacting_rc(**overrides: object) -> object:
     values: dict[str, object] = {
         "model_context_window": 512,
+        "request_context_safety_tokens": 0,
         "compaction_trigger_ratio": 0.5,
         "compaction_keep_recent_turns": 1,
     }

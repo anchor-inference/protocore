@@ -2721,7 +2721,7 @@ class LoopConstants(BaseModel):
         description="Compact when context tokens exceed the window minus this reserve.",
     )
     request_context_safety_tokens: int = Field(
-        default=64,
+        default=512,
         ge=0,
         description=(
             "Tokens kept unused when fitting a complete provider request to the model "

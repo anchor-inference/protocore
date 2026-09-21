@@ -113,6 +113,7 @@ async def test_same_model_resume_restores_conservative_calibration(
 ) -> None:
     rc = LoopConstants(
         model_context_window=1_000,
+        request_context_safety_tokens=0,
         token_estimate_calibration=1.0,
     )
     source = engine_factory(model_name="m", rc=rc)

@@ -69,8 +69,44 @@ def test_default_margin_keeps_provider_framing_space_unused() -> None:
             context_window=65_536,
             safety_tokens=LoopConstants().request_context_safety_tokens,
         )
-        == 8_128
+        == 7_680
     )
+
+
+def test_default_margin_absorbs_additive_provider_framing_drift() -> None:
+    estimated_prompt_tokens = 57_280
+    provider_prompt_lower_bound = 57_345
+    fitted = fit_max_tokens(
+        prompt_tokens=estimated_prompt_tokens,
+        requested_max_tokens=8_192,
+        context_window=65_536,
+        safety_tokens=LoopConstants().request_context_safety_tokens,
+    )
+
+    assert fitted == 7_744
+    assert provider_prompt_lower_bound + fitted <= 65_536
+
+
+def test_request_fitting_wires_default_margin_into_the_hard_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = LLMRequest(
+        model="test-model",
+        messages=[Message(role=MessageRole.user, content_blocks=[TextBlock(text="hello")])],
+        max_tokens=8_192,
+    )
+    monkeypatch.setattr(
+        "protocore.runtime.request_budget.estimate_request_prompt_tokens",
+        lambda request, constants: 57_280,
+    )
+
+    fitted = fit_request_to_context(
+        request,
+        LoopConstants(model_context_window=65_536),
+    )
+
+    assert fitted.max_tokens == 7_744
+    assert 57_345 + fitted.max_tokens <= 65_536
 
 
 def test_fit_max_tokens_rejects_prompt_that_fills_usable_window() -> None:

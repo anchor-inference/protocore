@@ -179,7 +179,7 @@ async def test_context_manager_detects_russian() -> None:
 
 
 def test_context_manager_needs_compaction_when_history_exceeds_trigger() -> None:
-    rc = LoopConstants(model_context_window=512)
+    rc = LoopConstants(model_context_window=512, request_context_safety_tokens=0)
     blobs = InMemoryBlobStore()
     llm = InMemoryLLMProvider()
     mgr = ContextManager(rc=rc, blob_store=blobs, compaction_llm=llm)
@@ -203,7 +203,7 @@ def test_context_manager_no_compaction_for_short_history() -> None:
 
 
 def test_calibrated_estimate_governs_compaction() -> None:
-    rc = LoopConstants(model_context_window=512)
+    rc = LoopConstants(model_context_window=512, request_context_safety_tokens=0)
     blobs = InMemoryBlobStore()
     llm = InMemoryLLMProvider()
     mgr = ContextManager(rc=rc, blob_store=blobs, compaction_llm=llm)
@@ -373,6 +373,7 @@ def _folding_manager(llm: InMemoryLLMProvider) -> ContextManager:
     return ContextManager(
         rc=LoopConstants(
             model_context_window=1_024,
+            request_context_safety_tokens=0,
             compaction_keep_recent_turns=2,
             compaction_fold_min_messages=4,
             compaction_fold_min_tokens=0,
@@ -480,6 +481,7 @@ async def test_the_fold_switch_stops_it_before_the_tier_is_entered() -> None:
     mgr = ContextManager(
         rc=LoopConstants(
             model_context_window=1_024,
+            request_context_safety_tokens=0,
             compaction_keep_recent_turns=2,
             compaction_fold_enabled=False,
             compaction_fold_min_messages=4,

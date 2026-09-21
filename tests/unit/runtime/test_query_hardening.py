@@ -419,6 +419,7 @@ async def test_force_compaction_runs_both_tiers_unconditionally(
 
     rc = LoopConstants(
         model_context_window=128,
+        request_context_safety_tokens=0,
         compaction_keep_recent_turns=1,
     )
     failing_llm = _ScriptedFailureLLM(exceptions=[None])  # never raises
@@ -467,6 +468,7 @@ async def test_force_compaction_exhaustion_raises(
 
     rc = LoopConstants(
         model_context_window=128,
+        request_context_safety_tokens=0,
         compaction_keep_recent_turns=1,
         compaction_failed_max_retries=1,
     )
