@@ -1,19 +1,17 @@
 """A round that came back with nothing usable in it.
 
-Two shapes, one subject, and they are told apart by what the empty round DID
-carry. A round with reasoning and nothing else is a model that spent its whole
-output budget thinking: it is given the reasoning back plus a short prompt to
-continue, and re-run. A round with nothing at all, arriving straight after
-tool results, is a model treating the tool result as the last word: it is
-handed an API-valid pair — an empty assistant turn so the sequence never goes
-tool → user, and a corrective nudge — and re-run.
+Reasoning-only rounds cut by the output cap are retried without retaining the
+incomplete reasoning: effort is lowered, then thinking is disabled when the run
+mode permits it. A reasoning-only round the model ended itself is given the
+reasoning back plus a short prompt to continue. A round with nothing at all,
+arriving straight after tool results, is a model treating the tool result as
+the last word: it is handed an API-valid pair — an empty assistant turn so the
+sequence never goes tool → user, and a corrective nudge — and re-run.
 
-Both are bounded by the same count, and both count separately, so one shape
-cannot spend the other's budget. Past the bound they part company: the
-thinking trap winds the run down and, if it cannot, ends it, because a model
-that has produced nothing consumable for several rounds will not produce
-something on the next one. The post-tool nudge simply stops and lets the turn
-finish, where the ordinary end-of-turn policies get their say.
+All are bounded. Reasoning-only length cuts and model-ended reasoning use
+separate counters, so one shape cannot spend the other's budget. Past the
+bound the thinking traps wind the run down and, if they cannot, end it. The
+post-tool nudge simply stops and lets the ordinary end-of-turn policies decide.
 
 A round that produced anything at all clears the counters, so a single early
 empty response does not permanently consume either budget.
@@ -45,6 +43,9 @@ from protocore.runtime.turn_policies.run_ceilings import (
 #: The event that says a continue prompt went in, with the round it was and
 #: how much reasoning the model had produced instead of an answer.
 ContinuePromptEvent = Callable[[Any, int, int], TurnEvent]
+ReasoningCutStep = Callable[[Any, int], str | None]
+ReasoningCutRestore = Callable[[Any], None]
+ReasoningCutEvent = Callable[[Any, int, str, int], TurnEvent]
 
 
 class EmptyModelTurnPolicy:
@@ -56,11 +57,16 @@ class EmptyModelTurnPolicy:
     __slots__ = (
         "_append_continue_prompt",
         "_append_post_tool_nudge",
+        "_append_reasoning_cut_nudge",
         "_continue_prompt_event",
         "_empty_rounds",
         "_enter_wind_down",
         "_llm_terminal",
         "_post_tool_nudges",
+        "_reasoning_cut_event",
+        "_reasoning_cut_restore",
+        "_reasoning_cut_rounds",
+        "_reasoning_cut_step",
         "_state_change",
         "_wind_down_budget",
     )
@@ -69,20 +75,30 @@ class EmptyModelTurnPolicy:
         self,
         *,
         empty_rounds: RunCounter,
+        reasoning_cut_rounds: RunCounter,
         post_tool_nudges: RunCounter,
         append_continue_prompt: HistoryAppender,
         append_post_tool_nudge: HistoryAppender,
         continue_prompt_event: ContinuePromptEvent,
+        reasoning_cut_step: ReasoningCutStep,
+        reasoning_cut_restore: ReasoningCutRestore,
+        append_reasoning_cut_nudge: HistoryAppender,
+        reasoning_cut_event: ReasoningCutEvent,
         enter_wind_down: WindDownEntry,
         wind_down_budget: WindDownBudget,
         llm_terminal: TerminalEmitter,
         state_change: StateChangeEmitter,
     ) -> None:
         self._empty_rounds = empty_rounds
+        self._reasoning_cut_rounds = reasoning_cut_rounds
         self._post_tool_nudges = post_tool_nudges
         self._append_continue_prompt = append_continue_prompt
         self._append_post_tool_nudge = append_post_tool_nudge
         self._continue_prompt_event = continue_prompt_event
+        self._reasoning_cut_step = reasoning_cut_step
+        self._reasoning_cut_restore = reasoning_cut_restore
+        self._append_reasoning_cut_nudge = append_reasoning_cut_nudge
+        self._reasoning_cut_event = reasoning_cut_event
         self._enter_wind_down = enter_wind_down
         self._wind_down_budget = wind_down_budget
         self._llm_terminal = llm_terminal
@@ -98,6 +114,16 @@ class EmptyModelTurnPolicy:
         )
 
         if (
+            turn.finish_reason == "length"
+            and not turn.text_emitted
+            and not turn.tool_calls_pending
+            and turn.reasoning_emitted
+        ):
+            async for event in self._length_cut(turn):
+                yield event
+            if turn.outcome.directive is not TurnDirective.proceed:
+                return
+        elif (
             not turn.text_emitted
             and not turn.tool_calls_pending
             and turn.reasoning_emitted
@@ -111,6 +137,8 @@ class EmptyModelTurnPolicy:
         # The trap either did not engage or was recovered from; either way the
         # count starts again, so a later turn that trips it gets a fresh one.
         self._empty_rounds.reset(engine)
+        self._reasoning_cut_rounds.reset(engine)
+        self._reasoning_cut_restore(engine)
 
         if (
             engine.rc.resilience_post_tool_empty_nudge_enabled
@@ -154,6 +182,54 @@ class EmptyModelTurnPolicy:
         # the per-message recovery reset, so another empty round during the
         # wind-down comes back here and falls through to the terminal below
         # under the original reason.
+        async for event in self._nothing_consumable(
+            turn,
+            reason="thinking_eats_all_tokens",
+            kind="thinking_eats_all_tokens",
+            detail=(
+                "consecutive empty responses with reasoning_content exceeded "
+                "rc.max_consecutive_empty_responses"
+            ),
+        ):
+            yield event
+
+    async def _length_cut(self, turn: TurnContext) -> AsyncIterator[TurnEvent]:
+        """Retry a reasoning-only length cut without retaining partial thought."""
+        engine = turn.engine
+        round_ = self._reasoning_cut_rounds.charge(engine)
+        if round_ <= engine.rc.reasoning_length_cut_retries:
+            control_change = self._reasoning_cut_step(engine, round_)
+            if control_change is not None:
+                if round_ == 1:
+                    self._append_reasoning_cut_nudge(engine)
+                turn.outcome.directive = TurnDirective.restart_turn
+                turn.outcome.rebuild_context = True
+                turn.outcome.reason = "reasoning_length_cut_retry"
+                yield self._reasoning_cut_event(
+                    engine, round_, control_change, turn.reasoning_chars
+                )
+                return
+        self._reasoning_cut_restore(engine)
+        async for event in self._nothing_consumable(
+            turn,
+            reason="reasoning_length_cut",
+            kind="reasoning_length_cut",
+            detail=(
+                "reasoning-only length-limited responses exhausted "
+                "rc.reasoning_length_cut_retries"
+            ),
+        ):
+            yield event
+
+    async def _nothing_consumable(
+        self,
+        turn: TurnContext,
+        *,
+        reason: str,
+        kind: str,
+        detail: str,
+    ) -> AsyncIterator[TurnEvent]:
+        engine = turn.engine
         events = self._enter_wind_down(engine, cause=_soft_stop.CAUSE_PROVIDER_ERROR)
         if events:
             turn.outcome.directive = TurnDirective.restart_turn
@@ -167,16 +243,19 @@ class EmptyModelTurnPolicy:
             await engine.persist_snapshot()
             return
         turn.outcome.directive = TurnDirective.end_turn
-        turn.outcome.reason = "thinking_eats_all_tokens"
+        turn.outcome.reason = reason
         async for event in self._llm_terminal(
             engine,
-            LLMProviderError(
-                "consecutive empty responses with reasoning_content exceeded "
-                "rc.max_consecutive_empty_responses"
-            ),
-            kind="thinking_eats_all_tokens",
+            LLMProviderError(detail),
+            kind=kind,
         ):
             yield event
 
 
-__all__ = ["ContinuePromptEvent", "EmptyModelTurnPolicy"]
+__all__ = [
+    "ContinuePromptEvent",
+    "EmptyModelTurnPolicy",
+    "ReasoningCutEvent",
+    "ReasoningCutRestore",
+    "ReasoningCutStep",
+]

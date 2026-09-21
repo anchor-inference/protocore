@@ -991,6 +991,10 @@ class QueryEngine:
         # beyond → terminal FAILED with kind=``thinking_eats_all_tokens``.
         # Per-turn lifecycle — reset on every new ``engine.run()`` call.
         self._consecutive_empty_responses: int = 0
+        # Dedicated reasoning-only length-cut retry rung. It is separate from
+        # model-ended thinking-only responses so alternating finish modes
+        # cannot skip or replenish either recovery ladder.
+        self._reasoning_length_cut_count: int = 0
         # Post-tool empty-response recovery counter. Counts consecutive
         # FULLY-empty assistant turns (no text, no tool calls, AND no
         # reasoning_content) that arrive immediately after a tool-result turn.
@@ -1109,6 +1113,8 @@ class QueryEngine:
         self._live_model_name: str | None = None
         self._live_thinking_enabled: bool | None = None
         self._live_reasoning_effort: str | None = None
+        self._reasoning_recovery_thinking_enabled: bool | None = None
+        self._reasoning_recovery_effort: str | None = None
         self._run_settled_emitted: bool = False
 
         # Ordered record of the tool calls this run DISPATCHED. Written at the
@@ -2044,6 +2050,8 @@ class QueryEngine:
         # wait is still on the stack.
         assert_awaiting_is_witnessed(new_state, len(self._pending_interrupts))
         self.state = new_state
+        if is_terminal(new_state):
+            self.reset_reasoning_recovery()
 
     def turn_id(self) -> str:
         """Wire turn identifier for the current in-flight assistant-message round.
@@ -2616,6 +2624,11 @@ class QueryEngine:
             "live_model_name": self._live_model_name,
             "live_thinking_enabled": self._live_thinking_enabled,
             "live_reasoning_effort": self._live_reasoning_effort,
+            "reasoning_length_cut_count": self._reasoning_length_cut_count,
+            "reasoning_recovery_thinking_enabled": (
+                self._reasoning_recovery_thinking_enabled
+            ),
+            "reasoning_recovery_effort": self._reasoning_recovery_effort,
             "run_settled_emitted": self._run_settled_emitted,
             # Persist the tool-call ledger so a run re-driven on another pod
             # continues one record rather than starting a second. It is the
@@ -3295,7 +3308,20 @@ class QueryEngine:
         self._live_reasoning_effort = (
             live_effort if isinstance(live_effort, str) else None
         )
+        self._reasoning_length_cut_count = int(
+            snapshot.get("reasoning_length_cut_count", 0)
+        )
+        recovery_thinking = snapshot.get("reasoning_recovery_thinking_enabled")
+        self._reasoning_recovery_thinking_enabled = (
+            recovery_thinking if isinstance(recovery_thinking, bool) else None
+        )
+        recovery_effort = snapshot.get("reasoning_recovery_effort")
+        self._reasoning_recovery_effort = (
+            recovery_effort if isinstance(recovery_effort, str) else None
+        )
         self._run_settled_emitted = bool(snapshot.get("run_settled_emitted", False))
+        if self.is_terminal:
+            self.reset_reasoning_recovery()
         restored_ledger = snapshot.get("tool_call_ledger") or []
         self._tool_call_ledger = [
             {
@@ -3456,13 +3482,27 @@ class QueryEngine:
 
     @property
     def effective_thinking_enabled(self) -> bool:
+        if self._reasoning_recovery_thinking_enabled is not None:
+            return self._reasoning_recovery_thinking_enabled
         if self._live_thinking_enabled is None:
             return self.config.thinking_enabled
         return self._live_thinking_enabled
 
     @property
     def effective_reasoning_effort(self) -> str:
+        if self._reasoning_recovery_effort is not None:
+            return self._reasoning_recovery_effort
         return self._live_reasoning_effort or self.config.reasoning_effort
+
+    def clear_reasoning_recovery_overrides(self) -> None:
+        """Drop temporary reasoning controls without refunding retry budget."""
+        self._reasoning_recovery_thinking_enabled = None
+        self._reasoning_recovery_effort = None
+
+    def reset_reasoning_recovery(self) -> None:
+        """Clear temporary controls and start a fresh retry budget."""
+        self.clear_reasoning_recovery_overrides()
+        self._reasoning_length_cut_count = 0
 
     def apply_live_controls(
         self,

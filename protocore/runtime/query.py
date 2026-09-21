@@ -126,6 +126,7 @@ from protocore.contracts.types import (
     SYNTHETIC_RECOVERY_PRE_DISPATCH_TERMINAL_VERIFY,
     SYNTHETIC_RECOVERY_PRE_TERMINAL_SELF_VERIFY,
     SYNTHETIC_RECOVERY_PROSE_GATE_REPAIR,
+    SYNTHETIC_RECOVERY_REASONING_CUT,
     SYNTHETIC_RECOVERY_TERMINAL_REPAIR,
     SYNTHETIC_RECOVERY_TERMINAL_TOOL_NUDGE,
     SYNTHETIC_RECOVERY_THINKING_CONTINUE,
@@ -325,6 +326,64 @@ def _append_thinking_continue_prompt(engine: QueryEngine) -> None:
     )
 
 
+def _step_reasoning_after_cut(engine: QueryEngine, round_: int) -> str | None:
+    """Apply the next bounded control change after a reasoning-only cut."""
+    if round_ == 1 and engine.effective_reasoning_effort != "low":
+        engine._reasoning_recovery_effort = "low"
+        return "reasoning_effort=low"
+    if (
+        engine.config.rc.reasoning_length_cut_disable_thinking
+        and engine.config.run_mode != "deep"
+        and engine.effective_thinking_enabled
+    ):
+        engine._reasoning_recovery_thinking_enabled = False
+        return "thinking=off"
+    return None
+
+
+def _restore_reasoning_after_cut(engine: QueryEngine) -> None:
+    """Restore operator-selected controls after length-cut recovery."""
+    engine.clear_reasoning_recovery_overrides()
+
+
+def _append_reasoning_cut_nudge(engine: QueryEngine) -> None:
+    engine.history.append(
+        Message(
+            role=MessageRole.user,
+            content_blocks=[
+                TextBlock(text=engine.config.rc.reasoning_length_cut_nudge_text)
+            ],
+            metadata={
+                SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_REASONING_CUT
+            },
+        )
+    )
+
+
+def _policy_reasoning_cut_event(
+    engine: QueryEngine, round_: int, control_change: str, reasoning_chars: int
+) -> TurnEvent:
+    _logger.warning(
+        "reasoning-only length cut: %s chars of reasoning and no answer; "
+        "retry %s with %s",
+        reasoning_chars,
+        round_,
+        control_change,
+    )
+    return TurnEvent(
+        type=EventType.STATE_CHANGED,
+        run_id=engine.config.run_id,
+        payload={
+            "from": engine.state.value,
+            "to": engine.state.value,
+            "reason": "reasoning_length_cut_retry",
+            "round": round_,
+            "changed": control_change,
+            "reasoning_content_chars": reasoning_chars,
+        },
+    )
+
+
 def _append_post_tool_empty_nudge(engine: QueryEngine) -> None:
     """Correct a model that answered a tool result with silence.
 
@@ -382,6 +441,19 @@ def _charge_empty_round(engine: QueryEngine) -> int:
 
 def _reset_empty_rounds(engine: QueryEngine) -> None:
     engine._consecutive_empty_responses = 0
+
+
+def _reasoning_cut_rounds_spent(engine: QueryEngine) -> int:
+    return engine._reasoning_length_cut_count
+
+
+def _charge_reasoning_cut_round(engine: QueryEngine) -> int:
+    engine._reasoning_length_cut_count += 1
+    return engine._reasoning_length_cut_count
+
+
+def _reset_reasoning_cut_rounds(engine: QueryEngine) -> None:
+    engine._reasoning_length_cut_count = 0
 
 
 def _policy_commit_usage(
@@ -3229,6 +3301,8 @@ async def _stream_one_assistant_message(
                 TurnCoordinate.output_truncated,
                 pending_tool_calls=stream_result.tool_calls,
                 finish_reason=stream_result.finish_reason or "",
+                text_emitted=bool(stream_result.text_buffer),
+                reasoning_emitted=bool(stream_result.reasoning_buffer),
                 record_partial_attempt=partial(
                     _persist_partial_attempt_to_history, engine, stream_result
                 ),
@@ -3323,6 +3397,7 @@ async def _stream_one_assistant_message(
             text_emitted=bool(text_buffer),
             reasoning_emitted=bool(reasoning_buffer),
             reasoning_chars=len(reasoning_buffer),
+            finish_reason=stream_result.finish_reason or "",
             tool_calls_pending=bool(pending_tool_calls),
             tool_results_ready=tool_results_ready_at is not None,
             record_partial_attempt=partial(
@@ -11763,6 +11838,11 @@ _CORE_TURN_POLICIES: Final[TurnPolicyRegistry] = TurnPolicyRegistry(
                 charge=_charge_empty_round,
                 reset=_reset_empty_rounds,
             ),
+            reasoning_cut_rounds=RunCounter(
+                read=_reasoning_cut_rounds_spent,
+                charge=_charge_reasoning_cut_round,
+                reset=_reset_reasoning_cut_rounds,
+            ),
             post_tool_nudges=RunCounter(
                 read=_post_tool_nudges_spent,
                 charge=_charge_post_tool_nudge,
@@ -11771,6 +11851,10 @@ _CORE_TURN_POLICIES: Final[TurnPolicyRegistry] = TurnPolicyRegistry(
             append_continue_prompt=_append_thinking_continue_prompt,
             append_post_tool_nudge=_append_post_tool_empty_nudge,
             continue_prompt_event=_policy_continue_prompt_event,
+            reasoning_cut_step=_step_reasoning_after_cut,
+            reasoning_cut_restore=_restore_reasoning_after_cut,
+            append_reasoning_cut_nudge=_append_reasoning_cut_nudge,
+            reasoning_cut_event=_policy_reasoning_cut_event,
             enter_wind_down=_enter_soft_stop,
             wind_down_budget=_soft_stop_turn_budget,
             llm_terminal=_emit_llm_terminal,

@@ -180,13 +180,20 @@ class OutputCapRecoveryPolicy:
             turn.finish_reason in ("length", "")
             and not turn.pending_tool_calls
             and not turn.engine.stop_requested
+            and not (
+                turn.finish_reason == "length"
+                and turn.reasoning_emitted
+                and not turn.text_emitted
+            )
         ):
             # An empty finish reason is folded in here. Some providers end the
             # stream cleanly with no finish delta at all, and reading that as a
             # normal completion let a mid-sentence partial be persisted as the
             # run's final answer. A finish-less, call-less stream is an
             # incomplete turn, and gets the same bounded resume a length cap
-            # does. A cancel also leaves the finish reason empty, which is why
+            # does. A reasoning-only length cut has its own recovery ladder in
+            # EmptyModelTurnPolicy and must not be persisted as prose here. A
+            # cancel also leaves the finish reason empty, which is why
             # a stopped run is excluded: an interrupted turn is not recovered.
             async for event in self._cut_mid_prose(turn):
                 yield event

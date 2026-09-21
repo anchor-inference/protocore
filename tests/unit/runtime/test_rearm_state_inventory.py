@@ -89,9 +89,12 @@ _RESET_ON_REARM: frozenset[str] = frozenset(
         "_truncation_recovery_prompt_counts",
         "_provider_chain_advances",
         "_consecutive_empty_responses",
+        "_reasoning_length_cut_count",
         "_post_tool_empty_nudge_count",
         "_transient_stream_retry_count",
         "_empty_completion_redrive_count",
+        "_reasoning_recovery_thinking_enabled",
+        "_reasoning_recovery_effort",
         # Fire-once report that the session's background pool cannot speak for
         # the session. A run re-armed onto a pool that is still detached is
         # entitled to be told again.

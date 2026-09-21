@@ -1506,6 +1506,34 @@ class LoopConstants(BaseModel):
             "deployments can tune the nudge per locale."
         ),
     )
+    reasoning_length_cut_retries: int = Field(
+        default=2,
+        ge=0,
+        description=(
+            "Maximum recovery retries when a length-limited response contains "
+            "reasoning but no visible text or tool call. Recovery first lowers "
+            "reasoning effort and then disables thinking when permitted."
+        ),
+    )
+    reasoning_length_cut_nudge_text: str = Field(
+        default=(
+            "Your previous response reached the output token limit while still "
+            "reasoning, before it produced an answer or a tool call, so it was "
+            "discarded. Respond more concisely: think briefly, then give the "
+            "answer or exactly one tool call."
+        ),
+        description=(
+            "Synthetic user-role instruction appended on the first "
+            "reasoning-only length-cut recovery attempt."
+        ),
+    )
+    reasoning_length_cut_disable_thinking: bool = Field(
+        default=True,
+        description=(
+            "Allow reasoning-only length-cut recovery to disable thinking "
+            "after lowering reasoning effort. Deep mode remains unchanged."
+        ),
+    )
 
  # ----- Death-spiral guard -----
     skip_terminal_hooks_on_llm_error: bool = Field(

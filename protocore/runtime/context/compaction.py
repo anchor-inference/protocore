@@ -50,6 +50,7 @@ from protocore.contracts.types import (
     COMPACTION_REFERENCE_METADATA_KEY,
     COMPACTION_SUMMARY_METADATA_KEY,
     SESSION_HISTORY_SEED_METADATA_KEY,
+    SYNTHETIC_RECOVERY_METADATA_KEY,
     CompactionSourceRef,
     ContentBlock,
     ImageRefBlock,
@@ -1179,6 +1180,7 @@ class _SummaryOutcome:
     anchor_key: str
     replacement: Message | None
     tokens_freed: int
+    failed: bool = False
 
 
 def _is_plain_operator_turn(message: Message) -> bool:
@@ -1192,6 +1194,8 @@ def _is_plain_operator_turn(message: Message) -> bool:
     frees nothing and specific enough that a paraphrase changes it.
     """
     if message.role is not MessageRole.user or _is_compaction_summary(message):
+        return False
+    if message.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY):
         return False
     if message.metadata.get(COMPACTION_REFERENCE_METADATA_KEY) is True:
         return False
@@ -1305,7 +1309,12 @@ async def _run_summariser(
         response = await compaction_llm.complete_structured(request, build_summary_schema(rc))
     except Exception as exc:
         _logger.warning("summariser failed for %s; skipping (err=%s)", unit_label, exc)
-        return _SummaryOutcome(anchor_key=anchor_key, replacement=None, tokens_freed=0)
+        return _SummaryOutcome(
+            anchor_key=anchor_key,
+            replacement=None,
+            tokens_freed=0,
+            failed=True,
+        )
     summary_text = _summary_from_response(response.message.text, unit_label)
     if not summary_text:
         return _SummaryOutcome(anchor_key=anchor_key, replacement=None, tokens_freed=0)
@@ -1461,10 +1470,34 @@ async def run_tier2_summarisation(
     if not history:
         return Tier2Result(turns_summarised=0, tokens_freed=0)
 
+    original_history = history
+    history = list(history)
+    summarised_turn_ids = set(state.summarised_turn_ids)
+
     keep = rc.compaction_keep_recent_turns
     eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index)
     if eligible_upper == 0:
         return Tier2Result(turns_summarised=0, tokens_freed=0)
+
+    # Aged user-role recovery nudges are runtime control flow, not conversation
+    # content. Sending them to the summariser lets it misattribute the runtime's
+    # instruction to the operator; protecting them instead makes them immortal.
+    # They have no tool-pairing role, so remove them deterministically before
+    # building Tier-2 units while the recent tail remains untouched.
+    synthetic_nudges = {
+        idx
+        for idx in range(eligible_upper)
+        if history[idx].role is MessageRole.user
+        and history[idx].metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
+    }
+    synthetic_tokens_freed = sum(
+        estimate_message_tokens(history[idx], rc) for idx in synthetic_nudges
+    )
+    if synthetic_nudges:
+        history[:] = [
+            message for idx, message in enumerate(history) if idx not in synthetic_nudges
+        ]
+        eligible_upper -= len(synthetic_nudges)
 
     protected: frozenset[int] = frozenset()
     if rc.compaction_protect_first_user_turn:
@@ -1506,7 +1539,7 @@ async def run_tier2_summarisation(
     resolved_prompts = prompts if prompts is not None else bundled_prompt_provider()
 
     summarised = 0
-    freed = 0
+    freed = synthetic_tokens_freed
     # Replacement Message keyed by anchor index; indices to delete after the loop.
     replacements: dict[int, Message] = {}
     indices_to_drop: set[int] = set()
@@ -1522,7 +1555,7 @@ async def run_tier2_summarisation(
         if _is_compaction_summary(anchor):
             continue
         anchor_key = _stable_turn_key(anchor)
-        if anchor_key in state.summarised_turn_ids:
+        if anchor_key in summarised_turn_ids:
             continue
         # Exhaustive across EVERY member of the unit (assistant turn + its
         # tool results), so the summary preserves the tool exchange.
@@ -1569,6 +1602,8 @@ async def run_tier2_summarisation(
                 for unit, anchor_key, unit_messages, before_tokens in batch
             )
         )
+        if any(outcome.failed for outcome in outcomes):
+            return Tier2Result(turns_summarised=0, tokens_freed=0)
         for (unit, _key, _members, _before), outcome in zip(batch, outcomes, strict=True):
             if outcome.replacement is None:
                 continue
@@ -1576,7 +1611,7 @@ async def run_tier2_summarisation(
             # Every non-anchor member of the unit (the matching tool results) is
             # removed so the dropped ToolUseBlock leaves no orphaned tool_result.
             indices_to_drop.update(member for member in unit.indices if member != unit.anchor_idx)
-            state.summarised_turn_ids.add(outcome.anchor_key)
+            summarised_turn_ids.add(outcome.anchor_key)
             summarised += 1
             freed += outcome.tokens_freed
 
@@ -1587,6 +1622,10 @@ async def run_tier2_summarisation(
                 continue
             rebuilt.append(replacements.get(idx, history[idx]))
         history[:] = rebuilt
+
+    if history != original_history:
+        original_history[:] = history
+    state.summarised_turn_ids = summarised_turn_ids
 
     return Tier2Result(turns_summarised=summarised, tokens_freed=freed)
 
