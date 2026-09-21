@@ -224,6 +224,7 @@ async def test_query_compact_then_retry_settled_only_at_end(
     llm.queue_response(text="ok after compact")
     rc = _enabled(
         model_context_window=64,
+        request_context_safety_tokens=0,
         compaction_trigger_ratio=0.5,
         compaction_keep_recent_turns=1,
     )

@@ -590,6 +590,7 @@ async def test_compaction_uses_rc_for_summary_caps(
 
     rc = LoopConstants(
         model_context_window=64,
+        request_context_safety_tokens=0,
         compaction_trigger_ratio=0.5,
         compaction_keep_recent_turns=1,
         # Custom caps — values different from defaults so we can assert.
@@ -643,6 +644,7 @@ async def test_compaction_started_payload_uses_correct_threshold(
 
     rc = LoopConstants(
         model_context_window=64,
+        request_context_safety_tokens=0,
         compaction_trigger_ratio=0.5,
         compaction_keep_recent_turns=1,
     )
@@ -683,6 +685,7 @@ async def test_compaction_completion_persists_snapshot(
     # Tiny window so a single long message triggers compaction.
     rc = LoopConstants(
         model_context_window=64,
+        request_context_safety_tokens=0,
         compaction_trigger_ratio=0.5,  # 32 tokens trigger
         compaction_keep_recent_turns=1,
         compaction_failed_max_retries=2,

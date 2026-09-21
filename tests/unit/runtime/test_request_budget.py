@@ -61,7 +61,7 @@ def test_fit_max_tokens_keeps_provider_framing_margin_unused() -> None:
     )
 
 
-def test_default_margin_prevents_the_observed_one_token_overflow() -> None:
+def test_default_margin_keeps_provider_framing_space_unused() -> None:
     assert (
         fit_max_tokens(
             prompt_tokens=57_344,
@@ -69,7 +69,7 @@ def test_default_margin_prevents_the_observed_one_token_overflow() -> None:
             context_window=65_536,
             safety_tokens=LoopConstants().request_context_safety_tokens,
         )
-        == 8_191
+        == 8_128
     )
 
 

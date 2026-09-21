@@ -357,6 +357,7 @@ async def test_compaction_summariser_request_shape() -> None:
 async def test_compaction_summariser_skips_a_known_oversized_request() -> None:
     rc = LoopConstants(
         model_context_window=64,
+        request_context_safety_tokens=0,
         compaction_keep_recent_turns=1,
     )
     llm = InMemoryLLMProvider()
@@ -386,7 +387,7 @@ async def test_deep_plan_skips_a_known_oversized_request() -> None:
     engine = _build_engine(
         run_mode="deep",
         llm=llm,
-        rc=LoopConstants(model_context_window=64),
+            rc=LoopConstants(model_context_window=64, request_context_safety_tokens=0),
     )
     tool = MockTool(tool_name="Read").definition
     context = engine.context_manager.build_context(
@@ -435,7 +436,7 @@ async def test_deep_plan_json_fallback_skips_a_known_oversized_request() -> None
     engine = _build_engine(
         run_mode="deep",
         llm=llm,
-        rc=LoopConstants(model_context_window=64),
+            rc=LoopConstants(model_context_window=64, request_context_safety_tokens=0),
     )
     messages = [
         Message(

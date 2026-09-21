@@ -1292,7 +1292,9 @@ async def test_compaction_exhausted_teardown_pairs_dangling_tool_use(
     from protocore.runtime.context.compaction import CompactionExhaustedError
 
     # Force compaction to trigger then fail.
-    engine = engine_factory(rc=LoopConstants(model_context_window=64))
+    engine = engine_factory(
+        rc=LoopConstants(model_context_window=64, request_context_safety_tokens=0)
+    )
     engine.history.append(
         Message(
             role=MessageRole.assistant,
