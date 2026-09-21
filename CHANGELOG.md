@@ -4,6 +4,43 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0a6]
+
+This release makes long-running conversations safer at the two points where a
+model can otherwise lose the task: history compaction and the final request
+budget sent to a provider.
+
+### Added
+
+- **Bounded recovery for a response that spends its output on reasoning.** A
+  length-limited response containing reasoning but no answer or tool call is
+  discarded and retried through a small recovery ladder: lower the reasoning
+  effort, then disable thinking when the run mode permits it. The ladder and
+  its original controls survive snapshot pickup, do not overwrite live
+  operator controls, and end with one honest best-effort wind-down request.
+- **A hard context-window fit for every provider request.** The complete
+  normalized messages and tool schemas are estimated together after the
+  ordinary output cap, adaptive safety band and terminal reserve have been
+  chosen. `max_tokens` is clipped before the request is manifested or sent;
+  when no positive output fits, the action path gets one bounded compaction
+  retry and secondary planning or summarisation calls fail locally without
+  sending a request already known to be too large.
+
+### Fixed
+
+- **Runtime recovery messages no longer become operator intent during
+  compaction.** User-role control messages are identified by provenance rather
+  than role alone. Aged recovery nudges are removed on the same atomic working
+  copy as the rest of Tier 2, so a failed summariser or recorder cannot leave
+  history and compaction accounting disagreeing.
+- **Token-estimate calibration follows the model that produced it.** Learned
+  calibration survives snapshot pickup for the same model, respects a newer
+  configured baseline, and resets on live or provider-chain model changes.
+  Late usage from an earlier model is still accounted for but cannot replace
+  the active model's calibration. A provider count from one wire request is no
+  longer reused as a size floor for a different request or for a history-only
+  compaction decision.
+
 ## [2.0.0a5]
 
 The repository moved to `https://github.com/anchor-inference/protocore` and is
@@ -319,7 +356,8 @@ describe the boundary rather than the company.
 - 2964 tests, a 90% coverage floor, strict typing, lint, and a security scan,
   all gated on Python 3.12, 3.13, and 3.14.
 
-[Unreleased]: https://github.com/anchor-inference/protocore/compare/v2.0.0a5...HEAD
+[Unreleased]: https://github.com/anchor-inference/protocore/compare/v2.0.0a6...HEAD
+[2.0.0a6]: https://github.com/anchor-inference/protocore/releases/tag/v2.0.0a6
 [2.0.0a5]: https://github.com/anchor-inference/protocore/releases/tag/v2.0.0a5
 [2.0.0a4]: https://github.com/anchor-inference/protocore/releases/tag/v2.0.0a4
 [2.0.0a3]: https://github.com/anchor-inference/protocore/releases/tag/v2.0.0a3
