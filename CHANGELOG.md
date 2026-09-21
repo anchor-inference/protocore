@@ -4,6 +4,16 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0a8]
+
+### Fixed
+
+- **The default provider-framing margin now covers real chat-template
+  variance.** Live OpenAI-compatible providers may add several tokens that are
+  absent from a local message estimate. The default request margin is now 64
+  tokens; installations can still tune it, and tiny synthetic test windows can
+  explicitly disable it when they are testing an unrelated boundary.
+
 ## [2.0.0a7]
 
 ### Fixed
