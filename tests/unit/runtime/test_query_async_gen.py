@@ -964,15 +964,21 @@ async def test_compaction_mid_turn(engine_factory, in_memory_runtime) -> None:
     from protocore.contracts.runtime_constants import LoopConstants
 
     rc = LoopConstants(
-        model_context_window=64,
+        model_context_window=4_096,
         compaction_trigger_ratio=0.5,
         compaction_keep_recent_turns=1,
     )
     engine = engine_factory(rc=rc)
+    in_memory_runtime["llm"].queue_response(text='{"summary":"old answer"}')
     in_memory_runtime["llm"].queue_response(text="post-compaction reply")
 
-    big_text = "a" * 1024
-    user_msg = Message(role=MessageRole.user, content_blocks=[TextBlock(text=big_text)])
+    engine.history.append(
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[TextBlock(text="a" * 10_000)],
+        )
+    )
+    user_msg = Message(role=MessageRole.user, content_blocks=[TextBlock(text="continue")])
     events: list[TurnEvent] = []
     async for evt in engine.run(user_msg):
         events.append(evt)

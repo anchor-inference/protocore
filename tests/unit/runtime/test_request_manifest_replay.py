@@ -217,6 +217,24 @@ async def test_the_manifest_states_what_the_request_was_made_of() -> None:
     assert len(manifest.constants_sha256) == 64
 
 
+async def test_manifest_records_the_hard_fitted_output_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text="done", stop_reason=StopReason.end_turn)
+    sink = InMemoryRequestManifestSink()
+    rc = LoopConstants(model_context_window=8_192)
+    monkeypatch.setattr(
+        "protocore.runtime.request_budget.estimate_request_prompt_tokens",
+        lambda request, constants, **kwargs: constants.model_context_window - 1,
+    )
+
+    await _drive(_build_engine(llm=llm, sink=sink, rc=rc))
+
+    assert llm.calls[0].max_tokens == 1
+    assert sink.manifests[0].max_tokens == 1
+
+
 async def test_the_attempt_id_is_stable_across_processes() -> None:
     """Derived from the run, the turn and the request's own digest — so the
     same request rebuilt on another pod carries the same id without anything
@@ -463,8 +481,8 @@ async def test_a_run_that_compacted_records_the_summariser_call_and_replays() ->
     it is the call an incident most needs explained.
     """
     compacting_rc = LoopConstants(
-        model_context_window=512,
-        compaction_trigger_ratio=0.5,
+        model_context_window=4_096,
+        compaction_trigger_ratio=0.2,
         compaction_keep_recent_turns=1,
     )
     summary = "the old turns, summarised"

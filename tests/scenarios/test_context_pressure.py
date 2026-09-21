@@ -98,10 +98,10 @@ async def test_the_proactive_switches_do_not_reach_the_turn_start_gate(
     assert EventType.COMPACTION_STARTED in [evt.type for evt in produced]
 
 
-async def test_the_provider_reported_prompt_size_can_trigger_a_compaction(
+async def test_provider_count_from_an_old_request_does_not_trigger_compaction(
     scenario: ScenarioFactory,
 ) -> None:
-    """The char estimate under-counts; the real number the provider reports floors it."""
+    """A scalar from one wire envelope cannot size the next one by itself."""
     run = scenario(
         rc=default_rc(
             model_context_window=1_000,
@@ -120,7 +120,8 @@ async def test_the_provider_reported_prompt_size_can_trigger_a_compaction(
 
     produced = await run.run("small question")
 
-    assert EventType.COMPACTION_STARTED in [evt.type for evt in produced]
+    assert EventType.COMPACTION_STARTED not in [evt.type for evt in produced]
+    assert len(run.requests) == 2
 
 
 async def test_a_prompt_over_the_cliff_is_compacted_unconditionally(
@@ -141,13 +142,12 @@ async def test_a_prompt_over_the_cliff_is_compacted_unconditionally(
             compaction_emergency_ratio=0.8,
             compaction_keep_recent_turns=1,
         ),
-        tools=[ScriptedTool(tool_name="Note")],
+        tools=[ScriptedTool(tool_name="Note", content="x" * 4_000)],
     )
     run.llm.queue_tool_call_response(
         tool_call_id="call-1",
         tool_name="Note",
         tool_input={},
-        usage_input_tokens=900,
     )
     run.llm.queue_response(text="after the cliff was cleared")
 
@@ -173,13 +173,12 @@ async def test_the_cliff_switch_leaves_the_ordinary_gate_running(
             compaction_emergency_proactive_enabled=False,
             compaction_keep_recent_turns=1,
         ),
-        tools=[ScriptedTool(tool_name="Note")],
+        tools=[ScriptedTool(tool_name="Note", content="x" * 2_400)],
     )
     run.llm.queue_tool_call_response(
         tool_call_id="call-1",
         tool_name="Note",
         tool_input={},
-        usage_input_tokens=900,
     )
     run.llm.queue_response(text="after the ordinary compaction")
 
@@ -313,7 +312,11 @@ async def test_pressure_the_first_pass_cannot_absorb_is_summarised(
     apart from the first.
     """
     run = scenario(
-        rc=_compacting_rc(compaction_routine_min_clear_ratio=1.0),
+        rc=_compacting_rc(
+            model_context_window=4_096,
+            compaction_trigger_ratio=0.3,
+            compaction_routine_min_clear_ratio=1.0,
+        ),
     )
     for index in range(2):
         run.engine.history.append(

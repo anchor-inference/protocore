@@ -41,6 +41,7 @@ from protocore.constants import MAX_TOKEN_ESTIMATE_CACHE_ENTRIES
 from protocore.contracts.blob import IBlobStore
 from protocore.contracts.llm import (
     ILLMProvider,
+    LLMContextWindowExceeded,
     LLMObservabilityContext,
     LLMRequest,
 )
@@ -1303,6 +1304,22 @@ async def _run_summariser(
         temperature=rc.compaction_summary_temperature,
         observability=observability,
     )
+    from protocore.runtime.request_budget import fit_request_to_context
+
+    try:
+        request = fit_request_to_context(request, rc)
+    except LLMContextWindowExceeded as exc:
+        _logger.warning(
+            "summariser request exceeds the context window for %s; skipping (err=%s)",
+            unit_label,
+            exc,
+        )
+        return _SummaryOutcome(
+            anchor_key=anchor_key,
+            replacement=None,
+            tokens_freed=0,
+            failed=True,
+        )
     if record_request is not None:
         await record_request(request)
     try:

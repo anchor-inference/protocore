@@ -103,6 +103,11 @@ _PROCESS_LOCAL: dict[str, str] = {
         "background_task_ids of the payload this engine was resumed from, and a "
         "run that was never resumed has none."
     ),
+    "_token_estimate_calibration_baseline": (
+        "the destination engine's configured calibration is the fallback for a "
+        "different model; a learned run value is carried separately with its "
+        "model identity"
+    ),
 }
 
 
@@ -319,6 +324,10 @@ _RESTORED_BY_HELPER: dict[str, str] = {
         "compared against the digest the payload carried; assigning the "
         "block from the payload would resume onto a catalog that may no "
         "longer exist."
+    ),
+    "_token_estimate_calibration_model": (
+        "restored together with the learned factor through "
+        "set_token_estimate_calibration after the effective model is known"
     ),
 }
 

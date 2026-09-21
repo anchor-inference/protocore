@@ -202,59 +202,14 @@ def test_context_manager_no_compaction_for_short_history() -> None:
     assert mgr.needs_compaction([small]) is False
 
 
-def test_observed_prompt_tokens_floors_compaction_gate() -> None:
-    """The char heuristic under-counts adversarial content, so a history that
-    the estimate reads as tiny must still trip the gate once the provider has
-    reported a real prompt size above the trigger. Regression for a 65536-window
-    provider that received ~148K real input tokens with the estimate far below
-    trigger and never compacted."""
-    rc = LoopConstants(model_context_window=65_536)
-    blobs = InMemoryBlobStore()
-    llm = InMemoryLLMProvider()
-    mgr = ContextManager(rc=rc, blob_store=blobs, compaction_llm=llm)
-
-    # A short message whose char estimate is far below 0.8 * 65536 = 52428.
-    tiny = Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
-    assert estimate_history_tokens([tiny], rc) < 52_428
-
-    # No real measurement yet → gate relies on the (low) estimate → no compaction.
-    assert mgr.needs_compaction([tiny], observed_prompt_tokens=0) is False
-    # Provider reported 148K real prompt tokens on the prior call (2.25x window).
-    assert mgr.needs_compaction([tiny], observed_prompt_tokens=147_892) is True
-    assert (
-        mgr.needs_emergency_compaction([tiny], observed_prompt_tokens=147_892)
-        is True
-    )
-
-
-def test_observed_prompt_tokens_below_trigger_does_not_force_compaction() -> None:
-    """A real measurement UNDER the trigger must not spuriously trip the gate;
-    the floor is a max, never an override that ignores a healthy prompt."""
-    rc = LoopConstants(model_context_window=65_536)
-    blobs = InMemoryBlobStore()
-    llm = InMemoryLLMProvider()
-    mgr = ContextManager(rc=rc, blob_store=blobs, compaction_llm=llm)
-
-    tiny = Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
-    # 10K real tokens < 0.8 * 65536 trigger and < 0.95 * 65536 emergency.
-    assert mgr.needs_compaction([tiny], observed_prompt_tokens=10_000) is False
-    assert (
-        mgr.needs_emergency_compaction([tiny], observed_prompt_tokens=10_000)
-        is False
-    )
-
-
-def test_estimate_still_governs_when_it_exceeds_observed() -> None:
-    """When the char estimate is the larger of the two (e.g. right after a
-    resume with a stale-zero observation but a genuinely large history), the
-    estimate still drives the gate — the floor is max(estimate, observed)."""
+def test_calibrated_estimate_governs_compaction() -> None:
     rc = LoopConstants(model_context_window=512)
     blobs = InMemoryBlobStore()
     llm = InMemoryLLMProvider()
     mgr = ContextManager(rc=rc, blob_store=blobs, compaction_llm=llm)
 
     big = Message(role=MessageRole.user, content_blocks=[TextBlock(text="x" * 8000)])
-    assert mgr.needs_compaction([big], observed_prompt_tokens=0) is True
+    assert mgr.needs_compaction([big]) is True
 
 
 # ---------------------------------------------------------------------------

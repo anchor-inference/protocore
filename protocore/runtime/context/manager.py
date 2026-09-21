@@ -519,44 +519,22 @@ class ContextManager:
     def current_prompt_tokens(
         self,
         history: Sequence[Message],
-        *,
-        observed_prompt_tokens: int = 0,
     ) -> int:
-        """Best estimate of the current prompt size in tokens.
-
-        The char-based :func:`estimate_history_tokens` heuristic is only a
-        cold-start proxy: it systematically under-counts adversarial content
-        (digit-dense tables, multilingual prose) by 2-3x relative to the real
-        provider tokenizer, so a history that already occupies >2x the context
-        window can still read below the compaction trigger. When the provider
-        has reported a real prompt token count for a prior LLM call
-        (``observed_prompt_tokens``), that ground-truth measurement is the
-        floor — history only grows between calls, so the last real prompt size
-        is a valid lower bound on the current one. The heuristic still governs
-        cold start (turn 1, no usage yet) and post-compaction (observed is
-        reset to 0 so the freshly-shrunk history is re-measured cheaply).
-        """
-        estimated = self._token_estimator.estimate_history(history, self._rc)
-        return max(estimated, max(0, observed_prompt_tokens))
+        """Calibrated estimate of the history available to this gate."""
+        return self._token_estimator.estimate_history(history, self._rc)
 
     def needs_compaction(
         self,
         history: Sequence[Message],
-        *,
-        observed_prompt_tokens: int = 0,
     ) -> bool:
         """Return ``True`` if the current prompt exceeds the trigger threshold."""
         budgets = derive_budgets(self._rc)
-        current = self.current_prompt_tokens(
-            history, observed_prompt_tokens=observed_prompt_tokens
-        )
+        current = self.current_prompt_tokens(history)
         return current > budgets.compaction_trigger_tokens
 
     def needs_emergency_compaction(
         self,
         history: Sequence[Message],
-        *,
-        observed_prompt_tokens: int = 0,
     ) -> bool:
         """Return ``True`` if the current prompt exceeds the emergency cliff.
 
@@ -568,9 +546,7 @@ class ContextManager:
         enforces ``compaction_trigger_ratio < compaction_emergency_ratio``).
         """
         budgets = derive_budgets(self._rc)
-        current = self.current_prompt_tokens(
-            history, observed_prompt_tokens=observed_prompt_tokens
-        )
+        current = self.current_prompt_tokens(history)
         return current > budgets.compaction_emergency_tokens
 
 

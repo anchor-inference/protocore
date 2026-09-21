@@ -152,7 +152,6 @@ from protocore.runtime.answer_narration import leading_narration_span
 from protocore.runtime.context.compaction import (
     CompactionExhaustedError,
     current_tool_batch_protect_index,
-    estimate_history_tokens_uncalibrated,
 )
 from protocore.runtime.context.manager import ContextBundle
 from protocore.runtime.error_kinds import (
@@ -197,6 +196,10 @@ from protocore.runtime.loop_guard import (
 from protocore.runtime.loop_state import LoopState
 from protocore.runtime.loop_strategies import select_strategy
 from protocore.runtime.prompt_caching import apply_system_and_3
+from protocore.runtime.request_budget import (
+    estimate_request_prompt_tokens_uncalibrated,
+    fit_request_to_context,
+)
 from protocore.runtime.result_eviction import evict_history_for_llm, tool_name_for_result
 from protocore.runtime.run_work_budget import (
     SUBAGENT_RUN_BUDGET_SHORT,
@@ -229,7 +232,6 @@ from protocore.runtime.tool_surface import (
     note_surface_described,
     read_tool_surface,
     surface_needs_describing,
-    tool_surface_tokens,
 )
 from protocore.runtime.turn_policies import (
     RunCounter,
@@ -2577,10 +2579,9 @@ async def _run_compaction(
     if compact_usage is not None:
         yield compact_usage
 
-    # The last real prompt measurement now describes a pre-compaction history
-    # that no longer exists. Clear it so the gate does not re-fire on a stale
-    # high-water mark: the freshly-shrunk history is re-measured by the cheap
-    # estimate until the next LLM call reports a new ground-truth prompt size.
+    # The diagnostic scalar describes the pre-compaction request. Clear it so
+    # snapshots and telemetry do not present it as a measurement of the newly
+    # rewritten history; request budgeting uses the calibrated current shape.
     engine.last_observed_prompt_tokens = 0
 
     # Snapshot after compaction completion
@@ -2781,6 +2782,10 @@ async def _advance_provider_chain(
     engine._provider_chain_advances += 1
     engine.llm = chain.current()
     engine.config = replace(engine.config, model_name=chain.current_model_name())
+    engine.set_token_estimate_calibration(
+        engine._token_estimate_calibration_baseline,
+        model_name=chain.current_model_name(),
+    )
     return chain.current_model_name()
 
 
@@ -4579,8 +4584,19 @@ async def _drive_one_stream(
     # description on an event nobody received.
     if advert.describes:
         note_surface_described(advert.digest, advert.audience)
+    request_model = engine.effective_model_name
+    if engine._token_estimate_calibration_model != request_model:
+        engine.set_token_estimate_calibration(
+            engine._token_estimate_calibration_baseline,
+            model_name=request_model,
+        )
+    # A live model switch may be applied while the advertised-surface event is
+    # in the consumer's hands. Re-read both the request model and its bound
+    # calibration before the hard fit; the values captured at function entry
+    # may describe the previous model.
+    rc = engine.config.rc
     request = build_llm_request(
-        model=engine.effective_model_name,
+        model=request_model,
         messages=full_messages,
         tools=context.tools,
         max_tokens=max_output_tokens,
@@ -4594,6 +4610,7 @@ async def _drive_one_stream(
             call_category=_provider_call_category(engine),
         ),
     )
+    request = fit_request_to_context(request, rc)
 
     block_idx = engine.next_block_idx()
     # Track the KIND of the currently-open content block, not a bare
@@ -4788,8 +4805,9 @@ async def _drive_one_stream(
             # inclusive of any cache-read portion) into ``input_tokens``, so it
             # already reflects total context-window occupancy — do NOT add
             # ``cache_read`` on top (that subset is already inside input_tokens
-            # and would double-count). Floors the compaction gate against the
-            # char heuristic, which under-counts adversarial content 2-3x.
+            # and would double-count). It trains the model-bound calibration
+            # applied to later current-request estimates; the scalar itself is
+            # never reused as a different request's floor.
             if input_tokens > 0:
                 engine.last_observed_prompt_tokens = input_tokens
                 _calibrate_token_estimate(engine, request, input_tokens)
@@ -5050,11 +5068,17 @@ def _calibrate_token_estimate(engine: QueryEngine, request: LLMRequest, observed
     definitions are costed once per surface digest, which for a deployment
     whose registry is not changing is once.
     """
+    if request.model != engine.effective_model_name:
+        return
+    if engine._token_estimate_calibration_model != request.model:
+        engine.set_token_estimate_calibration(
+            engine._token_estimate_calibration_baseline,
+            model_name=request.model,
+        )
     rc = engine.config.rc
     if not rc.token_estimate_calibration_enabled or observed <= 0:
         return
-    raw = estimate_history_tokens_uncalibrated(list(request.messages), rc)
-    raw += tool_surface_tokens(read_tool_surface(request.tools), rc)
+    raw = estimate_request_prompt_tokens_uncalibrated(request, rc)
     if raw <= 0:
         return
     measured = min(max(observed / raw, 1.0), 4.0)
@@ -5062,9 +5086,7 @@ def _calibrate_token_estimate(engine: QueryEngine, request: LLMRequest, observed
     smoothed = round(current + (measured - current) * 0.5, 3)
     if abs(smoothed - current) < 0.02:
         return
-    calibrated = rc.model_copy(update={"token_estimate_calibration": smoothed})
-    engine.config = replace(engine.config, rc=calibrated)
-    engine.context_manager.update_rc(calibrated)
+    engine.set_token_estimate_calibration(smoothed, model_name=request.model)
 
 
 async def _handle_context_window_exceeded(
@@ -5164,9 +5186,8 @@ async def _handle_context_window_exceeded(
         },
     )
     # This path calls force_compaction directly (not via _run_compaction), so
-    # clear the stale prompt-size floor here too — the pre-compaction history it
-    # described no longer exists, and leaving it set would drive one spurious
-    # compaction at the next turn-start before the next LLM call self-heals it.
+    # clear the diagnostic scalar here too: it describes the request before
+    # history was rewritten, not the current prompt.
     engine.last_observed_prompt_tokens = 0
     await engine._persist_snapshot()
     compacting_from = engine.state

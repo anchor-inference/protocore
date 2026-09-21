@@ -736,6 +736,8 @@ class QueryEngine:
             "compact_checkpoint",
             "context_manager",
             "last_observed_prompt_tokens",
+            "_token_estimate_calibration_baseline",
+            "_token_estimate_calibration_model",
             "last_heartbeat_ms",
             "_pinned_tool_result_ids",
             "_skill_catalog_block",
@@ -865,11 +867,10 @@ class QueryEngine:
         self.total_usage = TokenUsage()
         # Real provider-reported prompt size (full prompt_tokens, normalised
         # into input_tokens by the adapters) for the most recent LLM call.
-        # Ground truth for the compaction gate — the
-        # char heuristic under-counts adversarial content, so this floors the
-        # decision. 0 means "no real measurement yet" (cold start or just after
-        # a compaction shrank history), in which case the gate falls back to
-        # the cheap estimate until the next LLM call refreshes it.
+        # Ground truth for adaptive calibration: the char heuristic under-counts
+        # adversarial content, so provider usage trains the multiplier applied
+        # to later current-request estimates. The scalar itself never floors a
+        # different request or a history-only compaction decision.
         self.last_observed_prompt_tokens: int = 0
         self.turn_count = 0
         self.last_heartbeat_ms: int = 0
@@ -1113,6 +1114,10 @@ class QueryEngine:
         self._live_model_name: str | None = None
         self._live_thinking_enabled: bool | None = None
         self._live_reasoning_effort: str | None = None
+        self._token_estimate_calibration_baseline: float = (
+            config.rc.token_estimate_calibration
+        )
+        self._token_estimate_calibration_model: str = config.model_name
         self._reasoning_recovery_thinking_enabled: bool | None = None
         self._reasoning_recovery_effort: str | None = None
         self._run_settled_emitted: bool = False
@@ -2504,6 +2509,10 @@ class QueryEngine:
             "pending_interrupts": serialise_interrupts(self._pending_interrupts),
             "usage": self.total_usage.to_dict(),
             "last_observed_prompt_tokens": self.last_observed_prompt_tokens,
+            "token_estimate_calibration": self.config.rc.token_estimate_calibration,
+            "token_estimate_calibration_model": (
+                self._token_estimate_calibration_model
+            ),
             "compaction": {
                 "retry_count": self.compaction_state.retry_count,
                 "summarised_turn_ids": list(self.compaction_state.summarised_turn_ids),
@@ -2976,6 +2985,10 @@ class QueryEngine:
         restored_observed_prompt_tokens = int(
             snapshot.get("last_observed_prompt_tokens", 0)
         )
+        restored_calibration = snapshot.get("token_estimate_calibration")
+        restored_calibration_model = snapshot.get(
+            "token_estimate_calibration_model"
+        )
         # The run continuity — checkpoint, rules, pins, records. Parsed here for
         # the same reason as the history above: a missing or malformed block
         # must refuse the snapshot with the chain standing where it was, not
@@ -3297,6 +3310,23 @@ class QueryEngine:
         )
         live_model = snapshot.get("live_model_name")
         self._live_model_name = live_model if isinstance(live_model, str) else None
+        restored_calibration_factor = self._token_estimate_calibration_baseline
+        if (
+            self.config.rc.token_estimate_calibration_enabled
+            and isinstance(restored_calibration_model, str)
+            and restored_calibration_model == self.effective_model_name
+            and isinstance(restored_calibration, int | float)
+            and not isinstance(restored_calibration, bool)
+            and 1.0 <= float(restored_calibration) <= 4.0
+        ):
+            restored_calibration_factor = max(
+                self._token_estimate_calibration_baseline,
+                float(restored_calibration),
+            )
+        self.set_token_estimate_calibration(
+            restored_calibration_factor,
+            model_name=self.effective_model_name,
+        )
         if "live_thinking_enabled" in snapshot:
             thinking_flag = snapshot.get("live_thinking_enabled")
             self._live_thinking_enabled = (
@@ -3523,11 +3553,30 @@ class QueryEngine:
         if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
             raise ValueError("invalid_reasoning_effort")
         if model_name is not None:
+            if model_name != self.effective_model_name:
+                self.set_token_estimate_calibration(
+                    self._token_estimate_calibration_baseline,
+                    model_name=model_name,
+                )
             self._live_model_name = model_name
         if thinking_enabled is not None:
             self._live_thinking_enabled = thinking_enabled
         if reasoning_effort is not None:
             self._live_reasoning_effort = reasoning_effort
+
+    def set_token_estimate_calibration(
+        self,
+        factor: float,
+        *,
+        model_name: str,
+    ) -> None:
+        """Bind one adaptive estimate factor to the model that produced it."""
+        calibrated = self.config.rc.model_copy(
+            update={"token_estimate_calibration": factor}
+        )
+        self.config = replace(self.config, rc=calibrated)
+        self.context_manager.update_rc(calibrated)
+        self._token_estimate_calibration_model = model_name
 
     def pin_tool_result(self, tool_call_id: str) -> None:
         self._pinned_tool_result_ids.add(tool_call_id)
@@ -3537,17 +3586,11 @@ class QueryEngine:
         return is_terminal(self.state)
 
     def needs_compaction(self) -> bool:
-        return self.context_manager.needs_compaction(
-            self.history,
-            observed_prompt_tokens=self.last_observed_prompt_tokens,
-        )
+        return self.context_manager.needs_compaction(self.history)
 
     def needs_emergency_compaction(self) -> bool:
         """Return True when history exceeds the emergency cliff (proactive force)."""
-        return self.context_manager.needs_emergency_compaction(
-            self.history,
-            observed_prompt_tokens=self.last_observed_prompt_tokens,
-        )
+        return self.context_manager.needs_emergency_compaction(self.history)
 
     @property
     def last_request_manifest(self) -> dict[str, Any] | None:

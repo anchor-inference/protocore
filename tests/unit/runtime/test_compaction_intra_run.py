@@ -18,8 +18,6 @@ Covers, with universal (non-eval-tuned) assertions:
 """
 from __future__ import annotations
 
-from itertools import pairwise
-
 import pytest
 
 from protocore.contracts.runtime_constants import LoopConstants
@@ -1099,38 +1097,34 @@ async def test_per_iteration_gate_kill_switch_reverts_to_turn_start_only(
     ]
     assert not per_iter
 
-    # Contrast proof: with the gate OFF the per-call prompt grows MONOTONICALLY
-    # (the b5a0762e inflation) far past the trigger — the gate is load-bearing.
+    # Contrast proof: with the gate OFF a provider-bound prompt grows past the
+    # proactive trigger. The hard request ceiling still prevents an oversized
+    # call and routes the next attempt through reactive compaction.
     budgets = derive_budgets(rc)
-    estimates = [_prompt_estimate(req) for req in llm.calls if req.messages]
+    requests = [request for request in llm.calls if request.messages]
+    estimates = [_prompt_estimate(request) for request in requests]
     assert estimates
-    assert max(estimates) > budgets.compaction_emergency_tokens
-    # Strictly increasing across the tool-call iterations (ignoring the final
-    # short answer turn): each iteration adds an un-shed tool result.
-    growth = estimates[: len(estimates) - 1] if len(estimates) > 1 else estimates
-    assert all(b >= a for a, b in pairwise(growth)), growth
+    assert max(estimates) > budgets.compaction_trigger_tokens
+    assert all(
+        estimate + request.max_tokens <= rc.model_context_window
+        for estimate, request in zip(estimates, requests, strict=True)
+    )
 
 
 @pytest.mark.asyncio
-async def test_real_provider_prompt_size_triggers_compaction_when_estimate_low(
+async def test_observed_prompt_size_does_not_drive_history_only_compaction(
     engine_factory, in_memory_runtime
 ) -> None:
-    """The compaction gate must fire on the provider's real reported prompt
-    size, not only the char heuristic. Regression for the deepseek-v4-flash
-    stress case: a 65536-window run whose provider reported ~148K input tokens
-    (2.25x window) never compacted because the cheap char estimate of the
-    (adversarial, digit/multilingual) history stayed below the trigger.
+    """A count from an older wire envelope cannot size history by itself.
 
-    Here the history bytes are trivially small (a tiny tool result), so the
-    estimate is far below trigger — the ONLY signal above trigger is the
-    provider-reported ``input_tokens``. Compaction must still fire.
+    The provider reports a deliberately enormous count on a tiny first action
+    request. The following per-iteration gate has only history, not the full
+    current request's model/tool/context envelope, so it must rely on the
+    calibrated current-history estimate and leave the stale scalar out.
     """
     rc = LoopConstants(
         model_context_window=4_096,
         compaction_per_iteration_enabled=True,
-        # Protect the whole (tiny) history from Tier-2 so no summariser LLM
-        # call is made — keeps the scripted mock queue deterministic. The gate
-        # firing at all is what this test asserts.
         compaction_keep_recent_turns=50,
         compaction_failed_max_retries=10,
     )
@@ -1160,24 +1154,10 @@ async def test_real_provider_prompt_size_triggers_compaction_when_estimate_low(
 
     assert estimate_history_tokens(engine.history, rc) < budgets.compaction_trigger_tokens
 
-    # The observed-prompt-tokens floor drove a proactive per-iteration
-    # compaction even though the estimate is tiny.
-    proactive = [
-        e
-        for e in events
-        if e.type is EventType.COMPACTION_STARTED
-        and str(e.payload.get("reason", "")).startswith("proactive_per_iteration")
-    ]
-    assert proactive, "compaction never fired on the real provider prompt size"
-
-    # Exactly once: resetting the floor to 0 after compaction prevents the gate
-    # from oscillating (re-firing every iteration on a stale high-water mark).
     all_started = [e for e in events if e.type is EventType.COMPACTION_STARTED]
-    assert len(all_started) == 1, [e.payload.get("reason") for e in all_started]
-
-    # After compaction the stale high-water mark is cleared so the gate does
-    # not re-fire on a history that no longer exists.
-    assert engine.last_observed_prompt_tokens == 0
+    assert all_started == []
+    assert engine.state is LoopState.COMPLETED
+    assert engine.last_observed_prompt_tokens == 147_892
 
 
 # ---------------------------------------------------------------------------
