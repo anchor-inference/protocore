@@ -61,6 +61,18 @@ def test_fit_max_tokens_keeps_provider_framing_margin_unused() -> None:
     )
 
 
+def test_default_margin_prevents_the_observed_one_token_overflow() -> None:
+    assert (
+        fit_max_tokens(
+            prompt_tokens=57_344,
+            requested_max_tokens=8_192,
+            context_window=65_536,
+            safety_tokens=LoopConstants().request_context_safety_tokens,
+        )
+        == 8_191
+    )
+
+
 def test_fit_max_tokens_rejects_prompt_that_fills_usable_window() -> None:
     with pytest.raises(LLMContextWindowExceeded):
         fit_max_tokens(

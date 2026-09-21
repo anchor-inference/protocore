@@ -4,6 +4,19 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0a7]
+
+### Fixed
+
+- **Provider framing can no longer push an exactly fitted request one token
+  beyond the context window.** Complete requests now leave a configurable
+  `request_context_safety_tokens` margin after prompt estimation and before
+  choosing `max_tokens`. The default one-token margin covers providers that
+  count a framing token absent from the local estimate, while the runtime
+  constants contract lets an installation reserve more for another tokenizer.
+  Invalid margins that consume the whole context window are rejected by both
+  snapshot validation and the constants registry.
+
 ## [2.0.0a6]
 
 This release makes long-running conversations safer at the two points where a
