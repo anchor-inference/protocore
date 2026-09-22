@@ -597,6 +597,47 @@ async def test_context_window_exceeded_second_failure_is_terminal(
     assert [request.max_tokens for request in failing_llm.calls] == [8_192, 4_096]
 
 
+@pytest.mark.asyncio
+async def test_context_window_corrective_retry_is_bounded(
+    engine_factory, in_memory_runtime
+) -> None:
+    rc = LoopConstants(
+        model_context_window=65_536,
+        request_context_safety_tokens=2_048,
+        llm_output_max_tokens_ratio=0.125,
+        compaction_keep_recent_turns=1,
+    )
+    engine = engine_factory(rc=rc)
+    failing_llm = _ScriptedFailureLLM(
+        exceptions=[
+            LLMContextWindowExceeded("pre-compaction overflow"),
+            LLMContextWindowExceeded(
+                "compacted request overflowed",
+                context_window=65_536,
+                input_tokens=62_000,
+                requested_output_tokens=4_096,
+            ),
+            LLMContextWindowExceeded(
+                "corrective request overflowed",
+                context_window=65_536,
+                input_tokens=64_100,
+                requested_output_tokens=1_488,
+            ),
+        ],
+    )
+    engine.llm = failing_llm  # type: ignore[assignment]
+    engine.context_manager._compaction_llm = failing_llm  # type: ignore[attr-defined]
+    engine.compaction_llm = failing_llm  # type: ignore[assignment]
+
+    async for _ in engine.run(
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+    ):
+        pass
+
+    assert engine.state is LoopState.FAILED
+    assert [request.max_tokens for request in failing_llm.calls] == [8_192, 4_096, 1_488]
+
+
 # ----------------------------------------------------------------------
 # ContextManager.force_compaction unit coverage
 # ----------------------------------------------------------------------
