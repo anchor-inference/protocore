@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0a19]
+
 ### Added
 
 - **A provider can size the rendered request, and is asked near the edge.**
