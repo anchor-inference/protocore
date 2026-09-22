@@ -26,6 +26,19 @@ All notable changes to this project are recorded here. The format follows
   again. The rate is now `compaction_summary_output_tokens_per_word` (4), and
   it caps the fold target the same way.
 
+### Changed
+
+- **A summariser failure costs its own unit, not the whole pass.** Tier 2 used
+  to discard everything a pass had produced as soon as one call failed, so one
+  unit the summariser cannot handle kept a run from shedding a single token
+  and the next pass bought the same failure again. Failures are now counted
+  per unit in `CompactionState.failed_anchor_keys`; past
+  `compaction_summary_failed_unit_max_attempts` (2) the unit is left to the
+  fold tier, and the other units in the batch commit. The census is carried in
+  the run snapshot. A reply carrying no readable summary now counts as a
+  failed call — that is the shape a cut-off reply takes — while a summary that
+  is merely no smaller than the original does not.
+
 ## [2.0.0a16]
 
 ### Fixed

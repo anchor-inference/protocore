@@ -170,6 +170,15 @@ class CompactionState:
     retry_count: int = 0
     summarised_turn_ids: set[str] = field(default_factory=set)
     blob_refs_created: list[str] = field(default_factory=list)
+    failed_anchor_keys: dict[str, int] = field(default_factory=dict)
+    """How many passes the summariser has failed on a unit, by anchor key.
+
+    Past ``compaction_summary_failed_unit_max_attempts`` the unit is not sent
+    again: the failure is a property of the unit (too large to fit, or a reply
+    the cap cuts every time), so paying for it again buys the same failure.
+    Snapshotted with the rest of the state, because a run re-driven on another
+    pod would otherwise start the same census from zero.
+    """
 
     def reset_retries(self) -> None:
         self.retry_count = 0
@@ -1189,6 +1198,14 @@ class _SummaryOutcome:
     replacement: Message | None
     tokens_freed: int
     failed: bool = False
+    """The CALL went wrong — it raised, would not fit, or brought back no
+    usable summary — as opposed to a summary that simply came back no smaller.
+
+    Only the former is counted against the unit: a summary that is no smaller
+    is a fact about this unit's size that says nothing about whether the next
+    attempt can succeed, while a call that cannot complete fails the same way
+    every time it is repeated.
+    """
 
 
 def _is_plain_operator_turn(message: Message) -> bool:
@@ -1343,7 +1360,16 @@ async def _run_summariser(
         )
     summary_text = _summary_from_response(response.message.text, unit_label)
     if not summary_text:
-        return _SummaryOutcome(anchor_key=anchor_key, replacement=None, tokens_freed=0)
+        # A reply with no readable summary in it is the shape a cut-off reply
+        # takes: the JSON envelope never closed. It is a failed CALL, not a
+        # summary that came back too large, and repeating it on the same unit
+        # produces the same cut in the same place.
+        return _SummaryOutcome(
+            anchor_key=anchor_key,
+            replacement=None,
+            tokens_freed=0,
+            failed=True,
+        )
     wrapped = _wrap_compaction_summary(anchor_key, summary_text)
     after_tokens = estimate_tokens(wrapped, rc)
     if after_tokens >= before_tokens:
@@ -1506,6 +1532,7 @@ async def run_tier2_summarisation(
     original_history = history
     history = list(history)
     summarised_turn_ids = set(state.summarised_turn_ids)
+    failed_anchor_keys = dict(state.failed_anchor_keys)
 
     keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
     eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index)
@@ -1588,6 +1615,13 @@ async def run_tier2_summarisation(
         anchor_key = _stable_turn_key(anchor)
         if anchor_key in summarised_turn_ids:
             continue
+        if (
+            failed_anchor_keys.get(anchor_key, 0)
+            >= rc.compaction_summary_failed_unit_max_attempts
+        ):
+            # The summariser has failed on this unit as often as it may. Paying
+            # again buys the same failure; the fold tier still gets its turn.
+            continue
         # Exhaustive across EVERY member of the unit (assistant turn + its
         # tool results), so the summary preserves the tool exchange.
         unit_messages = [history[member] for member in unit.indices]
@@ -1643,12 +1677,19 @@ async def run_tier2_summarisation(
                 for unit, anchor_key, unit_messages, before_tokens, _seed_only in batch
             )
         )
-        if any(outcome.failed for outcome in outcomes):
-            return Tier2Result(turns_summarised=0, tokens_freed=0)
         for (unit, _key, _members, _before, seed_only), outcome in zip(
             batch, outcomes, strict=True
         ):
             if outcome.replacement is None:
+                # A failed CALL is counted against its own unit and nothing
+                # else: the units beside it in the batch are unaffected, and a
+                # pass that lost one of five still commits the other four. An
+                # all-or-nothing pass meant one oversized unit could keep a run
+                # from shedding a single token.
+                if outcome.failed:
+                    failed_anchor_keys[outcome.anchor_key] = (
+                        failed_anchor_keys.get(outcome.anchor_key, 0) + 1
+                    )
                 continue
             replacement = outcome.replacement
             if seed_only:
@@ -1679,6 +1720,7 @@ async def run_tier2_summarisation(
     if history != original_history:
         original_history[:] = history
     state.summarised_turn_ids = summarised_turn_ids
+    state.failed_anchor_keys = failed_anchor_keys
 
     return Tier2Result(turns_summarised=summarised, tokens_freed=freed)
 

@@ -347,5 +347,9 @@ async def test_a_cold_resume_does_not_re_summarise_what_was_already_summarised(
     # key the snapshot brought back.
     resumed_snapshot = resumed.engine.snapshot()
     assert already <= set(resumed_snapshot["compaction"]["summarised_turn_ids"])
+    # The per-unit failure census rides the same snapshot: a resumed run that
+    # started it from zero would pay again for units already proved unsummarisable.
+    assert "failed_anchor_keys" in snapshot["compaction"]
+    assert "failed_anchor_keys" in resumed_snapshot["compaction"]
     fresh_prompts = [call.messages[0].text for call in summariser.calls[calls_before:]]
     assert all("<compacted-turn" not in prompt.split("</turn>")[0] for prompt in fresh_prompts)

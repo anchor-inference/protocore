@@ -475,6 +475,18 @@ class LoopConstants(BaseModel):
             "that never shrink, and the next pass pays for them again."
         ),
     )
+    compaction_summary_failed_unit_max_attempts: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "How many passes may try to summarise the same unit and fail — the "
+            "provider raised, the request would not fit, or the reply carried "
+            "no usable summary — before the run stops paying for that unit. A "
+            "unit that fails the same way twice fails the same way every later "
+            "pass, and the per-iteration gate would otherwise buy the same "
+            "failure once an iteration. The fold tier still gets its turn at it."
+        ),
+    )
     compaction_summary_tokens_per_word: int = Field(
         default=6,
         ge=1,

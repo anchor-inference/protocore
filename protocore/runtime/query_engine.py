@@ -2544,6 +2544,10 @@ class QueryEngine:
                 "retry_count": self.compaction_state.retry_count,
                 "summarised_turn_ids": list(self.compaction_state.summarised_turn_ids),
                 "blob_refs_created": list(self.compaction_state.blob_refs_created),
+                # The per-unit failure census. Without it a resumed run starts
+                # paying again for the units the summariser already proved it
+                # cannot summarise.
+                "failed_anchor_keys": dict(self.compaction_state.failed_anchor_keys),
             },
             "last_heartbeat_ms": self.last_heartbeat_ms,
             # Persist the terminal-only latch so an executor pod that
@@ -3033,6 +3037,10 @@ class QueryEngine:
             retry_count=int(compaction.get("retry_count", 0)),
             summarised_turn_ids=set(compaction.get("summarised_turn_ids", [])),
             blob_refs_created=list(compaction.get("blob_refs_created", [])),
+            failed_anchor_keys={
+                str(key): int(count)
+                for key, count in dict(compaction.get("failed_anchor_keys", {})).items()
+            },
         )
 
         # Put the run back on the provider it was demoted to. An unreachable

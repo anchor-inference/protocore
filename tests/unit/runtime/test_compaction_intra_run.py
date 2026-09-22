@@ -548,7 +548,13 @@ async def test_tier2_cleanup_only_satisfies_target_without_provider_call() -> No
 
 
 @pytest.mark.asyncio
-async def test_tier2_provider_failure_rolls_back_synthetic_cleanup() -> None:
+async def test_tier2_provider_failure_keeps_the_deterministic_cleanup() -> None:
+    """A failed summariser call costs its own unit and nothing else.
+
+    Dropping an aged synthetic recovery nudge needs no provider, so it is not
+    undone by a call that failed elsewhere in the pass: the pass commits what
+    it actually achieved and counts the failure against the unit that caused it.
+    """
     from protocore.tests_support.adapters import InMemoryLLMProvider
 
     class FailingSummaryLLM(InMemoryLLMProvider):
@@ -570,7 +576,9 @@ async def test_tier2_provider_failure_rolls_back_synthetic_cleanup() -> None:
         ),
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
     ]
-    before = [message.model_dump(mode="json") for message in history]
+    synthetic_tokens = estimate_message_tokens(history[2], LoopConstants(
+        model_context_window=4_096, compaction_keep_recent_turns=1
+    ))
     state = CompactionState()
 
     result = await run_tier2_summarisation(
@@ -581,9 +589,18 @@ async def test_tier2_provider_failure_rolls_back_synthetic_cleanup() -> None:
         model_name="m",
     )
 
-    assert result == type(result)(turns_summarised=0, tokens_freed=0)
-    assert [message.model_dump(mode="json") for message in history] == before
+    # Nothing was summarised, but the nudge the runtime had put there is gone.
+    assert result.turns_summarised == 0
+    assert result.tokens_freed == synthetic_tokens
+    assert [message.text for message in history] == [
+        "real task",
+        "aged answer " * 40,
+        "recent",
+    ]
     assert state.summarised_turn_ids == set()
+    # The unit the call failed on carries the failure, so the next pass does
+    # not buy the same one.
+    assert list(state.failed_anchor_keys.values()) == [1]
 
 
 @pytest.mark.asyncio

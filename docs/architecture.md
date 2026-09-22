@@ -552,6 +552,17 @@ crashes. The shared assistant loop is **not** a single immutable path:
   while the run sits in `COMPACTING`, and the fold takes at most
   `compaction_fold_max_spans_per_pass` runs per pass. A summary that comes
   back no smaller than what it would replace is discarded, never committed.
+
+  A call that cannot complete at all — the provider raised, the request would
+  not fit, the reply carried no readable summary — is counted against ITS OWN
+  unit in `CompactionState.failed_anchor_keys`, and past
+  `compaction_summary_failed_unit_max_attempts` that unit is not sent again;
+  the fold tier still gets its turn at it. The other units in the batch commit
+  regardless, so one unit the summariser cannot handle no longer keeps a pass
+  from shedding anything. The census rides the run snapshot, so a run re-driven
+  on another pod does not start it from zero. A summary that is merely no
+  smaller is not counted: that says something about the unit's size, not about
+  whether the call can complete.
 - `runtime/loop_state.py` — `LoopState` is a pure 7-state machine:
   `PENDING → RUNNING → {AWAITING | COMPACTING} → {COMPLETED | FAILED |
   CANCELLED}`. `assert_transition()` enforces the legal-edge table;
