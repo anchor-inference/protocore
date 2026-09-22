@@ -4,6 +4,16 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0a11]
+
+### Fixed
+
+- **The compaction summary string limit remains at 1,024 characters.** This
+  corrects an unrelated default change that slipped into the preceding
+  provider-framing release while retaining its larger request safety margin.
+- **Published installation examples now name the current pre-release**, both
+  for the runtime package and the optional conformance test extra.
+
 ## [2.0.0a10]
 
 ### Fixed

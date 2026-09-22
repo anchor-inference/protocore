@@ -796,7 +796,7 @@ class LoopConstants(BaseModel):
         ),
     )
     compaction_summary_string_max_chars: int = Field(
-        default=2048,
+        default=1024,
         gt=0,
         description=(
             "JSON-schema ``maxLength`` cap on the summary string field. "
