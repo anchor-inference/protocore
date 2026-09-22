@@ -43,7 +43,7 @@ from collections.abc import (
 )
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from protocore.contracts.agent_dispatch import IDelegationTool
 from protocore.contracts.background import describe_finished_task
@@ -5193,8 +5193,8 @@ async def _handle_context_window_exceeded(
         return
 
     if engine._compaction_attempted_for_current_turn:
-        assert retry_max_tokens is not None
-        engine._context_overflow_retry_max_tokens = retry_max_tokens
+        retry_cap = cast(int, retry_max_tokens)
+        engine._context_overflow_retry_max_tokens = retry_cap
         engine._context_overflow_corrective_retry_count += 1
         yield _emit_state_change(
             engine,
