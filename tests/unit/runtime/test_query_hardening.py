@@ -825,6 +825,51 @@ async def test_a_proactive_pass_is_followed_by_exactly_one_reactive_pass_after_o
 
 
 @pytest.mark.asyncio
+async def test_an_exhausted_compaction_budget_hands_the_turn_back_to_the_cap_ladder(
+    engine_factory, in_memory_runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing to compact twice over must not end a run the cap ladder can still save."""
+    rc = LoopConstants(
+        model_context_window=65_536,
+        llm_output_max_tokens_ratio=0.125,
+        compaction_keep_recent_turns=1,
+        compaction_failed_max_retries=1,
+    )
+    engine = engine_factory(rc=rc)
+    failing_llm = _ScriptedFailureLLM(
+        exceptions=[
+            LLMContextWindowExceeded(
+                "prompt contains at least a lower bound",
+                context_window=65_536,
+                requested_output_tokens=cap,
+            )
+            for cap in (8_192, 4_096)
+        ],
+    )
+    engine.llm = failing_llm  # type: ignore[assignment]
+    engine.context_manager._compaction_llm = failing_llm  # type: ignore[attr-defined]
+    engine.compaction_llm = failing_llm  # type: ignore[assignment]
+    monkeypatch.setattr(engine, "needs_emergency_compaction", lambda: True)
+
+    events = [
+        event
+        async for event in engine.run(
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+        )
+    ]
+
+    assert engine.state is LoopState.COMPLETED
+    assert [request.max_tokens for request in failing_llm.calls] == [8_192, 4_096, 2_048]
+    reasons = [
+        event.payload.get("reason")
+        for event in events
+        if event.type is EventType.STATE_CHANGED
+    ]
+    assert "reactive_413_compaction_exhausted" not in reasons
+    assert "reactive_413_compaction_exhausted_retry" in reasons
+
+
+@pytest.mark.asyncio
 async def test_lower_bound_overflow_stops_at_configured_reduction_bound(
     engine_factory, in_memory_runtime
 ) -> None:

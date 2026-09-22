@@ -5307,6 +5307,21 @@ async def _handle_context_window_exceeded(
             reactive=True,
         )
     except CompactionExhaustedError as inner_exc:
+        if retry_strictly_shrinks and not attempts_exhausted:
+            # History could not be rewritten any further, but the output cap
+            # can still shrink: the ladder is the remaining recovery, and the
+            # retry cap set above already names the next rung. Hand the turn
+            # back to it instead of ending the run on the compaction budget.
+            engine.last_observed_prompt_tokens = 0
+            compacting_from = engine.state
+            engine.transition_to(LoopState.RUNNING)
+            yield _emit_state_change(
+                engine,
+                compacting_from,
+                LoopState.RUNNING,
+                reason="reactive_413_compaction_exhausted_retry",
+            )
+            return
         # Death-spiral guard — set BEFORE the state transition.
         engine.skip_terminal_hooks = engine.config.rc.skip_terminal_hooks_on_llm_error
         compacting_from = engine.state
