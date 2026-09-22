@@ -1271,8 +1271,10 @@ def _summary_word_budget(before_tokens: int, rc: LoopConstants) -> int:
     # The prompt must not ask for more than the reply may hold: a budget above the
     # output cap is a summary that is always truncated, never parsed and never
     # committed, so the largest units are exactly the ones that never shrink.
-    # Two tokens per word leaves room for the structure around the words.
-    ceiling = rc.compaction_summary_max_output_tokens // 2
+    # What a word costs on the way out is a property of the script it is
+    # written in and of the JSON around it, not of English —
+    # ``compaction_summary_output_tokens_per_word`` carries that figure.
+    ceiling = rc.compaction_summary_max_output_tokens // rc.compaction_summary_output_tokens_per_word
     return max(rc.compaction_summary_min_words, min(scaled, ceiling))
 
 
@@ -1848,7 +1850,14 @@ async def _fold_span(
             "item_count": len(members),
             "operator_count": operator_count,
             "seed_count": seed_count,
-            "max_words": rc.compaction_fold_summary_target_words,
+            # Same cap as the per-turn budget, for the same reason: a fold
+            # asked for more words than its output cap can hold at the going
+            # per-word rate comes back cut, and a cut fold is discarded.
+            "max_words": min(
+                rc.compaction_fold_summary_target_words,
+                rc.compaction_fold_max_output_tokens
+                // rc.compaction_summary_output_tokens_per_word,
+            ),
         },
     )
     outcome = await _run_summariser(

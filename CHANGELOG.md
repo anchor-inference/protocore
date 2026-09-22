@@ -18,6 +18,13 @@ All notable changes to this project are recorded here. The format follows
   and 0.25 output reserve the trigger on a 65 536-token window stood above
   that cliff, so proactive compaction could not fire before the rejection.
   The emergency cliff is held strictly above the effective trigger.
+- **A summary's word budget is sized for the script it is written in.** The
+  ceiling was half the summariser's output cap, two tokens a word being the
+  English figure; JSON escaping and a non-Latin script cost three or four, so
+  the summary of every large unit outgrew the cap, came back cut off, never
+  parsed and never committed — and the next pass paid for the same units
+  again. The rate is now `compaction_summary_output_tokens_per_word` (4), and
+  it caps the fold target the same way.
 
 ## [2.0.0a16]
 

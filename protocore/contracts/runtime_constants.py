@@ -460,6 +460,21 @@ class LoopConstants(BaseModel):
             "the identifiers the summary must keep verbatim."
         ),
     )
+    compaction_summary_output_tokens_per_word: int = Field(
+        default=4,
+        ge=1,
+        description=(
+            "Tokens one word of a summary is assumed to cost on the way OUT. "
+            "The word budget the summariser is asked for is capped at what "
+            "compaction_summary_max_output_tokens can hold at this rate. Two "
+            "is the figure for English prose; JSON escaping and a non-Latin "
+            "script (Cyrillic runs at three to four tokens a word) put a "
+            "budget sized that way past the output cap on every large unit, "
+            "and a summary the cap cuts off is never valid JSON, never parsed "
+            "and never committed — so the largest units are exactly the ones "
+            "that never shrink, and the next pass pays for them again."
+        ),
+    )
     compaction_summary_tokens_per_word: int = Field(
         default=6,
         ge=1,

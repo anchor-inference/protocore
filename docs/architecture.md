@@ -543,7 +543,11 @@ crashes. The shared assistant loop is **not** a single immutable path:
   `compaction_summary_min_unit_tokens` is not sent at all (a summariser writes
   a sentence or three whatever it is handed, so below some size the call is
   spent to discover the summary is no smaller), the word budget in the prompt
-  scales with the unit rather than being a fixed sentence count, calls go out
+  scales with the unit rather than being a fixed sentence count and is capped
+  at what the output cap can hold at
+  `compaction_summary_output_tokens_per_word` (four — the English figure of two
+  understates JSON escaping and a non-Latin script, and a budget sized that way
+  comes back cut off, never parses and is never committed), calls go out
   `compaction_summariser_parallelism` at a time instead of one after another
   while the run sits in `COMPACTING`, and the fold takes at most
   `compaction_fold_max_spans_per_pass` runs per pass. A summary that comes
