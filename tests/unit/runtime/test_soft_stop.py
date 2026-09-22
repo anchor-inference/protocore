@@ -451,6 +451,11 @@ async def test_the_notification_is_bilingual_and_names_the_bound_that_was_hit() 
     text = "".join(b.text for b in notice.content_blocks)
     assert "Write your final response" in text
     assert "Напишите финальный ответ" in text
+    # The reply presents results; it is not a log of the run's steps.
+    assert "your best answer" in text
+    assert "do not describe your steps" in text
+    assert "не описывайте шаги" in text
+    assert "what you did" not in text
     assert _soft_stop.CAUSE_TOOL_CALL_BUDGET in text
     assert "{cause}" not in text
 

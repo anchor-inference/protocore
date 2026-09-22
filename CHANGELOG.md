@@ -6,6 +6,26 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **The wind-down notice asks for the answer, not the work log.** The default
+  `soft_stop_notice_text` told the model to report what it did and what it
+  found, which invited a narration of the run's steps into the user-facing
+  reply — something many hosts' personas forbid. It now asks for the best answer
+  from what the run already has and where any results are, says plainly what
+  could not be established or finished, and tells the model not to describe its
+  steps. Both languages changed; the text is no longer than before. A host that
+  seeded the old default into its own constants store keeps the old wording
+  until that row is updated.
+
+### Fixed
+
+- **`RequestTokenCounterConformance` and `LifecycleRegistryConformance` are
+  importable from `protocore.conformance`.** Both were in `SUITES` but only
+  reachable through `protocore.conformance.suites`. The package's own tests now
+  fail if a suite in `SUITES` is not re-exported by the package, or if a suite
+  class is defined in `suites` without being listed in `SUITES`.
+
 ## [2.0.0a19]
 
 ### Added
