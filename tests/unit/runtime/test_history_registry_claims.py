@@ -53,6 +53,7 @@ from protocore.runtime.query import (
     _history_has_tool_result,
     _history_tool_result_is_terminal,
     _prose_gate_just_injected,
+    _run_produced_output,
     _tool_call_from_history,
     _tool_name_for_call_id,
 )
@@ -73,6 +74,9 @@ PINNED_ENTRIES: dict[str, tuple[str, ...]] = {
     ),
     "test_prose_gate_reads_the_tail_and_not_a_seeded_turn": (
         "protocore/runtime/turn_policies/sibling_walk.py::prose_gate_just_injected",
+    ),
+    "test_produced_output_ignores_a_seeded_prior_run": (
+        "protocore/runtime/query.py::_run_produced_output",
     ),
     "test_call_id_lookups_resolve_the_call_they_are_asked_for": (
         "protocore/runtime/query.py::_tool_name_for_call_id",
@@ -242,6 +246,64 @@ def test_prose_gate_reads_the_tail_and_not_a_seeded_turn(engine_factory) -> None
 
     engine.history = []
     assert _prose_gate_just_injected(engine) is False
+
+
+def test_produced_output_ignores_a_seeded_prior_run(engine_factory) -> None:
+    """Work a PREVIOUS run did is not work this one can be asked to report on.
+
+    Its registry reason is that the walk starts after the last caller message,
+    which the seed always precedes. Widen it to the whole transcript and a
+    session whose earlier run answered makes every later run look productive —
+    so a run whose first request the endpoint refused is wound down and told to
+    write a closing summary, and it summarises the previous run's work as its
+    own.
+    """
+    engine: QueryEngine = engine_factory()
+    prior_answer = _assistant(TextBlock(text="The retrospective is attached."))
+
+    engine.history = [_seeded(_user(_PRIOR_TASK)), _seeded(prior_answer), _user(_NEW_TASK)]
+    assert _run_produced_output(engine) is False
+
+    engine.history = [*engine.history, _assistant(TextBlock(text="Reading the plan now."))]
+    assert _run_produced_output(engine) is True
+
+
+def test_produced_output_is_output_and_not_merely_a_turn(engine_factory) -> None:
+    """Prose, a tool call or a tool result count; an empty turn does not.
+
+    The predicate gates the wind-down, and a wind-down is a request for the
+    best answer the evidence supports. An assistant turn carrying nothing but
+    whitespace is not evidence of anything, and a synthetic recovery turn the
+    runtime itself wrote is not a caller message, so it must not be mistaken
+    for one and move the boundary past the work that precedes it.
+    """
+    engine: QueryEngine = engine_factory()
+
+    engine.history = [_user(_NEW_TASK), _assistant(TextBlock(text="   "))]
+    assert _run_produced_output(engine) is False
+
+    engine.history = [
+        _user(_NEW_TASK),
+        _assistant(ToolUseBlock(tool_call_id="call-1", name="Read", arguments_json="{}")),
+    ]
+    assert _run_produced_output(engine) is True
+
+    engine.history = [
+        _user(_NEW_TASK),
+        _assistant(ToolUseBlock(tool_call_id="call-1", name="Read", arguments_json="{}")),
+        Message(
+            role=MessageRole.tool,
+            content_blocks=[
+                ToolResultBlock(tool_call_id="call-1", content="42 lines", is_error=False)
+            ],
+        ),
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text="wrap up now")],
+            metadata={SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_PROSE_GATE_REPAIR},
+        ),
+    ]
+    assert _run_produced_output(engine) is True
 
 
 # ---------------------------------------------------------------------------

@@ -500,6 +500,14 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "request; it reaches no engine and selects nothing"
     ),
     # --- identity lookups keyed on a tool call id ---------------------------
+    "protocore/runtime/query.py::_run_produced_output": _run_scoped(
+        "asks whether there is anything a final answer could be about, and "
+        "looks only after the LAST message the caller put in — the operator's "
+        "task, or the tool result a parked run was resumed with. A seeded turn "
+        "precedes that message, so nothing from an earlier run is in the span "
+        "it walks",
+        f"{_CLAIMS}::test_produced_output_ignores_a_seeded_prior_run",
+    ),
     "protocore/runtime/query.py::_tool_name_for_call_id": _run_scoped(
         "resolves ONE tool_call_id to its tool name; a call id identifies a "
         "single call, so the search cannot land on another run's",
