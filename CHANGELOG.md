@@ -4,6 +4,15 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0a10]
+
+### Fixed
+
+- **Near-limit requests reserve more space for provider-rendered framing.**
+  The default request margin is 1,024 tokens. Regression coverage now models
+  the boundary where an unchanged output cap previously let a provider-side
+  prompt count exceed the context window even though the local estimate fit.
+
 ## [2.0.0a9]
 
 ### Fixed
