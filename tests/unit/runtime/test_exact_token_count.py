@@ -597,3 +597,91 @@ async def test_a_zero_backoff_retries_on_the_next_request() -> None:
     for _ in range(2):
         await fit_request_to_context_measured(_near_edge_request(rc), rc, provider, cache=cache)
     assert len(provider.counted) == 2
+
+
+class _ContentAwareCounter(_CountingProvider):
+    """Real size by content: prose 0.84x the heuristic, hexadecimal 3.5x."""
+
+    def __init__(self, rc: LoopConstants) -> None:
+        super().__init__()
+        self.rc = rc
+
+    async def count_request_tokens(self, request: LLMRequest) -> int | None:
+        self.counted.append(request)
+        return _real_size(request, self.rc)
+
+
+def _real_size(request: LLMRequest, rc: LoopConstants) -> int:
+    total = 0.0
+    for message in request.messages:
+        raw = estimate_request_prompt_tokens_uncalibrated(
+            LLMRequest(model=request.model, messages=[message]), rc
+        )
+        text = message.content_blocks[0].text  # type: ignore[union-attr]
+        dense = all(ch in "0123456789abcdef" for ch in text)
+        total += raw * (3.5 if dense else 0.84)
+    return round(total)
+
+
+def _prose(i: int) -> Message:
+    return _msg(f"paragraph {i} " + "plain library prose " * 420)
+
+
+@pytest.mark.parametrize(
+    ("kept", "hex_chars"),
+    [
+        # Compaction replaced most of the prose; the request got SMALLER by the
+        # heuristic, and a hex result arrived in the same breath.
+        (8, 80_000),
+        # Fewer messages replaced, and the net growth is a few hundred tokens.
+        (13, 60_000),
+    ],
+)
+@pytest.mark.asyncio
+async def test_dense_content_arriving_after_a_rewrite_is_counted(kept: int, hex_chars: int) -> None:
+    rc = _rc(model_context_window=65_536)
+    provider = _ContentAwareCounter(rc)
+    cache = ExactTokenCountCache()
+    before = LLMRequest(model="m", messages=[_prose(i) for i in range(20)], max_tokens=16_384)
+    await fit_request_to_context_measured(before, rc, provider, cache=cache)
+    assert len(provider.counted) == 1
+
+    after = LLMRequest(
+        model="m",
+        messages=[
+            _msg("Summary of the earlier reading."),
+            *[_prose(i) for i in range(20 - kept, 20)],
+            _msg(secrets.token_hex(hex_chars // 2)),
+        ],
+        max_tokens=16_384,
+    )
+    raw_before = estimate_request_prompt_tokens_uncalibrated(before, rc)
+    raw_after = estimate_request_prompt_tokens_uncalibrated(after, rc)
+    if kept == 8:
+        assert raw_after < raw_before
+    else:
+        assert 0 < raw_after - raw_before < 1_000
+    assert _real_size(after, rc) + after.max_tokens > rc.model_context_window
+
+    try:
+        await fit_request_to_context_measured(after, rc, provider, cache=cache)
+    except LLMContextWindowExceeded:
+        pass
+
+    assert len(provider.counted) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_rewrite_that_adds_nothing_unseen_is_not_counted_again() -> None:
+    rc = _rc(model_context_window=65_536)
+    provider = _ContentAwareCounter(rc)
+    cache = ExactTokenCountCache()
+    messages = [_prose(i) for i in range(20)]
+    await fit_request_to_context_measured(
+        LLMRequest(model="m", messages=messages, max_tokens=16_384), rc, provider, cache=cache
+    )
+    # Eviction dropped the oldest half; nothing new arrived.
+    await fit_request_to_context_measured(
+        LLMRequest(model="m", messages=messages[10:], max_tokens=16_384), rc, provider, cache=cache
+    )
+    assert len(provider.counted) == 1

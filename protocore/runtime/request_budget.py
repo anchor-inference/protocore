@@ -21,6 +21,7 @@ from typing import cast
 
 from protocore.contracts.llm import LLMContextWindowExceeded, LLMRequest
 from protocore.contracts.runtime_constants import LoopConstants
+from protocore.contracts.types import Message
 from protocore.logging_utils import get_logger
 from protocore.runtime.context.compaction import estimate_history_tokens_uncalibrated
 from protocore.runtime.tool_surface import read_tool_surface, tool_surface_tokens
@@ -124,8 +125,10 @@ class CountAnchor:
     model: str
     #: What the provider said that request rendered to.
     measured: int
-    #: The heuristic's raw size of the same request.
-    raw_estimate: int
+    #: The content digest of every message that request carried.
+    message_digests: frozenset[str]
+    #: The digest of everything else that decides its size: model, tools, extra.
+    frame_digest: str
 
 
 class ExactTokenCountCache:
@@ -162,10 +165,39 @@ class ExactTokenCountCache:
         return len(self._entries)
 
 
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def message_digest(message: Message) -> str:
+    """A digest of what one message renders to. Its creation time renders to nothing."""
+    return _sha256(message.model_dump_json(exclude={"created_at"}))
+
+
+@dataclass(frozen=True, slots=True)
+class RequestDigests:
+    """A request's content, digested per message and for the frame around them."""
+
+    messages: tuple[str, ...]
+    frame: str
+
+    @property
+    def key(self) -> str:
+        return _sha256("\n".join((*self.messages, self.frame)))
+
+
+def request_digests(request: LLMRequest) -> RequestDigests:
+    """Digest ``request`` once, for the count cache and for the re-count decision."""
+    frame = request.model_dump_json(exclude={"messages", *_SIZE_INDEPENDENT_FIELDS})
+    return RequestDigests(
+        messages=tuple(message_digest(message) for message in request.messages),
+        frame=_sha256(frame),
+    )
+
+
 def request_content_key(request: LLMRequest) -> str:
     """A digest of everything in ``request`` that decides its rendered size."""
-    payload = request.model_dump_json(exclude=set(_SIZE_INDEPENDENT_FIELDS))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return request_digests(request).key
 
 
 async def count_request_tokens_exactly(
@@ -175,6 +207,7 @@ async def count_request_tokens_exactly(
     *,
     cache: ExactTokenCountCache | None = None,
     estimate: int | None = None,
+    digests: RequestDigests | None = None,
 ) -> int | None:
     """Ask ``provider`` what ``request`` renders to; ``None`` when it cannot say.
 
@@ -197,7 +230,7 @@ async def count_request_tokens_exactly(
         return None
     key: str | None
     try:
-        key = request_content_key(request)
+        key = (digests or request_digests(request)).key
     except (TypeError, ValueError):
         key = None
     if key is not None and cache is not None:
@@ -255,9 +288,37 @@ def worst_case_ratio(rc: LoopConstants) -> float:
     return math.inf if margin >= 1.0 else 1.0 / (1.0 - margin)
 
 
+def unmeasured_raw_tokens(
+    request: LLMRequest,
+    digests: RequestDigests,
+    anchor: CountAnchor,
+    rc: LoopConstants,
+) -> int:
+    """The heuristic's size of what in ``request`` the last count did not see.
+
+    Gross, message by message: every message whose content is not among the
+    counted ones — appended, or rewritten by compaction or eviction — is new,
+    whatever was removed alongside it. A net difference would let a summary that
+    replaced a page of prose hide the dense tool result that arrived in the same
+    breath. Removed messages are simply left out of the sum: they can only make
+    the real prompt smaller than the count already says, so the bound stays an
+    upper bound. A changed frame (tools, model, request options) adds the tool
+    definitions back in whole.
+    """
+    unseen = [
+        message
+        for message, digest in zip(request.messages, digests.messages, strict=True)
+        if digest not in anchor.message_digests
+    ]
+    added = estimate_history_tokens_uncalibrated(unseen, rc) if unseen else 0
+    if digests.frame != anchor.frame_digest:
+        added += tool_surface_tokens(read_tool_surface(request.tools), rc)
+    return added
+
+
 def _count_warranted(
     request: LLMRequest,
-    raw: int,
+    digests: RequestDigests,
     estimate: int,
     limit: int,
     rc: LoopConstants,
@@ -267,19 +328,20 @@ def _count_warranted(
 
     Before the run has a count of a full request for this model, the margin rule
     decides. After it, the question is narrower: the last count is known, and
-    only the content added since is unmeasured. If that content, sized at the
+    only the content it did not see is unmeasured. If that content, sized at the
     worst undercount the margin assumes, still could not carry the prompt over
     the limit, the count would only confirm what the calibrated estimate already
     says, and it is not made. Prose-heavy turns then count about once near the
     edge instead of on every iteration, and a large block of dense content —
-    the case the count exists for — crosses the bound at once.
+    the case the count exists for — crosses the bound at once, including when it
+    arrives in a history that compaction has just rewritten.
     """
-    if not near_limit(estimate, limit, rc):
-        return False
     anchor = cache.anchor if cache is not None else None
     if anchor is None or anchor.model != request.model:
         return True
-    added = max(0, raw - anchor.raw_estimate)
+    added = unmeasured_raw_tokens(request, digests, anchor, rc)
+    if added == 0:
+        return anchor.measured >= limit
     return anchor.measured + added * worst_case_ratio(rc) >= limit
 
 
@@ -335,14 +397,19 @@ async def fit_request_to_context_measured(
     clip_limit = (
         rc.model_context_window - rc.request_context_safety_tokens - request.max_tokens
     )
-    if _count_warranted(request, raw, estimate, clip_limit, rc, cache):
-        measured = await count_request_tokens_exactly(
-            request, provider, rc, cache=cache, estimate=estimate
-        )
-        if measured is not None and cache is not None:
-            cache.anchor = CountAnchor(
-                model=request.model, measured=measured, raw_estimate=raw
+    if near_limit(estimate, clip_limit, rc):
+        digests = request_digests(request)
+        if _count_warranted(request, digests, estimate, clip_limit, rc, cache):
+            measured = await count_request_tokens_exactly(
+                request, provider, rc, cache=cache, estimate=estimate, digests=digests
             )
+            if measured is not None and cache is not None:
+                cache.anchor = CountAnchor(
+                    model=request.model,
+                    measured=measured,
+                    message_digests=frozenset(digests.messages),
+                    frame_digest=digests.frame,
+                )
     if measured is None:
         fitted = _fit_to_prompt_tokens(request, rc, estimate)
     else:
@@ -368,6 +435,7 @@ __all__ = [
     "CountAnchor",
     "ExactTokenCountCache",
     "FittedRequest",
+    "RequestDigests",
     "RequestTokenCount",
     "count_request_tokens_exactly",
     "estimate_request_prompt_tokens",
@@ -375,8 +443,11 @@ __all__ = [
     "fit_max_tokens",
     "fit_request_to_context",
     "fit_request_to_context_measured",
+    "message_digest",
     "near_limit",
     "request_content_key",
+    "request_digests",
     "request_token_counter",
+    "unmeasured_raw_tokens",
     "worst_case_ratio",
 ]

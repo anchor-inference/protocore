@@ -515,8 +515,10 @@ crashes. The shared assistant loop is **not** a single immutable path:
   on the provider's tokens — until a fit has counted the turn's full request,
   after which the gate reads the factor that count set instead of paying a
   second round-trip. After the first count the fit asks again only when the
-  last count plus the content added since, sized at the worst undercount the
-  margin assumes (`1 / (1 - margin)`), could cross the limit, so prose-heavy
+  last count plus the content that count did not see — every message whose
+  digest is not among the counted ones, so a message rewritten by compaction
+  or eviction is new, and removals are ignored — sized at the worst undercount
+  the margin assumes (`1 / (1 - margin)`), could cross the limit, so prose-heavy
   turns count about once near the edge while a large dense tool result is
   counted at once. A count that fails or times out stops counting for
   `exact_token_count_failure_backoff_seconds`. The default margin, 0.75, is `1 - 1/4`: an undercount by

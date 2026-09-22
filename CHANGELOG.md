@@ -23,8 +23,10 @@ All notable changes to this project are recorded here. The format follows
   `exact_token_count_enabled`. Once the fit has counted a turn's request, the
   compaction gate reuses the factor that count set instead of counting the
   history a second time. After a count, the next one is made only when the
-  content added since, sized at the worst undercount the margin assumes, could
-  carry the prompt over the limit; a count that fails or times out stops
+  content that count did not see — messages whose digest is not among the
+  counted ones, so compaction or eviction cannot hide dense content arriving
+  with it — sized at the worst undercount the margin assumes, could carry the
+  prompt over the limit; a count that fails or times out stops
   counting for `exact_token_count_failure_backoff_seconds` (default 300). A provider without the capability sends exactly the
   requests it sent before; a count that fails or times out is logged and the
   estimate is used.
