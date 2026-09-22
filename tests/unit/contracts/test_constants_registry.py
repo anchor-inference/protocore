@@ -561,6 +561,14 @@ class TestLoopGroup:
         assert spec.minimum == 1.0
         assert spec.kind == "int"
 
+    def test_compaction_trigger_turn_headroom_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("compaction_trigger_turn_headroom_ratio")
+        assert spec.default == 0.15
+        assert spec.minimum == 0.0
+        assert spec.maximum == 1.0
+        assert spec.exclusive_maximum is True
+        assert spec.kind == "float"
+
     def test_a_constant_without_a_bound_has_none(self) -> None:
         spec = build_loop_group().spec("continue_prompt_text")
         assert spec.minimum is None and spec.maximum is None

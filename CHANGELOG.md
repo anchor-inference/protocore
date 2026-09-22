@@ -6,6 +6,19 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **The compaction trigger now sits below the prompt size the provider will
+  still accept.** `derive_budgets` takes the lower of
+  `model_context_window * compaction_trigger_ratio` and the window less the
+  output reserve, less `request_context_safety_tokens`, less the new
+  `compaction_trigger_turn_headroom_ratio` (0.15) for the turn about to be
+  added. A server that reserves the output budget inside the context window
+  rejects any prompt above `window - max output`; with the stock 0.8 trigger
+  and 0.25 output reserve the trigger on a 65 536-token window stood above
+  that cliff, so proactive compaction could not fire before the rejection.
+  The emergency cliff is held strictly above the effective trigger.
+
 ## [2.0.0a16]
 
 ### Fixed

@@ -53,6 +53,25 @@ class LoopConstants(BaseModel):
         le=1.0,
         description="Fraction of context window above which compaction is triggered.",
     )
+    compaction_trigger_turn_headroom_ratio: float = Field(
+        default=0.15,
+        ge=0.0,
+        lt=1.0,
+        description=(
+            "Fraction of the context window kept free above the compaction "
+            "trigger so that ONE more turn fits before the request stops being "
+            "accepted. A server that reserves the output budget inside the "
+            "window rejects any prompt above window - max output, so the "
+            "trigger has to sit below that cliff rather than merely below the "
+            "window; and it has to sit a whole turn below it, because the "
+            "check runs BEFORE a turn whose tool results can add tens of "
+            "thousands of tokens and because the character-based estimate runs "
+            "short of the provider's own count. A sixth of the window is what "
+            "a large tool turn plus that undercount measured at, and it is the "
+            "figure a 65k window running a non-Latin script needs to keep "
+            "proactive compaction reachable at all."
+        ),
+    )
     compaction_routine_min_clear_ratio: float = Field(
         default=0.5,
         gt=0.0,
@@ -2882,6 +2901,17 @@ class LoopConstants(BaseModel):
         if self.compaction_trigger_ratio >= self.compaction_emergency_ratio:
             raise ValueError(
                 "compaction_trigger_ratio must be < compaction_emergency_ratio"
+            )
+ # the effective trigger sits below the output reserve and a turn's headroom;
+ # leave room for both, or there is no prompt size compaction could aim at
+        if (
+            self.llm_output_max_tokens_ratio
+            + self.compaction_trigger_turn_headroom_ratio
+            >= 1.0
+        ):
+            raise ValueError(
+                "llm_output_max_tokens_ratio + compaction_trigger_turn_headroom_ratio "
+                "must be < 1.0"
             )
  # combined overhead budgets must leave room for history
         fixed_overhead = (

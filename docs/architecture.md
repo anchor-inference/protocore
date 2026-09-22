@@ -488,6 +488,19 @@ crashes. The shared assistant loop is **not** a single immutable path:
   live override when one is set), the forced tool (one slot,
   `extra["forced_tool_choice"]`, carrying the tool NAME for an adapter to
   render onto its own wire) and the temperature (stated on every request).
+- `runtime/context/budgets.py` — `derive_budgets` turns one RC snapshot into
+  every per-layer token budget, deterministically, with no cache. The
+  compaction trigger it returns is the LOWER of two bounds: the configured
+  `compaction_trigger_ratio` of the window, and the largest prompt the
+  provider would still accept — the window less the output reserve
+  (`llm_output_max_tokens_ratio`), less `request_context_safety_tokens`, less
+  `compaction_trigger_turn_headroom_ratio` of the window for the turn that is
+  about to be added. A server that reserves the output budget inside the
+  context window rejects any prompt above `window - max output`, so a trigger
+  derived from the ratio alone can sit above the cliff and never fire: on a
+  65 536-token window with the stock 0.25 output reserve, 0.8 of the window is
+  3 276 tokens past the point the request stops being accepted. Consumers read
+  the effective value — the emergency cliff is held strictly above it.
 - `runtime/context/compaction.py` — three passes over the transcript, in
   order, each one taking what the pass before it could not.
   **Tier 1** replaces an over-budget tool result with a placeholder and puts

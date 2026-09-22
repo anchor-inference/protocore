@@ -78,7 +78,8 @@ def test_emergency_tokens_derived_and_above_trigger() -> None:
     assert budgets.compaction_emergency_tokens == int(
         rc.model_context_window * rc.compaction_emergency_ratio
     )
-    # The RC validator guarantees trigger_ratio < emergency_ratio.
+    # The RC validator guarantees trigger_ratio < emergency_ratio, and the
+    # trigger only ever moves DOWN from its ratio.
     assert budgets.compaction_emergency_tokens > budgets.compaction_trigger_tokens
 
 
