@@ -5118,6 +5118,14 @@ async def _handle_context_window_exceeded(
         retry_max_tokens = int(
             rejected_max_tokens * engine.config.rc.context_overflow_retry_output_ratio
         )
+        if exc.context_window is not None and exc.input_tokens is not None:
+            provider_safe_output = (
+                exc.context_window
+                - exc.input_tokens
+                - engine.config.rc.request_context_safety_tokens
+            )
+            if provider_safe_output > 0:
+                retry_max_tokens = min(retry_max_tokens, provider_safe_output)
         if retry_max_tokens < 1:
             async for evt in _emit_llm_terminal(
                 engine, exc, kind="llm_context_window_exceeded"

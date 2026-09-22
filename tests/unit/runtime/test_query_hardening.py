@@ -375,6 +375,40 @@ async def test_context_window_retry_ceiling_uses_the_fitted_wire_cap(
 
 
 @pytest.mark.asyncio
+async def test_context_window_retry_uses_provider_reported_prompt_size(
+    engine_factory, in_memory_runtime
+) -> None:
+    rc = LoopConstants(
+        model_context_window=65_536,
+        request_context_safety_tokens=2_048,
+        llm_output_max_tokens_ratio=0.25,
+        compaction_keep_recent_turns=1,
+    )
+    engine = engine_factory(rc=rc)
+    llm = _ScriptedFailureLLM(
+        exceptions=[
+            LLMContextWindowExceeded(
+                "request exceeded context",
+                context_window=65_536,
+                input_tokens=58_475,
+                requested_output_tokens=14_124,
+            )
+        ],
+    )
+    engine.llm = llm  # type: ignore[assignment]
+    engine.context_manager._compaction_llm = llm  # type: ignore[attr-defined]
+    engine.compaction_llm = llm  # type: ignore[assignment]
+
+    async for _ in engine.run(
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+    ):
+        pass
+
+    assert engine.state is LoopState.COMPLETED
+    assert [request.max_tokens for request in llm.calls] == [16_384, 5_013]
+
+
+@pytest.mark.asyncio
 async def test_context_window_retry_ceiling_does_not_leak_to_the_next_tool_iteration(
     engine_factory, in_memory_runtime
 ) -> None:

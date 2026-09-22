@@ -54,6 +54,19 @@ class LLMContextWindowExceeded(LLMError):
     + re-stream once. Second occurrence → terminal FAILED.
     """
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        context_window: int | None = None,
+        input_tokens: int | None = None,
+        requested_output_tokens: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.context_window = context_window
+        self.input_tokens = input_tokens
+        self.requested_output_tokens = requested_output_tokens
+
 
 class LLMProviderError(LLMError):
     """Provider-level error (5xx, transient 4xx, network).
