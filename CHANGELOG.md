@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0a12]
+
 ### Fixed
 
 - **A context-overflow retry now reduces its output allowance.** Reactive
