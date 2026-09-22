@@ -260,6 +260,9 @@ class ContextManager:
         observability: LLMObservabilityContext | None,
         protect_tail_from_index: int | None,
         record_request: RequestRecorder | None,
+        *,
+        keep_recent_turns: int | None = None,
+        compact_seeded_history: bool = False,
     ) -> Tier3Result | None:
         """Tier 3, after Tier 2 in both cascades.
 
@@ -283,6 +286,8 @@ class ContextManager:
                 protect_tail_from_index=protect_tail_from_index,
                 record_request=record_request,
                 prompts=self._prompts,
+                keep_recent_turns=keep_recent_turns,
+                compact_seeded_history=compact_seeded_history,
             )
         except Exception as exc:
             _logger.warning("tier3 fold failed; skipping (err=%s)", exc)
@@ -405,8 +410,9 @@ class ContextManager:
         observability: LLMObservabilityContext | None = None,
         protect_tail_from_index: int | None = None,
         record_request: RequestRecorder | None = None,
+        reactive: bool = False,
     ) -> CompactionAttempt:
-        """Run BOTH Tier 1 + Tier 2 unconditionally for reactive-413 recovery.
+        """Run BOTH Tier 1 + Tier 2 unconditionally for emergency recovery.
 
  Unlike :meth:`run_compaction` (which gates Tier 2 behind a
  "Tier 1 didn't free enough" check), this method always runs both
@@ -419,15 +425,34 @@ class ContextManager:
 
  ``protect_tail_from_index`` (set only by the per-iteration
  emergency-cliff gate) exempts the current just-executed tool-result
- batch from BOTH tiers on top of ``compaction_keep_recent_turns``.
- The reactive-413 caller passes ``None`` (the provider already rejected
- the request, so the whole history is fair game and the most-recent
- batch was never wire-accepted).
+ batch from BOTH tiers on top of the keep window. The reactive-413
+ caller passes ``None`` (the provider already rejected the request, so
+ the whole history is fair game and the most-recent batch was never
+ wire-accepted).
+
+ ``reactive`` distinguishes a provider rejection from the two proactive
+ emergency gates (turn start, per iteration) that also land here on an
+ estimate. Only a rejection switches to the emergency profile: the keep
+ window shrinks to ``compaction_force_keep_recent_turns`` and turns
+ seeded from earlier runs become eligible for lossy Tier 2/Tier 3
+ replacement, every replacement keeping the seed tag. The proactive
+ gates keep the routine window and leave seeds untouched.
  """
         budgets = derive_budgets(self._rc)
         tokens_before = self._token_estimator.estimate_history(history, self._rc)
 
         attempt = CompactionAttempt(tokens_before=tokens_before)
+
+        # A provider rejection is stronger evidence than the routine estimate:
+        # keep only the emergency tail and make old session seeds eligible for
+        # lossy compaction. Seed provenance is carried onto every replacement
+        # so the host still excludes prior-run content when it persists the
+        # new run. A proactive emergency pass has no such proof and keeps the
+        # routine profile.
+        force_keep_recent_turns = (
+            self._rc.compaction_force_keep_recent_turns if reactive else None
+        )
+        compact_seeded_history = reactive
 
         # Tier 1 always runs.
         try:
@@ -437,6 +462,7 @@ class ContextManager:
                 tenant_id=tenant_id,
                 rc=self._rc,
                 truncation_threshold_tokens=budgets.tool_result_truncation_threshold,
+                keep_recent_turns=force_keep_recent_turns,
                 protect_tail_from_index=protect_tail_from_index,
             )
         except Exception as exc:
@@ -473,6 +499,8 @@ class ContextManager:
                     free_target_tokens=free_target if free_target > 0 else None,
                     record_request=record_request,
                     prompts=self._prompts,
+                    keep_recent_turns=force_keep_recent_turns,
+                    compact_seeded_history=compact_seeded_history,
                 )
             except Exception as exc:
                 compaction_state.retry_count += 1
@@ -490,6 +518,8 @@ class ContextManager:
             observability,
             protect_tail_from_index,
             record_request,
+            keep_recent_turns=force_keep_recent_turns,
+            compact_seeded_history=compact_seeded_history,
         )
 
         tokens_after = self._token_estimator.estimate_history(history, self._rc)

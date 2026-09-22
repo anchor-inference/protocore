@@ -20,10 +20,13 @@ from protocore.contracts.llm import (
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY,
+    SESSION_HISTORY_SEED_METADATA_KEY,
     Message,
     MessageRole,
     StopReason,
     TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
 )
 from protocore.prompts import bundled_prompt_provider
 from protocore.runtime.events import EventType, TurnEvent
@@ -855,6 +858,40 @@ async def test_lower_bound_overflow_stops_at_configured_reduction_bound(
     assert sum(event.type is EventType.COMPACTION_STARTED for event in events) == 1
 
 
+@pytest.mark.asyncio
+async def test_lower_bound_overflow_can_reduce_the_full_output_cap_ladder(
+    engine_factory, in_memory_runtime
+) -> None:
+    caps = [8_192, 4_096, 2_048, 1_024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
+    rc = LoopConstants(
+        model_context_window=65_536,
+        llm_output_max_tokens_ratio=0.125,
+        compaction_keep_recent_turns=1,
+    )
+    engine = engine_factory(rc=rc)
+    failing_llm = _ScriptedFailureLLM(
+        exceptions=[
+            LLMContextWindowExceeded(
+                "prompt contains at least a lower bound",
+                context_window=65_536,
+                requested_output_tokens=cap,
+            )
+            for cap in caps
+        ],
+    )
+    engine.llm = failing_llm  # type: ignore[assignment]
+    engine.context_manager._compaction_llm = failing_llm  # type: ignore[attr-defined]
+    engine.compaction_llm = failing_llm  # type: ignore[assignment]
+
+    async for _ in engine.run(
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+    ):
+        pass
+
+    assert engine.state is LoopState.FAILED
+    assert [request.max_tokens for request in failing_llm.calls] == caps
+
+
 # ----------------------------------------------------------------------
 # ContextManager.force_compaction unit coverage
 # ----------------------------------------------------------------------
@@ -909,6 +946,240 @@ async def test_force_compaction_runs_both_tiers_unconditionally(
     # Both tiers attempted.
     assert attempt.tier1 is not None
     assert attempt.tier2 is not None
+
+
+@pytest.mark.asyncio
+async def test_force_compaction_shrinks_seeded_cross_run_history(
+    in_memory_runtime,
+) -> None:
+    """Reactive compaction may shrink old seeds without making them persistable."""
+    from protocore.runtime.context.compaction import CompactionState
+    from protocore.runtime.context.manager import ContextManager
+
+    rc = LoopConstants(
+        model_context_window=32_768,
+        request_context_safety_tokens=0,
+        compaction_keep_recent_turns=4,
+        compaction_fold_min_messages=2,
+        compaction_fold_min_tokens=0,
+        compaction_fold_keep_operator_turns=0,
+    )
+    seed = {SESSION_HISTORY_SEED_METADATA_KEY: True}
+    history = [
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text="prior task " * 1_200)],
+            metadata=seed,
+        ),
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[TextBlock(text="prior answer " * 1_200)],
+            metadata=seed,
+        ),
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[TextBlock(text="ok")],
+            metadata=seed,
+        ),
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text="another prior task " * 1_200)],
+            metadata=seed,
+        ),
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[TextBlock(text="done")],
+            metadata=seed,
+        ),
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text="CURRENT TASK VERBATIM")],
+            metadata={"current": "task"},
+        ),
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[
+                ToolUseBlock(
+                    tool_call_id="current-call",
+                    name="read",
+                    arguments_json='{"path":"current"}',
+                )
+            ],
+            metadata={"current": "assistant"},
+        ),
+        Message(
+            role=MessageRole.tool,
+            content_blocks=[
+                ToolResultBlock(tool_call_id="current-call", content="current result")
+            ],
+            metadata={"current": "tool"},
+        ),
+    ]
+    current_tail_before = [message.model_dump_json() for message in history[-3:]]
+    llm = in_memory_runtime["llm"]
+    for text in ("seed one", "seed two", "seed three", "folded seed"):
+        llm.queue_response(text=text)
+    manager = ContextManager(
+        rc=rc,
+        blob_store=in_memory_runtime["blobs"],
+        compaction_llm=llm,
+    )
+
+    attempt = await manager.force_compaction(
+        history=history,
+        compaction_state=CompactionState(),
+        tenant_id="tenant",
+        model_name="model",
+        reactive=True,
+    )
+
+    assert attempt.tokens_after < attempt.tokens_before
+    assert [message.model_dump_json() for message in history[-3:]] == current_tail_before
+    assert history[-3].text == "CURRENT TASK VERBATIM"
+    assert history[-3].metadata == {"current": "task"}
+    assert all(
+        message.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True
+        for message in history[:-3]
+    )
+    persistable = [
+        message
+        for message in history
+        if message.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is not True
+    ]
+    assert persistable == history[-3:]
+
+
+def _seeded_incident_history() -> list[Message]:
+    """Five prior-run seed turns and the current task, as measured on a client stand."""
+    seed = {SESSION_HISTORY_SEED_METADATA_KEY: True}
+    return [
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text="prior task " * 1_200)],
+            metadata=seed,
+        ),
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[TextBlock(text="prior answer " * 1_200)],
+            metadata=seed,
+        ),
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="ok")], metadata=seed),
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text="another prior task " * 1_200)],
+            metadata=seed,
+        ),
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[TextBlock(text="prior answer two " * 1_200)],
+            metadata=seed,
+        ),
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="CURRENT TASK VERBATIM")]),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reactive_compaction_shrinks_the_incident_shape_under_default_constants(
+    in_memory_runtime,
+) -> None:
+    """Stock constants: a provider rejection must free tokens from seed-only history."""
+    from protocore.runtime.context.compaction import CompactionState
+    from protocore.runtime.context.manager import ContextManager
+
+    rc = LoopConstants(model_context_window=65_536)
+    history = _seeded_incident_history()
+    llm = in_memory_runtime["llm"]
+    for text in ("seed one", "seed two", "seed three", "seed four", "seed five"):
+        llm.queue_response(text=text)
+    manager = ContextManager(
+        rc=rc, blob_store=in_memory_runtime["blobs"], compaction_llm=llm
+    )
+
+    attempt = await manager.force_compaction(
+        history=history,
+        compaction_state=CompactionState(),
+        tenant_id="tenant",
+        model_name="model",
+        reactive=True,
+    )
+
+    assert attempt.tokens_after < attempt.tokens_before // 4
+    assert history[-1].text == "CURRENT TASK VERBATIM"
+    assert history[-1].metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is not True
+    assert all(
+        message.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True
+        for message in history[:-1]
+    )
+
+
+@pytest.mark.asyncio
+async def test_proactive_force_compaction_keeps_seeds_and_routine_window(
+    in_memory_runtime,
+) -> None:
+    """Without a provider rejection the emergency profile must not apply."""
+    from protocore.runtime.context.compaction import CompactionState
+    from protocore.runtime.context.manager import ContextManager
+
+    rc = LoopConstants(model_context_window=65_536)
+    history = _seeded_incident_history()
+    before = [message.model_dump_json() for message in history]
+    llm = in_memory_runtime["llm"]
+    llm.queue_response(text="must not be used")
+    manager = ContextManager(
+        rc=rc, blob_store=in_memory_runtime["blobs"], compaction_llm=llm
+    )
+
+    await manager.force_compaction(
+        history=history,
+        compaction_state=CompactionState(),
+        tenant_id="tenant",
+        model_name="model",
+    )
+
+    assert llm.calls == ()
+    assert [message.model_dump_json() for message in history] == before
+
+
+@pytest.mark.asyncio
+async def test_proactive_force_compaction_keeps_the_routine_window_for_a_fresh_batch(
+    in_memory_runtime,
+) -> None:
+    """A proactive emergency pass must not shed an unconsumed parallel tool batch."""
+    from protocore.runtime.context.compaction import CompactionState
+    from protocore.runtime.context.manager import ContextManager
+
+    rc = LoopConstants(model_context_window=8_192)
+    history = [
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="task")]),
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[
+                ToolUseBlock(tool_call_id=f"call-{n}", name="read", arguments_json="{}")
+                for n in range(3)
+            ],
+        ),
+        *(
+            Message(
+                role=MessageRole.tool,
+                content_blocks=[
+                    ToolResultBlock(tool_call_id=f"call-{n}", content="fresh result " * 2_000)
+                ],
+            )
+            for n in range(3)
+        ),
+    ]
+    manager = ContextManager(rc=rc, blob_store=in_memory_runtime["blobs"], compaction_llm=None)
+
+    attempt = await manager.force_compaction(
+        history=history,
+        compaction_state=CompactionState(),
+        tenant_id="tenant",
+        model_name="model",
+    )
+
+    assert attempt.tier1 is not None
+    assert attempt.tier1.messages_modified == 0
+    assert attempt.tier1.blob_refs_created == ()
 
 
 @pytest.mark.asyncio
@@ -2237,7 +2508,6 @@ class _MidToolCallTruncatedLLM:
 
 # ProviderDelta-emitting LLM needs ProviderDelta imported in scope.
 from protocore.contracts.llm import ProviderDelta, ProviderDeltaKind  # noqa: E402
-from protocore.contracts.types import ToolResultBlock, ToolUseBlock  # noqa: E402
 
 
 @pytest.mark.asyncio

@@ -5243,6 +5243,7 @@ async def _handle_context_window_exceeded(
                 call_purpose="structured",
                 call_category="compaction",
             ),
+            reactive=True,
         )
     except CompactionExhaustedError as inner_exc:
         # Death-spiral guard — set BEFORE the state transition.

@@ -1434,6 +1434,26 @@ _SEED_KEY_DERIVED_ELSEWHERE: dict[str, str] = {
         "Tier 2 nor the fold may treat it as one. The callers work by INDEX "
         "into the whole list, which a filtered copy cannot express"
     ),
+    "protocore/runtime/context/compaction.py::run_tier2_summarisation": (
+        "reactive compaction preserves seed provenance while replacing units "
+        "by INDEX into the whole list"
+    ),
+    "protocore/runtime/context/compaction.py::_foldable_indices.is_foldable": (
+        "reactive folding classifies each indexed message without losing its "
+        "seed provenance"
+    ),
+    "protocore/runtime/context/compaction.py::_fold_spans": (
+        "reactive folding splits indexed spans at seed/current boundaries"
+    ),
+    "protocore/runtime/context/compaction.py::_fold_span": (
+        "a seed-only replacement inherits the provenance of the indexed span"
+    ),
+    "protocore/runtime/context/compaction.py::_fold_item_text": (
+        "labels one indexed message for the fold summariser by its provenance"
+    ),
+    "protocore/runtime/context/compaction.py::run_tier3_fold": (
+        "reactive folding transfers seed provenance from each indexed span"
+    ),
     "protocore/runtime/context/session_memory.py::_tag_seeded": (
         "writes the tag; this is where the boundary comes from"
     ),

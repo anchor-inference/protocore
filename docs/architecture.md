@@ -492,7 +492,10 @@ crashes. The shared assistant loop is **not** a single immutable path:
   order, each one taking what the pass before it could not.
   **Tier 1** replaces an over-budget tool result with a placeholder and puts
   the bytes in the blob store; the content is recoverable and the preview says
-  what was shed. **Tier 2** summarises old turns through the compaction LLM —
+  what was shed. It may also shed aged reasoning or an over-budget frozen
+  reference while preserving message metadata, including seed provenance.
+  Routine **Tier 2** and **Tier 3** leave seeded prior-run turns untouched.
+  **Tier 2** summarises old turns through the compaction LLM —
   one atomic unit at a time, an assistant `tool_use` turn and the results
   answering it standing or falling together so no pair is orphaned. It never
   summarises a turn the operator wrote: an instruction is short, so
@@ -506,9 +509,13 @@ crashes. The shared assistant loop is **not** a single immutable path:
   becomes one consolidated summary in which the operator's instructions
   survive as exact quotes; the task turn and the
   `compaction_fold_keep_operator_turns` most recent instructions stay
-  verbatim, and a seeded prior-run turn is never folded (the fold would drop
-  the tag that separates the runs). A fold is a summary like any other, so a
-  later fold absorbs it once its neighbourhood has grown again.
+  verbatim. Reactive provider-overflow recovery may summarise and fold seed-only spans,
+  keeping only the `compaction_force_keep_recent_turns` trailing messages (one by
+  default); every replacement retains the seed tag and
+  spans split at seed/current boundaries, so the host's persistence filter
+  keeps the runs separate. Frozen compaction references remain protected. A
+  fold is a summary like any other, so a later fold absorbs it once its
+  neighbourhood has grown again.
 
   Both summarisers assemble their request through `build_llm_request`, record
   it to the request manifest, and are told the same two rules the wording of a

@@ -1426,6 +1426,49 @@ async def test_tier3_never_folds_a_turn_seeded_from_an_earlier_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reactive_fold_splits_seeded_and_current_provenance() -> None:
+    """A fold never merges messages that the persistence filter treats differently."""
+    rc = _fold_rc(
+        compaction_keep_recent_turns=1,
+        compaction_fold_min_messages=2,
+        compaction_fold_keep_operator_turns=0,
+    )
+    seeded = [
+        _summary_message(f"seed summary {index} " * 20, f"seed-{index}").model_copy(
+            update={
+                "metadata": {
+                    COMPACTION_SUMMARY_METADATA_KEY: True,
+                    SESSION_HISTORY_SEED_METADATA_KEY: True,
+                }
+            }
+        )
+        for index in range(2)
+    ]
+    current = [
+        _summary_message(f"current summary {index} " * 20, f"current-{index}")
+        for index in range(2)
+    ]
+    history = [*seeded, *current, _assistant("recent")]
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text=json.dumps({"summary": "seed fold"}))
+    llm.queue_response(text=json.dumps({"summary": "current fold"}))
+
+    result = await run_tier3_fold(
+        history=history,
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=rc,
+        model_name="mock",
+        compact_seeded_history=True,
+    )
+
+    assert result.spans_folded == 2
+    assert history[0].metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True
+    assert history[1].metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is not True
+    assert history[2].text == "recent"
+
+
+@pytest.mark.asyncio
 async def test_a_fold_no_smaller_than_the_run_it_replaces_is_discarded() -> None:
     rc = _fold_rc()
     history = _folding_history()

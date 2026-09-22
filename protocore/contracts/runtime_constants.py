@@ -345,6 +345,16 @@ class LoopConstants(BaseModel):
         gt=0,
         description="Last-N turns kept verbatim across compaction.",
     )
+    compaction_force_keep_recent_turns: int = Field(
+        default=1,
+        gt=0,
+        description=(
+            "Last-N messages kept verbatim when compaction answers a provider "
+            "context-window rejection. Smaller than the routine keep window "
+            "because the provider has already proven the request does not fit; "
+            "the trailing message is the request being recovered."
+        ),
+    )
     compaction_tracked_tool_names: tuple[str, ...] = Field(
         default=("Write", "Edit", "Read", "Glob", "Grep"),
         description=(

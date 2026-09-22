@@ -548,6 +548,13 @@ class TestLoopGroup:
         assert spec.maximum == 1.0
         assert spec.exclusive_maximum is True
 
+    def test_forced_compaction_keep_window_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("compaction_force_keep_recent_turns")
+        assert spec.default == 1
+        assert spec.minimum == 0.0
+        assert spec.exclusive_minimum is True
+        assert spec.kind == "int"
+
     def test_context_overflow_retry_attempt_bound_is_dashboard_configurable(self) -> None:
         spec = build_loop_group().spec("context_overflow_retry_max_attempts")
         assert spec.default == 13

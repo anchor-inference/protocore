@@ -833,6 +833,54 @@ async def test_seeded_turns_protected_from_tier2_summary() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tier2_keeps_mixed_provenance_tool_unit_atomic() -> None:
+    """A summary cannot represent a tool pair with two persistence provenances."""
+    from protocore.tests_support.adapters import InMemoryLLMProvider
+
+    rc = LoopConstants(
+        model_context_window=4_096,
+        compaction_keep_recent_turns=1,
+        compaction_protect_first_user_turn=False,
+    )
+    history = [
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[
+                ToolUseBlock(
+                    tool_call_id="mixed",
+                    name="read",
+                    arguments_json='{"path":"old"}',
+                )
+            ],
+            metadata={SESSION_HISTORY_SEED_METADATA_KEY: True},
+        ),
+        Message(
+            role=MessageRole.tool,
+            content_blocks=[
+                ToolResultBlock(tool_call_id="mixed", content="large result " * 200)
+            ],
+        ),
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="current task")]),
+    ]
+    before = [message.model_dump_json() for message in history]
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text="must not be used")
+
+    result = await run_tier2_summarisation(
+        history=history,
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=rc,
+        model_name="mock",
+        compact_seeded_history=True,
+    )
+
+    assert result.turns_summarised == 0
+    assert llm.calls == ()
+    assert [message.model_dump_json() for message in history] == before
+
+
+@pytest.mark.asyncio
 async def test_tier1_shed_preserves_seed_tag_on_placeholder() -> None:
     """Tier-1 shedding of a LARGE seeded tool result MUST keep the seed tag.
 

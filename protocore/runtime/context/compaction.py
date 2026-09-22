@@ -7,9 +7,10 @@ Tier 1 — tool-result truncation:
  in :class:`IBlobStore`. Loop oldest-first; stop when enough freed.
 
 Tier 2 — old-turn summarisation:
- For turns older than ``compaction_keep_recent_turns``, call
+ For turns older than ``compaction_keep_recent_turns`` (or, when recovery
+ answers a provider rejection, ``compaction_force_keep_recent_turns``), call
  :meth:`ILLMProvider.complete_structured` with :func:`build_summary_schema`
- and replace the turn with a system message containing the summary. Strip
+ and replace the turn with a user-role message containing the summary. Strip
  injection patterns before sending to the summariser. An operator turn is
  never summarised: an instruction is short, and a summary of an instruction
  is where "remove the model-name field" becomes "the user asked for changes".
@@ -546,7 +547,9 @@ def current_tool_batch_protect_index(history: list[Message]) -> int | None:
     results from the current assistant turn's just-executed batch have been
     appended to ``history``. Those results are freshly produced and the model
     has NOT yet consumed them. The ``compaction_keep_recent_turns`` window
-    (default 4) only protects the trailing N messages, so a parallel batch of
+    (default 4; reactive recovery narrows it to
+    ``compaction_force_keep_recent_turns``) only protects the trailing N
+    messages, so a parallel batch of
     more than ``keep`` tool calls leaves the 5th-from-last (and earlier) fresh
     result inside the eligible zone — Tier-1 can blob it to a placeholder and
     Tier-2 can summarise it away in the SAME iteration, before the next
@@ -946,11 +949,14 @@ def _first_user_turn_index(history: list[Message]) -> int | None:
 def _session_history_seed_indices(history: list[Message]) -> frozenset[int]:
     """Return the history indices of executor-seeded prior-run turns.
 
-    These are protected from Tier-2 summarisation so a lossy summary never
-    silently collapses seeded prior-run content into an UNtagged
-    ``<compacted-turn>`` system message — which would (a) defeat the host
+    Routine Tier-2 summarisation and Tier-3 folding protect these so a lossy
+    summary never silently collapses seeded prior-run content into an UNtagged
+    ``<compacted-turn>`` message — which would (a) defeat the host
     finalization filter that excludes seed-tagged turns from re-persistence and
-    (b) re-write prior-run conversation under the new ``run_id``.
+    (b) re-write prior-run conversation under the new ``run_id``. Reactive
+    recovery after a provider rejection (``compact_seeded_history=True``) may
+    replace seed-only units and spans, and then copies the seed tag onto every
+    replacement so the filter still holds.
 
     Tier-1 still bounds these turns under budget pressure, by TWO mechanisms
     (both preserve the seed tag because ``model_copy`` keeps ``metadata``):
@@ -966,8 +972,9 @@ def _session_history_seed_indices(history: list[Message]) -> frozenset[int]:
       exceed the truncation threshold. Without the reference dual-tag these
       large user-text blocks had NO shed path and were permanently immovable.
 
-    Only the lossy Tier-2 collapse is withheld from ALL seed-tagged turns; the
-    reference dual-tag does not weaken that (Tier-2 still skips them by seed tag).
+    Only the lossy Tier-2 collapse is withheld from seed-tagged turns outside
+    reactive recovery; the reference dual-tag does not weaken that (Tier-2
+    still skips them by seed tag).
     """
     return frozenset(
         idx
@@ -1415,13 +1422,20 @@ async def run_tier2_summarisation(
     free_target_tokens: int | None = None,
     record_request: RequestRecorder | None = None,
     prompts: IPromptTemplateProvider | None = None,
+    keep_recent_turns: int | None = None,
+    compact_seeded_history: bool = False,
 ) -> Tier2Result:
     """Summarise old turns via the compaction LLM.
 
- For each ATOMIC unit older than ``rc.compaction_keep_recent_turns`` that has
- not yet been summarised, call
+ For each ATOMIC unit older than ``keep_recent_turns`` (or
+ ``rc.compaction_keep_recent_turns`` when no override is supplied) that has not
+ yet been summarised, call
  :meth:`ILLMProvider.complete_structured` with the summary schema and replace
- the unit's anchor turn in-place with a system message wrapping the summary.
+ the unit's anchor turn in-place with a user-role message wrapping the summary.
+ ``compact_seeded_history`` is reserved for reactive overflow recovery: it
+ makes seed-only units eligible and copies the seed tag to their replacement.
+ Mixed seed/current units remain intact because one replacement cannot retain
+ both persistence provenances exactly.
 
  tool pairing is atomic: an assistant ``tool_use`` turn and the
  tool-role ``tool_result`` message(s) that answer it are summarised (the
@@ -1438,7 +1452,7 @@ async def run_tier2_summarisation(
  ``str(id(obj))``, so a turn already summarised before a snapshot/resume is
  recognised after rehydration and is NOT re-summarised (no churn, no
  summary-of-summary decay, deterministic across pods). The produced summary
- system message is tagged with :data:`COMPACTION_SUMMARY_METADATA_KEY` and
+ user message is tagged with :data:`COMPACTION_SUMMARY_METADATA_KEY` and
  an already-summary anchor is
  skipped, so the per-iteration gate (A1) is idempotent.
 
@@ -1491,7 +1505,7 @@ async def run_tier2_summarisation(
     history = list(history)
     summarised_turn_ids = set(state.summarised_turn_ids)
 
-    keep = rc.compaction_keep_recent_turns
+    keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
     eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index)
     if eligible_upper == 0:
         return Tier2Result(turns_summarised=0, tokens_freed=0)
@@ -1500,7 +1514,9 @@ async def run_tier2_summarisation(
     # content. Sending them to the summariser lets it misattribute the runtime's
     # instruction to the operator; protecting them instead makes them immortal.
     # They have no tool-pairing role, so remove them deterministically before
-    # building Tier-2 units while the recent tail remains untouched.
+    # building Tier-2 units while the recent tail remains untouched. Every
+    # nudge is appended as the trailing message of the request it steers, so
+    # even the one-message reactive keep window keeps the live nudge.
     synthetic_nudges = {
         idx
         for idx in range(eligible_upper)
@@ -1531,15 +1547,11 @@ async def run_tier2_summarisation(
     # which keeps their wording as quotes.
     protected = protected | frozenset(_operator_turn_indices(history))
 
-    # Protect executor-seeded prior-run turns from the lossy Tier-2 collapse so
-    # a summary never drops the SESSION_HISTORY_SEED tag (which the host
-    # finalization filter relies on to avoid re-persisting prior-run
-    # conversation under the new run_id). Tier-1 still bounds them: seeded tool
-    # results via the main shed path, and the session summary/ledger seed blocks
-    # via the reference path (they DUAL-TAG COMPACTION_REFERENCE — see
-    # ``_session_history_seed_indices``).
+    # Routine compaction protects prior-run seeds. Reactive compaction may
+    # summarise seed-only units, but every replacement retains the seed tag so
+    # the host's finalization filter still excludes it from persistence.
     seed_indices = _session_history_seed_indices(history)
-    if seed_indices:
+    if seed_indices and not compact_seeded_history:
         protected = protected | seed_indices
 
     # Reference blocks are a Tier-1-ONLY shed surface (A2(2) recoverable blob
@@ -1564,7 +1576,7 @@ async def run_tier2_summarisation(
     # Which units are worth a call at all, decided before any call is made:
     # not already summarised, and big enough that a summary could come back
     # smaller than what it replaces.
-    jobs: list[tuple[_SummarisationUnit, str, list[Message], int]] = []
+    jobs: list[tuple[_SummarisationUnit, str, list[Message], int, bool]] = []
     for unit in units:
         anchor = history[unit.anchor_idx]
         # A4 idempotency — never re-summarise an existing compaction summary
@@ -1577,6 +1589,16 @@ async def run_tier2_summarisation(
         # Exhaustive across EVERY member of the unit (assistant turn + its
         # tool results), so the summary preserves the tool exchange.
         unit_messages = [history[member] for member in unit.indices]
+        seeded_members = [
+            member.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True
+            for member in unit_messages
+        ]
+        # A single replacement cannot preserve exact persistence provenance for
+        # a mixed seed/current unit. Leave it intact rather than turning either
+        # side into the other.
+        if any(seeded_members) and not all(seeded_members):
+            continue
+        seed_only = all(seeded_members)
         before_tokens = sum(estimate_message_tokens(member, rc) for member in unit_messages)
         # No-net-gain floor — a unit at or below the empty-wrapper size cannot
         # shrink; replacing it would only GROW history (the inflation the
@@ -1590,7 +1612,7 @@ async def run_tier2_summarisation(
         )
         if before_tokens <= floor:
             continue
-        jobs.append((unit, anchor_key, unit_messages, before_tokens))
+        jobs.append((unit, anchor_key, unit_messages, before_tokens, seed_only))
 
     # Calls go out in small parallel batches, oldest unit first, and stop once
     # the pass has freed its budget. Sequentially this was one chain of
@@ -1616,15 +1638,27 @@ async def run_tier2_summarisation(
                     observability=observability,
                     record_request=record_request,
                 )
-                for unit, anchor_key, unit_messages, before_tokens in batch
+                for unit, anchor_key, unit_messages, before_tokens, _seed_only in batch
             )
         )
         if any(outcome.failed for outcome in outcomes):
             return Tier2Result(turns_summarised=0, tokens_freed=0)
-        for (unit, _key, _members, _before), outcome in zip(batch, outcomes, strict=True):
+        for (unit, _key, _members, _before, seed_only), outcome in zip(
+            batch, outcomes, strict=True
+        ):
             if outcome.replacement is None:
                 continue
-            replacements[unit.anchor_idx] = outcome.replacement
+            replacement = outcome.replacement
+            if seed_only:
+                replacement = replacement.model_copy(
+                    update={
+                        "metadata": {
+                            **replacement.metadata,
+                            SESSION_HISTORY_SEED_METADATA_KEY: True,
+                        }
+                    }
+                )
+            replacements[unit.anchor_idx] = replacement
             # Every non-anchor member of the unit (the matching tool results) is
             # removed so the dropped ToolUseBlock leaves no orphaned tool_result.
             indices_to_drop.update(member for member in unit.indices if member != unit.anchor_idx)
@@ -1651,7 +1685,13 @@ COMPACTION_FOLD_METADATA_KEY: Final[str] = "protocore.compaction_fold"
 """On a fold summary: how many messages it stands for, and how many were the operator's."""
 
 
-def _foldable_indices(history: list[Message], eligible_upper: int, rc: LoopConstants) -> frozenset[int]:
+def _foldable_indices(
+    history: list[Message],
+    eligible_upper: int,
+    rc: LoopConstants,
+    *,
+    compact_seeded_history: bool = False,
+) -> frozenset[int]:
     """Positions the fold may consolidate.
 
     A message qualifies when it is an old compaction summary or an old operator
@@ -1661,45 +1701,95 @@ def _foldable_indices(history: list[Message], eligible_upper: int, rc: LoopConst
     a frozen reference block. The seed exclusion is not cosmetic — a fold that
     absorbed a seeded turn would drop the tag that separates this run's
     messages from the previous run's, which is the one thing distinguishing
-    them.
+    them. ``compact_seeded_history`` (reactive recovery only) lifts it for
+    plain seeded user turns; :func:`_fold_spans` then never lets a seeded and
+    a current message share one span, and the fold copies the tag onto a
+    seed-only replacement.
     """
     first_user = _first_user_turn_index(history) if rc.compaction_protect_first_user_turn else None
     keep = rc.compaction_fold_keep_operator_turns
     operators = _operator_turn_indices(history)
     recent_operators = frozenset(operators[-keep:]) if keep else frozenset()
-    protected = recent_operators | _session_history_seed_indices(history) | _compaction_reference_indices(history)
+    protected = recent_operators | _compaction_reference_indices(history)
+    if not compact_seeded_history:
+        protected = protected | _session_history_seed_indices(history)
+
+    def is_foldable(message: Message) -> bool:
+        if _is_compaction_summary(message) or _is_plain_operator_turn(message):
+            return True
+        return (
+            compact_seeded_history
+            and message.role is MessageRole.user
+            and message.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True
+            and message.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY) is not True
+            and not any(
+                isinstance(block, ToolResultBlock) for block in message.content_blocks
+            )
+        )
+
     return frozenset(
         idx
         for idx in range(min(eligible_upper, len(history)))
         if idx != first_user
         and idx not in protected
-        and (_is_compaction_summary(history[idx]) or _is_plain_operator_turn(history[idx]))
+        and is_foldable(history[idx])
     )
 
 
-def _fold_spans(history: list[Message], eligible_upper: int, rc: LoopConstants) -> list[tuple[int, int]]:
+def _fold_spans(
+    history: list[Message],
+    eligible_upper: int,
+    rc: LoopConstants,
+    *,
+    compact_seeded_history: bool = False,
+) -> list[tuple[int, int]]:
     """Contiguous runs ``[start, end)`` of foldable messages, long and heavy enough to be worth a call.
 
     A run must be at least ``compaction_fold_min_messages`` long and
     ``compaction_fold_min_tokens`` big. Both bounds exist so a span that has
     already been folded is not folded again for nothing: one fold summary
     standing alone is neither long enough nor heavy enough to qualify.
+
+    With ``compact_seeded_history`` a run is additionally split where seed
+    provenance changes, so every span is either all seeded or all current and
+    its replacement can carry exactly one provenance.
     """
-    foldable = _foldable_indices(history, eligible_upper, rc)
+    foldable = _foldable_indices(
+        history,
+        eligible_upper,
+        rc,
+        compact_seeded_history=compact_seeded_history,
+    )
     spans: list[tuple[int, int]] = []
     start: int | None = None
+    span_is_seeded: bool | None = None
     for idx in range(len(history) + 1):
         if idx in foldable:
+            is_seeded = (
+                history[idx].metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True
+            )
             if start is None:
                 start = idx
+                span_is_seeded = is_seeded
+            elif is_seeded != span_is_seeded:
+                if idx - start >= rc.compaction_fold_min_messages:
+                    tokens = sum(
+                        estimate_message_tokens(history[j], rc) for j in range(start, idx)
+                    )
+                    if tokens >= rc.compaction_fold_min_tokens:
+                        spans.append((start, idx))
+                start = idx
+                span_is_seeded = is_seeded
             continue
         if start is not None:
-            end = idx
-            if end - start >= rc.compaction_fold_min_messages:
-                tokens = sum(estimate_message_tokens(history[j], rc) for j in range(start, end))
+            if idx - start >= rc.compaction_fold_min_messages:
+                tokens = sum(
+                    estimate_message_tokens(history[j], rc) for j in range(start, idx)
+                )
                 if tokens >= rc.compaction_fold_min_tokens:
-                    spans.append((start, end))
+                    spans.append((start, idx))
             start = None
+            span_is_seeded = None
     return spans
 
 
@@ -1714,6 +1804,8 @@ def _fold_item_text(message: Message) -> str:
     if _is_compaction_summary(message):
         inner = re.sub(r"^<compacted-turn[^>]*>", "", text).removesuffix("</compacted-turn>").strip()
         return f"[earlier summary] {inner}"
+    if message.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True:
+        return f"[earlier session turn] {text}"
     return f"[operator said] {text}"
 
 
@@ -1737,17 +1829,25 @@ async def _fold_span(
     model_name: str,
     observability: LLMObservabilityContext | None,
     record_request: RequestRecorder | None,
+    seed_only: bool,
 ) -> _SummaryOutcome:
     """Fold ONE run of old summaries and operator turns into a single summary."""
     anchor_key = _fold_anchor_key(members)
     before_tokens = sum(estimate_message_tokens(member, rc) for member in members)
     operator_count = sum(1 for member in members if _is_plain_operator_turn(member))
+    seed_count = sum(
+        1
+        for member in members
+        if member.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True
+        and not _is_compaction_summary(member)
+    )
     prompt = prompts.render(
         "compaction_fold_summary",
         {
             "items": "\n\n".join(_strip_injection_patterns(_fold_item_text(m)) for m in members),
             "item_count": len(members),
             "operator_count": operator_count,
+            "seed_count": seed_count,
             "max_words": rc.compaction_fold_summary_target_words,
         },
     )
@@ -1778,6 +1878,11 @@ async def _fold_span(
                         "messages": len(members),
                         "operator_turns": operator_count,
                     },
+                    **(
+                        {SESSION_HISTORY_SEED_METADATA_KEY: True}
+                        if seed_only
+                        else {}
+                    ),
                 }
             }
         ),
@@ -1796,6 +1901,8 @@ async def run_tier3_fold(
     protect_tail_from_index: int | None = None,
     record_request: RequestRecorder | None = None,
     prompts: IPromptTemplateProvider | None = None,
+    keep_recent_turns: int | None = None,
+    compact_seeded_history: bool = False,
 ) -> Tier3Result:
     """Fold runs of old summaries and old operator turns into one summary each.
 
@@ -1815,16 +1922,25 @@ async def run_tier3_fold(
     history with many foldable runs is compacted over several passes rather
     than in one long ``COMPACTING`` pause.
 
+    ``keep_recent_turns`` overrides ``rc.compaction_keep_recent_turns`` and
+    ``compact_seeded_history`` admits seed-only spans; both are set only by
+    reactive recovery after a provider rejection. A seed-only span's
+    replacement keeps the seed tag.
+
     Mutates ``history`` in place.
     """
     if not history or not rc.compaction_fold_enabled:
         return Tier3Result(spans_folded=0, messages_folded=0, tokens_freed=0)
-    eligible_upper = _effective_eligible_upper(
-        history, rc.compaction_keep_recent_turns, protect_tail_from_index
-    )
+    keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
+    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index)
     if eligible_upper == 0:
         return Tier3Result(spans_folded=0, messages_folded=0, tokens_freed=0)
-    spans = _fold_spans(history, eligible_upper, rc)[: rc.compaction_fold_max_spans_per_pass]
+    spans = _fold_spans(
+        history,
+        eligible_upper,
+        rc,
+        compact_seeded_history=compact_seeded_history,
+    )[: rc.compaction_fold_max_spans_per_pass]
     if not spans:
         return Tier3Result(spans_folded=0, messages_folded=0, tokens_freed=0)
 
@@ -1848,6 +1964,10 @@ async def run_tier3_fold(
                     model_name=model_name,
                     observability=observability,
                     record_request=record_request,
+                    seed_only=all(
+                        message.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True
+                        for message in history[start:end]
+                    ),
                 )
                 for start, end in batch
             )
