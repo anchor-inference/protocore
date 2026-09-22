@@ -535,7 +535,12 @@ crashes. The shared assistant loop is **not** a single immutable path:
   summary lives or dies by: keep every identifier — paths, ids, ports, URLs,
   numbers, error codes — verbatim rather than substituting a plausible value,
   and state an outcome with no tool result or confirmation behind it as
-  UNKNOWN rather than as done or not done. Both instructions are templates
+  UNKNOWN rather than as done or not done. The per-turn prompt states its
+  budget in characters as well as words, says a longer reply is cut off and
+  discarded, asks for the count and the records that matter instead of a copy
+  of a long tool result, and names the single key it wants — a model that
+  listed every record of a long result wrote a reply the output cap cut, and a
+  cut reply is never parsed. Both instructions are templates
   (`compaction_turn_summary`, `compaction_fold_summary`), not literals, so an
   operator serving another language has somewhere to put the translation.
 

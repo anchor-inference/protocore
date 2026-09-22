@@ -475,6 +475,17 @@ class LoopConstants(BaseModel):
             "that never shrink, and the next pass pays for them again."
         ),
     )
+    compaction_summary_chars_per_word: int = Field(
+        default=6,
+        ge=1,
+        description=(
+            "Characters one word of a summary is assumed to cost, used to "
+            "restate the summariser's word budget in the prompt as a character "
+            "budget as well. A model holds to a length it can count directly "
+            "better than to a word count it has to estimate, and the budget "
+            "only bites when the reply would otherwise have been cut off."
+        ),
+    )
     compaction_summary_failed_unit_max_attempts: int = Field(
         default=2,
         ge=1,

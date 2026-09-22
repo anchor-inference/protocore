@@ -38,6 +38,14 @@ All notable changes to this project are recorded here. The format follows
   the run snapshot. A reply carrying no readable summary now counts as a
   failed call — that is the shape a cut-off reply takes — while a summary that
   is merely no smaller than the original does not.
+- **The per-turn summariser prompt states its budget in characters too.** It
+  now also says that a longer reply is cut off and discarded, asks for a
+  count and the records that matter instead of a copy of a long tool result,
+  and names the single key it wants. A model that listed every record of a
+  long result wrote a reply the output cap cut, and a cut reply is never
+  parsed. `compaction_summary_chars_per_word` (6) converts the word budget.
+  The template gains a `max_chars` variable; a per-tenant override that does
+  not use it is unaffected.
 
 ## [2.0.0a16]
 

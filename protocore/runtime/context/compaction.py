@@ -1421,7 +1421,11 @@ async def _summarise_unit(
         "compaction_turn_summary",
         {
             "turn": _strip_injection_patterns(raw_text),
-            "max_words": _summary_word_budget(before_tokens, rc),
+            "max_words": (word_budget := _summary_word_budget(before_tokens, rc)),
+            # The same budget in characters. A model holds to a length it can
+            # count directly better than to a word count it has to estimate,
+            # and the reply is thrown away if the output cap cuts it.
+            "max_chars": word_budget * rc.compaction_summary_chars_per_word,
         },
     )
     return await _run_summariser(

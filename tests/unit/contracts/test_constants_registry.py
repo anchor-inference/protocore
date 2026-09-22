@@ -581,6 +581,12 @@ class TestLoopGroup:
         assert spec.minimum == 1.0
         assert spec.kind == "int"
 
+    def test_summary_chars_per_word_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("compaction_summary_chars_per_word")
+        assert spec.default == 6
+        assert spec.minimum == 1.0
+        assert spec.kind == "int"
+
     def test_a_constant_without_a_bound_has_none(self) -> None:
         spec = build_loop_group().spec("continue_prompt_text")
         assert spec.minimum is None and spec.maximum is None
