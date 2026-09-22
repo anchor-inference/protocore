@@ -6,6 +6,17 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0a13]
+
+### Fixed
+
+- **Context retries now use provider-reported prompt sizes when available.**
+  OpenAI-compatible adapters can attach the provider's measured context window
+  and input-token count to an overflow. The retry then reserves its configured
+  safety margin against that measured size instead of relying only on the local
+  estimator, preventing a second request from missing the hard limit by a small
+  provider-tokenization difference.
+
 ## [2.0.0a12]
 
 ### Fixed
