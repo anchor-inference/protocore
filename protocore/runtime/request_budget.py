@@ -17,7 +17,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 from protocore.contracts.llm import LLMContextWindowExceeded, LLMRequest
 from protocore.contracts.runtime_constants import LoopConstants
@@ -34,6 +34,15 @@ _logger = get_logger(__name__)
 #: prompt with a smaller cap reuse the count it already has.
 _SIZE_INDEPENDENT_FIELDS: frozenset[str] = frozenset(
     {"max_tokens", "temperature", "observability"}
+)
+
+#: Request options that move from one iteration to the next without changing
+#: what the prompt renders to. Prompt-cache breakpoints mark where a provider
+#: may cache, and are re-placed on every request as the history grows; the
+#: forced tool choice constrains decoding, not the template. Left in the digest,
+#: either would make the tool definitions look new on every iteration.
+_RENDER_NEUTRAL_EXTRA_KEYS: frozenset[str] = frozenset(
+    {"cache_breakpoints", "forced_tool_choice"}
 )
 
 RequestTokenCount = Callable[[LLMRequest], Awaitable[int | None]]
@@ -188,7 +197,9 @@ class RequestDigests:
 
 def request_digests(request: LLMRequest) -> RequestDigests:
     """Digest ``request`` once, for the count cache and for the re-count decision."""
-    frame = request.model_dump_json(exclude={"messages", *_SIZE_INDEPENDENT_FIELDS})
+    exclude: dict[str, Any] = dict.fromkeys(("messages", *_SIZE_INDEPENDENT_FIELDS), True)
+    exclude["extra"] = dict.fromkeys(_RENDER_NEUTRAL_EXTRA_KEYS, True)
+    frame = request.model_dump_json(exclude=exclude)
     return RequestDigests(
         messages=tuple(message_digest(message) for message in request.messages),
         frame=_sha256(frame),

@@ -33,6 +33,8 @@ from protocore.contracts.types import (
     MessageRole,
     StopReason,
     TextBlock,
+    ToolDefinition,
+    ToolParameterSchema,
     ToolResultBlock,
     ToolUseBlock,
 )
@@ -46,6 +48,7 @@ from protocore.runtime.request_budget import (
     fit_request_to_context,
     fit_request_to_context_measured,
     near_limit,
+    request_digests,
     request_token_counter,
 )
 
@@ -685,3 +688,50 @@ async def test_a_rewrite_that_adds_nothing_unseen_is_not_counted_again() -> None
         LLMRequest(model="m", messages=messages[10:], max_tokens=16_384), rc, provider, cache=cache
     )
     assert len(provider.counted) == 1
+
+
+@pytest.mark.asyncio
+async def test_moving_cache_breakpoints_do_not_make_the_tools_look_new() -> None:
+    rc = _rc(model_context_window=65_536)
+    provider = _ContentAwareCounter(rc)
+    cache = ExactTokenCountCache()
+    tools = [
+        ToolDefinition(
+            name=f"tool_{i}",
+            description="Searches the library. " * 200,
+            parameters=ToolParameterSchema(type="object", properties={"q": {"type": "string"}}),
+        )
+        for i in range(12)
+    ]
+    messages = [_prose(i) for i in range(10)]
+    for iteration in range(6):
+        messages.append(_msg(f"search result {iteration} " + "short prose " * 20))
+        request = LLMRequest(
+            model="m",
+            messages=list(messages),
+            tools=tools,
+            max_tokens=16_384,
+            extra={
+                "cache_breakpoints": [{"message_index": len(messages) - 1, "cache_control_type": "ephemeral"}],
+                "forced_tool_choice": "tool_0" if iteration % 2 else None,
+                "enable_thinking": False,
+            },
+        )
+        await fit_request_to_context_measured(request, rc, provider, cache=cache)
+    assert len(provider.counted) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_rendering_option_still_makes_the_frame_new() -> None:
+    rc = _rc(model_context_window=65_536)
+    provider = _ContentAwareCounter(rc)
+    cache = ExactTokenCountCache()
+    messages = [_prose(i) for i in range(20)]
+    for thinking in (False, True):
+        request = LLMRequest(
+            model="m", messages=messages, max_tokens=16_384, extra={"enable_thinking": thinking}
+        )
+        await fit_request_to_context_measured(request, rc, provider, cache=cache)
+    assert request_digests(request).frame != request_digests(
+        request.model_copy(update={"extra": {"enable_thinking": False}})
+    ).frame
