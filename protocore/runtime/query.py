@@ -4661,6 +4661,10 @@ async def _drive_one_stream(
         )
     await _manifest_request(engine, request, call_purpose="run")
 
+    # Capture the post-fit value that is actually handed to the provider. If
+    # this call is rejected for context length, its retry ceiling must be
+    # derived from this wire cap rather than from the larger pre-fit budget.
+    engine._last_fitted_request_max_tokens = request.max_tokens
     upstream = engine.llm.stream_with_tools(request)
 
     # Decide ONCE, up-front, whether this turn's visible assistant TEXT is the
@@ -5108,6 +5112,19 @@ async def _handle_context_window_exceeded(
         async for evt in _emit_llm_terminal(engine, exc, kind="llm_context_window_exceeded"):
             yield evt
         return
+
+    rejected_max_tokens = engine._last_fitted_request_max_tokens
+    if rejected_max_tokens is not None:
+        retry_max_tokens = int(
+            rejected_max_tokens * engine.config.rc.context_overflow_retry_output_ratio
+        )
+        if retry_max_tokens < 1:
+            async for evt in _emit_llm_terminal(
+                engine, exc, kind="llm_context_window_exceeded"
+            ):
+                yield evt
+            return
+        engine._context_overflow_retry_max_tokens = retry_max_tokens
 
     engine._compaction_attempted_for_current_turn = True
     from_state = engine.state
@@ -6836,10 +6853,10 @@ def _apply_context_overflow_retry_output_cap(
     rejected output allowance; the hard request fit still runs afterwards.
     """
 
-    if not engine._compaction_attempted_for_current_turn:
+    retry_max_tokens = engine._context_overflow_retry_max_tokens
+    if retry_max_tokens is None:
         return max_output_tokens
-    ratio = engine.config.rc.context_overflow_retry_output_ratio
-    return max(1, int(max_output_tokens * ratio))
+    return min(max_output_tokens, retry_max_tokens)
 
 
 def _history_has_file_write_result(engine: QueryEngine) -> bool:

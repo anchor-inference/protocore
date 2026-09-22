@@ -929,6 +929,14 @@ class QueryEngine:
         # Only one force_compaction attempt allowed per message
         # before the run goes terminal FAILED.
         self._compaction_attempted_for_current_turn: bool = False
+        # Actual max_tokens on the most recent fitted assistant request. Kept
+        # only until this assistant-message boundary so an upstream context
+        # rejection can derive a retry ceiling from what was really sent.
+        self._last_fitted_request_max_tokens: int | None = None
+        # One-shot ceiling for the rebuilt request after an upstream context
+        # rejection. Derived from the rejected wire cap, never from the
+        # pre-fit output budget, so partial compaction cannot raise the retry.
+        self._context_overflow_retry_max_tokens: int | None = None
         # Iterations the per-iteration compaction gate still skips after a pass that freed nothing.
         self.compaction_backoff_left: int = 0
         # Max-output-tokens recovery: count of "Resume directly" retries
@@ -2110,6 +2118,9 @@ class QueryEngine:
         * ``_compaction_attempted_for_current_turn`` — a run that ate two
           distinct PTLs in two separate model calls still gets one recovery
           attempt each.
+        * ``_last_fitted_request_max_tokens`` and
+          ``_context_overflow_retry_max_tokens`` — the rejected wire cap and
+          its derived retry ceiling belong only to that same model call.
         * ``_max_output_recovery_count`` — only consecutive
           truncations within one message exhaust the budget.
 
@@ -2134,6 +2145,8 @@ class QueryEngine:
         constraint applies to exactly that one message.
         """
         self._compaction_attempted_for_current_turn = False
+        self._last_fitted_request_max_tokens = None
+        self._context_overflow_retry_max_tokens = None
         self.compaction_backoff_left = 0
         if self._terminal_backstop_turn_active:
             self._terminal_backstop_turn_active = False

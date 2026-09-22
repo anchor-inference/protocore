@@ -29,6 +29,8 @@ from protocore.prompts import bundled_prompt_provider
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
 
+from ._tool_fixtures import MockTool
+
 # ----------------------------------------------------------------------
 # Provider-chain doubles
 # ----------------------------------------------------------------------
@@ -146,6 +148,29 @@ class _ScriptedFailureLLM:
 
     def count_tokens(self, text, model=None) -> int:  # type: ignore[no-untyped-def]
         return max(1, len(text) // 4)
+
+
+class _FirstCallOverflowLLM:
+    """Reject one request, then delegate later internal iterations."""
+
+    def __init__(self, delegate) -> None:  # type: ignore[no-untyped-def]
+        self._delegate = delegate
+        self.calls: list[LLMRequest] = []
+
+    async def stream_with_tools(  # type: ignore[no-untyped-def]
+        self, request: LLMRequest
+    ) -> AsyncIterator[LLMStreamEvent]:
+        self.calls.append(request)
+        if len(self.calls) == 1:
+            raise LLMContextWindowExceeded("request exceeded context")
+        async for event in self._delegate.stream_with_tools(request):
+            yield event
+
+    async def complete_structured(self, request, schema):  # type: ignore[no-untyped-def]
+        return await self._delegate.complete_structured(request, schema)
+
+    def count_tokens(self, text, model=None) -> int:  # type: ignore[no-untyped-def]
+        return int(self._delegate.count_tokens(text, model))
 
 
 # ----------------------------------------------------------------------
@@ -311,6 +336,74 @@ async def test_context_window_retry_halves_the_rejected_output_cap(
 
     assert engine.state is LoopState.COMPLETED
     assert [request.max_tokens for request in llm.calls] == [8_192, 4_096]
+
+
+@pytest.mark.asyncio
+async def test_context_window_retry_ceiling_uses_the_fitted_wire_cap(
+    engine_factory, in_memory_runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rc = LoopConstants(
+        model_context_window=65_536,
+        llm_output_max_tokens_ratio=0.125,
+        compaction_keep_recent_turns=1,
+    )
+    engine = engine_factory(rc=rc)
+    llm = _ScriptedFailureLLM(
+        exceptions=[LLMContextWindowExceeded("request exceeded context")],
+    )
+    engine.llm = llm  # type: ignore[assignment]
+    engine.context_manager._compaction_llm = llm  # type: ignore[attr-defined]
+    engine.compaction_llm = llm  # type: ignore[assignment]
+    prompt_estimates = iter(
+        [
+            rc.model_context_window - rc.request_context_safety_tokens - 3_000,
+            1,
+        ]
+    )
+    monkeypatch.setattr(
+        "protocore.runtime.request_budget.estimate_request_prompt_tokens",
+        lambda request, constants: next(prompt_estimates),
+    )
+
+    async for _ in engine.run(
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+    ):
+        pass
+
+    assert engine.state is LoopState.COMPLETED
+    assert [request.max_tokens for request in llm.calls] == [3_000, 1_500]
+
+
+@pytest.mark.asyncio
+async def test_context_window_retry_ceiling_does_not_leak_to_the_next_tool_iteration(
+    engine_factory, in_memory_runtime
+) -> None:
+    rc = LoopConstants(
+        model_context_window=65_536,
+        llm_output_max_tokens_ratio=0.125,
+        compaction_keep_recent_turns=1,
+    )
+    engine = engine_factory(rc=rc)
+    delegate = in_memory_runtime["llm"]
+    delegate.queue_tool_call_response(
+        tool_call_id="toolu_retry_boundary",
+        tool_name="Read",
+        tool_input={"v": "hello"},
+    )
+    delegate.queue_response(text="done")
+    llm = _FirstCallOverflowLLM(delegate)
+    engine.llm = llm  # type: ignore[assignment]
+    engine.context_manager._compaction_llm = llm  # type: ignore[attr-defined]
+    engine.compaction_llm = llm  # type: ignore[assignment]
+    in_memory_runtime["tools"].register(MockTool(tool_name="Read"))
+
+    async for _ in engine.run(
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="go")])
+    ):
+        pass
+
+    assert engine.state is LoopState.COMPLETED
+    assert [request.max_tokens for request in llm.calls] == [8_192, 4_096, 8_192]
 
 
 @pytest.mark.asyncio
@@ -555,10 +648,14 @@ def test_reset_recovery_state_resets_compaction_attempted(
     """``reset_recovery_state`` clears ``_compaction_attempted_for_current_turn``."""
     engine = engine_factory()
     engine._compaction_attempted_for_current_turn = True
+    engine._last_fitted_request_max_tokens = 8_192
+    engine._context_overflow_retry_max_tokens = 4_096
 
     engine.reset_recovery_state()
 
     assert engine._compaction_attempted_for_current_turn is False
+    assert engine._last_fitted_request_max_tokens is None
+    assert engine._context_overflow_retry_max_tokens is None
 
 
 def test_context_window_retry_cap_only_applies_inside_the_recovery_boundary(
@@ -570,6 +667,7 @@ def test_context_window_retry_cap_only_applies_inside_the_recovery_boundary(
         rc=LoopConstants(context_overflow_retry_output_ratio=0.5)
     )
     engine._compaction_attempted_for_current_turn = True
+    engine._context_overflow_retry_max_tokens = 4_096
 
     assert _apply_context_overflow_retry_output_cap(engine, 8_192) == 4_096
 
@@ -582,6 +680,8 @@ def test_new_engine_has_recovery_flags_reset(engine_factory) -> None:
     """Fresh :class:`QueryEngine` has recovery flags at false / zero."""
     engine = engine_factory()
     assert engine._compaction_attempted_for_current_turn is False
+    assert engine._last_fitted_request_max_tokens is None
+    assert engine._context_overflow_retry_max_tokens is None
     assert engine._max_output_recovery_count == 0
     assert engine._provider_chain_advances == 0
 

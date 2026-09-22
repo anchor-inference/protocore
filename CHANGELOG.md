@@ -11,9 +11,10 @@ All notable changes to this project are recorded here. The format follows
 ### Fixed
 
 - **A context-overflow retry now reduces its output allowance.** Reactive
-  compaction still rebuilds the prompt once, and the rebuilt request uses half
-  the normal output cap by default so provider-only framing cannot cause an
-  unchanged request to hit the same context limit twice.
+  compaction still rebuilds the prompt once, and the rebuilt request uses at
+  most half the fitted output allowance the provider rejected by default. A
+  smaller rebuilt prompt therefore cannot raise the retry back toward the
+  normal cap and hit the same context limit twice.
 
 ## [2.0.0a11]
 
