@@ -6,6 +6,7 @@ recovery, death-spiral guard, and continue-prompt fallback.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 
 import pytest
@@ -771,9 +772,16 @@ async def test_lower_bound_overflow_repeatedly_reduces_cap_after_one_compaction(
 
 
 @pytest.mark.asyncio
-async def test_proactive_no_progress_compaction_is_not_repeated_after_overflow(
+async def test_a_proactive_pass_is_followed_by_exactly_one_reactive_pass_after_overflow(
     engine_factory, in_memory_runtime, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A proactive pass that freed nothing does not use up the reactive attempt.
+
+    The two passes run different profiles: the proactive one keeps the routine
+    window and leaves seeded history alone, the reactive one may shrink it.
+    After the provider's rejection the reactive pass therefore still runs
+    once; a second rejection is answered by the output-cap ladder alone.
+    """
     rc = LoopConstants(
         model_context_window=65_536,
         llm_output_max_tokens_ratio=0.125,
@@ -813,7 +821,7 @@ async def test_proactive_no_progress_compaction_is_not_repeated_after_overflow(
         event.payload.get("reason")
         for event in events
         if event.type is EventType.COMPACTION_STARTED
-    ] == ["proactive_emergency"]
+    ] == ["proactive_emergency", "reactive_413"]
 
 
 @pytest.mark.asyncio
@@ -1180,6 +1188,114 @@ async def test_proactive_force_compaction_keeps_the_routine_window_for_a_fresh_b
     assert attempt.tier1 is not None
     assert attempt.tier1.messages_modified == 0
     assert attempt.tier1.blob_refs_created == ()
+
+
+class _WindowBoundLLM:
+    """Refuses any request whose estimated prompt plus output cap exceeds the window.
+
+    That is what a server that reserves the output budget inside its context
+    window does. The rejection reports only a lower bound for the prompt, as
+    such servers do, so recovery cannot measure its way out of it.
+    """
+
+    def __init__(self, rc: LoopConstants, summariser: object) -> None:
+        self._rc = rc
+        self._summariser = summariser
+        self.attempts: list[tuple[int, int, bool]] = []
+
+    async def stream_with_tools(  # type: ignore[no-untyped-def]
+        self, request: LLMRequest
+    ) -> AsyncIterator[LLMStreamEvent]:
+        from protocore.runtime.context.compaction import estimate_history_tokens
+
+        prompt = estimate_history_tokens(list(request.messages), self._rc)
+        cap = request.max_tokens
+        window = self._rc.model_context_window
+        if prompt + cap > window:
+            self.attempts.append((prompt, cap, False))
+            raise LLMContextWindowExceeded(
+                f"prompt contains at least {window} input tokens",
+                context_window=window,
+                requested_output_tokens=cap,
+            )
+        self.attempts.append((prompt, cap, True))
+        yield LLMStreamEvent(name="message_start", payload={})
+        yield LLMStreamEvent(name="content_block_start", payload={"kind": "text"})
+        yield LLMStreamEvent(name="content_block_delta", payload={"text": "ПРИНЯТО"})
+        yield LLMStreamEvent(name="content_block_stop", payload={})
+        yield LLMStreamEvent(name="message_stop", payload={"stop_reason": "end_turn"})
+
+    async def complete_structured(self, request, schema):  # type: ignore[no-untyped-def]
+        return await self._summariser.complete_structured(request, schema)  # type: ignore[attr-defined]
+
+
+def _filler_of_about(tokens: int, rc: LoopConstants) -> str:
+    from protocore.runtime.context.compaction import estimate_tokens
+
+    unit = "deadbeef0007 "
+    text = unit
+    while estimate_tokens(text, rc) < tokens:
+        text = text + unit * max(1, (tokens - estimate_tokens(text, rc)) // 4)
+    return text
+
+
+@pytest.mark.asyncio
+async def test_a_proactive_pass_that_freed_nothing_does_not_forfeit_reactive_compaction(
+    engine_factory, in_memory_runtime
+) -> None:
+    """The proactive window fires on seed-only history, frees nothing, and must not
+    stand in for the reactive pass the provider's rejection is owed.
+
+    Three turns of ~24k tokens each in one session: two are seeded from prior
+    runs, the third is the request. The routine profile leaves seeds alone, so
+    the proactive pass at turn start is a no-op; the provider then rejects the
+    request, and only the reactive profile can shrink the seeds.
+    """
+    from protocore.tests_support.adapters import InMemoryLLMProvider
+
+    rc = LoopConstants(
+        model_context_window=65_536,
+        request_context_safety_tokens=2_048,
+        llm_output_max_tokens_ratio=0.25,
+    )
+    summariser = InMemoryLLMProvider()
+    for _ in range(8):
+        summariser.queue_response(
+            text=json.dumps({"summary": "прежний ход: длинный заполнитель, ответ ПРИНЯТО"}, ensure_ascii=False)
+        )
+    llm = _WindowBoundLLM(rc, summariser)
+    engine = engine_factory(rc=rc)
+    engine.llm = llm  # type: ignore[assignment]
+    engine.compaction_llm = summariser  # type: ignore[assignment]
+    engine.context_manager._compaction_llm = summariser  # type: ignore[attr-defined]
+
+    seed = {SESSION_HISTORY_SEED_METADATA_KEY: True}
+    big = _filler_of_about(24_000, rc)
+    engine.history.extend(
+        [
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text=big + " один")], metadata=seed),
+            Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="ПРИНЯТО")], metadata=seed),
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text=big + " два")], metadata=seed),
+            Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="ПРИНЯТО")], metadata=seed),
+        ]
+    )
+
+    events = [
+        evt
+        async for evt in engine.run(
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text=big + " три")])
+        )
+    ]
+
+    reasons = [
+        evt.payload.get("reason")
+        for evt in events
+        if evt.type is EventType.COMPACTION_STARTED
+    ]
+    assert "reactive_413" in reasons
+    assert engine.state is LoopState.COMPLETED
+    assert llm.attempts[-1][2] is True
+    assert len(summariser.calls) >= 1
 
 
 @pytest.mark.asyncio
@@ -3010,7 +3126,6 @@ class _CleanCompleteToolCallLLM:
 
 
 # ``json`` is referenced inside the mock above.
-import json  # noqa: E402
 
 
 @pytest.mark.asyncio

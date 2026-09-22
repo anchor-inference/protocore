@@ -5223,7 +5223,7 @@ async def _handle_context_window_exceeded(
     )
 
     if (
-        engine._compaction_attempted_for_current_turn
+        engine._reactive_compaction_attempted_for_current_turn
         and (attempts_exhausted or not retry_strictly_shrinks)
     ):
         async for evt in _emit_llm_terminal(
@@ -5249,7 +5249,10 @@ async def _handle_context_window_exceeded(
         )
         return
 
-    if engine._compaction_attempted_for_current_turn:
+    # Only a reactive pass counts here. A proactive pass carried into this
+    # message ran the routine profile, which leaves seeded history alone; the
+    # rejection is the evidence that the reactive profile is still owed.
+    if engine._reactive_compaction_attempted_for_current_turn:
         retry_cap = cast(int, retry_max_tokens)
         engine._context_overflow_retry_max_tokens = retry_cap
         engine._context_overflow_corrective_retry_count += 1
@@ -5266,6 +5269,7 @@ async def _handle_context_window_exceeded(
         engine._context_overflow_corrective_retry_count += 1
 
     engine._compaction_attempted_for_current_turn = True
+    engine._reactive_compaction_attempted_for_current_turn = True
     from_state = engine.state
     engine.transition_to(LoopState.COMPACTING)
     yield _emit_state_change(engine, from_state, LoopState.COMPACTING, reason="reactive_413")

@@ -930,6 +930,12 @@ class QueryEngine:
         # Only one force_compaction attempt allowed per message
         # before the run goes terminal FAILED.
         self._compaction_attempted_for_current_turn: bool = False
+        # Set only by the provider-rejection handler once it has run the
+        # reactive compaction profile for this message. A proactive pass that
+        # was carried into the message does not set it: that pass keeps the
+        # routine window and never touches seeded history, so it proves
+        # nothing about what the reactive profile could still free.
+        self._reactive_compaction_attempted_for_current_turn: bool = False
         # A proactive pass performed between assistant messages belongs to the
         # request that follows it. The next recovery reset consumes this latch
         # and marks that message's one compaction allowance as already spent.
@@ -2164,6 +2170,7 @@ class QueryEngine:
         constraint applies to exactly that one message.
         """
         self._compaction_attempted_for_current_turn = False
+        self._reactive_compaction_attempted_for_current_turn = False
         self._last_fitted_request_max_tokens = None
         self._context_overflow_retry_max_tokens = None
         self._context_overflow_corrective_retry_count = 0

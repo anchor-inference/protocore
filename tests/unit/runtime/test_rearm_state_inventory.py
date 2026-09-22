@@ -81,6 +81,7 @@ _RESET_ON_REARM: frozenset[str] = frozenset(
         # Recovery budgets. Each bounds one failure mode within one question;
         # an exhausted budget carried forward is a turn that gets no attempt.
         "_compaction_attempted_for_current_turn",
+        "_reactive_compaction_attempted_for_current_turn",
         "_proactive_compaction_attempted_for_next_message",
         "_last_fitted_request_max_tokens",
         "_context_overflow_retry_max_tokens",
