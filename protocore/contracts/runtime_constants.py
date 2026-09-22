@@ -850,9 +850,10 @@ class LoopConstants(BaseModel):
         gt=0.0,
         lt=1.0,
         description=(
-            "Fraction of the normal assistant output cap used for the single "
-            "retry after a provider rejects a request for exceeding its context "
-            "window. The retry also compacts history before rebuilding the request."
+            "Fraction of the rejected assistant output cap used for the single "
+            "provider-measured corrective retry after a context-window rejection. "
+            "The retry runs before compaction when its measured prompt and reduced "
+            "output provably fit; otherwise recovery compacts history first."
         ),
     )
     pinned_tool_max_count: int = Field(

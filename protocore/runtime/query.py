@@ -5131,37 +5131,44 @@ async def _handle_context_window_exceeded(
     engine: QueryEngine,
     exc: LLMContextWindowExceeded,
 ) -> AsyncIterator[TurnEvent]:
-    """Recover from a context-window overflow — force_compaction once and
-    re-stream, else terminal.
+    """Recover from a context-window overflow with one correction and compaction.
 
-    The first overflow compacts and retries. If that rebuilt request is still
-    rejected and the provider reports its measured sizes, one strictly smaller
-    corrective retry is allowed without compacting again. A later overflow is
-    terminal.
+    When provider-measured sizes prove that a strictly smaller output cap fits,
+    retry that request once before rewriting history. If it still overflows, or
+    measured sizes cannot prove a fit, compact once and retry. A later overflow
+    is terminal. This ordering preserves recent history when output headroom is
+    the only problem and avoids failing merely because compaction had no
+    eligible history to rewrite.
     """
     retry_max_tokens = _context_overflow_retry_cap(engine, exc)
+    rejected_wire_cap = _context_overflow_rejected_wire_cap(engine, exc)
+    measured_retry_fits = (
+        exc.context_window is not None
+        and exc.input_tokens is not None
+        and retry_max_tokens is not None
+        and exc.input_tokens + retry_max_tokens <= exc.context_window
+    )
+    if (
+        not engine._context_overflow_corrective_retry_attempted
+        and exc.requested_output_tokens is not None
+        and retry_max_tokens is not None
+        and rejected_wire_cap is not None
+        and retry_max_tokens >= 1
+        and retry_max_tokens < rejected_wire_cap
+        and measured_retry_fits
+    ):
+        engine._context_overflow_retry_max_tokens = retry_max_tokens
+        engine._context_overflow_corrective_retry_attempted = True
+        yield _emit_state_change(
+            engine,
+            engine.state,
+            engine.state,
+            reason="context_overflow_corrective_retry",
+        )
+        return
+
     if engine._compaction_attempted_for_current_turn:
-        rejected_wire_cap = _context_overflow_rejected_wire_cap(engine, exc)
-        if (
-            not engine._context_overflow_corrective_retry_attempted
-            and exc.context_window is not None
-            and exc.input_tokens is not None
-            and exc.requested_output_tokens is not None
-            and retry_max_tokens is not None
-            and rejected_wire_cap is not None
-            and retry_max_tokens >= 1
-            and retry_max_tokens < rejected_wire_cap
-        ):
-            engine._context_overflow_retry_max_tokens = retry_max_tokens
-            engine._context_overflow_corrective_retry_attempted = True
-            yield _emit_state_change(
-                engine,
-                engine.state,
-                engine.state,
-                reason="context_overflow_corrective_retry",
-            )
-            return
-        # The compacted request and its one measured correction both failed.
+        # Compaction and the one measured correction have both been spent.
         # Death-spiral guard via _emit_llm_terminal.
         async for evt in _emit_llm_terminal(engine, exc, kind="llm_context_window_exceeded"):
             yield evt
@@ -6893,14 +6900,14 @@ def _apply_terminal_synthesis_output_reserve(
 def _apply_context_overflow_retry_output_cap(
     engine: QueryEngine, max_output_tokens: int
 ) -> int:
-    """Reduce output headroom on the one retry after context compaction.
+    """Reduce output headroom on the one measured context-overflow retry.
 
-    Reactive context recovery rebuilds the prompt after force-compacting it,
-    but a provider may still count framing that the local estimator cannot
-    see. The per-message recovery latch distinguishes that retry from an
-    ordinary request and already bounds it to one attempt. Applying the cap
-    after terminal synthesis reservation ensures no later floor restores the
-    rejected output allowance; the hard request fit still runs afterwards.
+    A provider may count framing that the local estimator cannot see. The
+    per-message recovery latch distinguishes the smaller request from an
+    ordinary call and bounds it to one attempt, whether it runs before or after
+    compaction. Applying the cap after terminal synthesis reservation ensures
+    no later floor restores the rejected output allowance; the hard request fit
+    still runs afterwards.
     """
 
     retry_max_tokens = engine._context_overflow_retry_max_tokens

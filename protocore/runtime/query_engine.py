@@ -933,12 +933,13 @@ class QueryEngine:
         # only until this assistant-message boundary so an upstream context
         # rejection can derive a retry ceiling from what was really sent.
         self._last_fitted_request_max_tokens: int | None = None
-        # One-shot ceiling for the rebuilt request after an upstream context
+        # One-shot ceiling for a rebuilt request after an upstream context
         # rejection. Derived from the rejected wire cap, never from the
-        # pre-fit output budget, so partial compaction cannot raise the retry.
+        # pre-fit output budget, so direct correction or partial compaction
+        # cannot raise the retry.
         self._context_overflow_retry_max_tokens: int | None = None
-        # A measured overflow of the compacted request may receive one final,
-        # smaller retry without compacting the same history a second time.
+        # A measured overflow may receive one smaller retry before or after the
+        # message's single compaction attempt.
         self._context_overflow_corrective_retry_attempted: bool = False
         # Iterations the per-iteration compaction gate still skips after a pass that freed nothing.
         self.compaction_backoff_left: int = 0
@@ -2124,8 +2125,9 @@ class QueryEngine:
         * ``_last_fitted_request_max_tokens`` and
           ``_context_overflow_retry_max_tokens`` — the rejected wire cap and
           its derived retry ceiling belong only to that same model call.
-        * ``_context_overflow_corrective_retry_attempted`` — the compacted
-          request gets at most one provider-measured corrective retry.
+        * ``_context_overflow_corrective_retry_attempted`` — the message gets
+          at most one provider-measured corrective retry, before or after
+          compaction.
         * ``_max_output_recovery_count`` — only consecutive
           truncations within one message exhaust the budget.
 

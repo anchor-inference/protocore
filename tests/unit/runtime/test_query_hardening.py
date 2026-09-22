@@ -399,13 +399,95 @@ async def test_context_window_retry_uses_provider_reported_prompt_size(
     engine.context_manager._compaction_llm = llm  # type: ignore[attr-defined]
     engine.compaction_llm = llm  # type: ignore[assignment]
 
-    async for _ in engine.run(
-        Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
-    ):
-        pass
+    events = [
+        event
+        async for event in engine.run(
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+        )
+    ]
 
     assert engine.state is LoopState.COMPLETED
     assert [request.max_tokens for request in llm.calls] == [16_384, 3_531]
+    assert not any(event.type is EventType.COMPACTION_STARTED for event in events)
+    assert any(
+        event.payload.get("reason") == "context_overflow_corrective_retry"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_one_token_provider_overflow_retries_before_no_progress_compaction(
+    engine_factory, in_memory_runtime
+) -> None:
+    rc = LoopConstants(
+        model_context_window=65_536,
+        request_context_safety_tokens=2_048,
+        llm_output_max_tokens_ratio=0.125,
+        compaction_keep_recent_turns=1,
+    )
+    engine = engine_factory(rc=rc)
+    llm = _ScriptedFailureLLM(
+        exceptions=[
+            LLMContextWindowExceeded(
+                "provider total exceeded the window by one token",
+                context_window=65_536,
+                input_tokens=63_490,
+                requested_output_tokens=2_047,
+            )
+        ],
+    )
+    engine.llm = llm  # type: ignore[assignment]
+    engine.context_manager._compaction_llm = llm  # type: ignore[attr-defined]
+    engine.compaction_llm = llm  # type: ignore[assignment]
+
+    events = [
+        event
+        async for event in engine.run(
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+        )
+    ]
+
+    assert engine.state is LoopState.COMPLETED
+    assert [request.max_tokens for request in llm.calls] == [8_192, 1_023]
+    assert not any(event.type is EventType.COMPACTION_STARTED for event in events)
+
+
+@pytest.mark.asyncio
+async def test_failed_direct_correction_then_compacts_once(
+    engine_factory, in_memory_runtime
+) -> None:
+    rc = LoopConstants(
+        model_context_window=65_536,
+        request_context_safety_tokens=2_048,
+        llm_output_max_tokens_ratio=0.125,
+        compaction_keep_recent_turns=1,
+    )
+    engine = engine_factory(rc=rc)
+    llm = _ScriptedFailureLLM(
+        exceptions=[
+            LLMContextWindowExceeded(
+                "measured overflow",
+                context_window=65_536,
+                input_tokens=60_000,
+                requested_output_tokens=8_192,
+            ),
+            LLMContextWindowExceeded("corrective request still overflowed"),
+        ],
+    )
+    engine.llm = llm  # type: ignore[assignment]
+    engine.context_manager._compaction_llm = llm  # type: ignore[attr-defined]
+    engine.compaction_llm = llm  # type: ignore[assignment]
+
+    events = [
+        event
+        async for event in engine.run(
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+        )
+    ]
+
+    assert engine.state is LoopState.COMPLETED
+    assert [request.max_tokens for request in llm.calls] == [8_192, 3_488, 1_744]
+    assert sum(event.type is EventType.COMPACTION_STARTED for event in events) == 1
 
 
 @pytest.mark.asyncio
