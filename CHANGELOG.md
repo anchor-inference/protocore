@@ -6,6 +6,37 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0a16]
+
+### Fixed
+
+- **Reactive compaction can now shrink history seeded from earlier runs.**
+  When a provider rejects a request as exceeding its context window, recovery
+  keeps only `compaction_force_keep_recent_turns` trailing messages (one by
+  default) and may summarise or fold prior-run seed turns, copying the seed tag
+  onto every replacement so the host still excludes them from persistence.
+  Previously a history made of protected seeds left reactive compaction with
+  nothing to compact, and the run failed after the output-cap ladder ran out.
+  Proactive emergency compaction keeps the routine window and seed protection.
+- Fold summaries label prior-session turns separately from the operator's own
+  instructions.
+
+## [2.0.0a15]
+
+### Fixed
+
+- **Bounded context-window recovery when providers report only a prompt-size
+  lower bound.** Repeated retries strictly reduce output headroom under
+  `context_overflow_retry_max_attempts`, and proactive compaction is not
+  repeated reactively for the same assistant message.
+
+## [2.0.0a14]
+
+### Fixed
+
+- A measured context overflow is retried with a smaller output cap before
+  history is rewritten; a repeated overflow gets exactly one compaction attempt.
+
 ## [2.0.0a13]
 
 ### Fixed
