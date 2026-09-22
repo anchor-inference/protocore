@@ -17,7 +17,11 @@ All notable changes to this project are recorded here. The format follows
   rejects any prompt above `window - max output`; with the stock 0.8 trigger
   and 0.25 output reserve the trigger on a 65 536-token window stood above
   that cliff, so proactive compaction could not fire before the rejection.
-  The emergency cliff is held strictly above the effective trigger.
+  The emergency cliff is held strictly above the effective trigger. The
+  output-reserve part of the deduction is gated on
+  `provider_reserves_output_in_context_window` (default true): a provider that
+  sizes its input window independently of the requested output gives that
+  share of the window back by setting it false.
 - **A summary's word budget is sized for the script it is written in.** The
   ceiling was half the summariser's output cap, two tokens a word being the
   English figure; JSON escaping and a non-Latin script cost three or four, so
@@ -37,13 +41,20 @@ All notable changes to this project are recorded here. The format follows
   fold tier, and the other units in the batch commit. The census is carried in
   the run snapshot. A reply carrying no readable summary now counts as a
   failed call — that is the shape a cut-off reply takes — while a summary that
-  is merely no smaller than the original does not.
+  is merely no smaller than the original does not — nor does a transport
+  failure (a rate limit, a 5xx, a reset socket): only a unit that does not fit
+  the summariser's window or whose reply the output cap cut is counted, since
+  only those repeat. The forced passes ignore the census entirely and try
+  every unit, and entries whose unit has left the history are pruned.
 - **The per-turn summariser prompt states its budget in characters too.** It
   now also says that a longer reply is cut off and discarded, asks for a
   count and the records that matter instead of a copy of a long tool result,
   and names the single key it wants. A model that listed every record of a
   long result wrote a reply the output cap cut, and a cut reply is never
-  parsed. `compaction_summary_chars_per_word` (6) converts the word budget.
+  parsed. `compaction_summary_chars_per_word` (6) converts the word budget,
+  `compaction_summary_envelope_tokens` (32) reserves room for the JSON around
+  the words before the budget is derived, and the budget is also clamped to
+  what `compaction_summary_string_max_chars` will accept at decode time.
   The template gains a `max_chars` variable; a per-tenant override that does
   not use it is unaffected.
 
@@ -62,7 +73,10 @@ All notable changes to this project are recorded here. The format follows
   with one of `tool_result_stale_trim_protected_prefixes` are carried over
   verbatim, so a result whose text names how to cite it keeps that line when it
   loses its body. Pinned results are spared unless a later write falsified the
-  pin, and compacted placeholders are never rewritten.
+  pin, and compacted placeholders are never rewritten. It does not delay
+  compaction: the compaction gate measures the whole durable transcript, not
+  the trimmed request view, so what it buys is a smaller and cheaper prompt at
+  the provider, not fewer compactions.
 
 ## [2.0.0a16]
 

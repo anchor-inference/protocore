@@ -619,6 +619,17 @@ class TestLoopGroup:
         assert spec.minimum == 1.0
         assert spec.kind == "int"
 
+    def test_output_reserve_gate_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("provider_reserves_output_in_context_window")
+        assert spec.default is True
+        assert spec.kind == "bool"
+
+    def test_summary_envelope_allowance_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("compaction_summary_envelope_tokens")
+        assert spec.default == 32
+        assert spec.minimum == 0.0
+        assert spec.kind == "int"
+
     def test_a_constant_without_a_bound_has_none(self) -> None:
         spec = build_loop_group().spec("continue_prompt_text")
         assert spec.minimum is None and spec.maximum is None

@@ -80,17 +80,26 @@ def derive_budgets(rc: LoopConstants) -> TokenBudgets:
     max_context = rc.model_context_window
 
     # The trigger has to be a prompt size the provider would still accept.
-    # A server that reserves the output budget inside the context window
-    # (vLLM does) rejects every request whose prompt exceeds
-    # ``window - max output``, and the request the runtime builds also keeps
-    # ``request_context_safety_tokens`` unused for provider-side framing. On
-    # top of that the check runs BEFORE a turn, so a turn's worth of headroom
-    # has to remain or the very turn the trigger was meant to precede is the
-    # one that overflows. A trigger above that cliff is unreachable: the
-    # provider rejects the request before the history ever grows into it, and
-    # proactive compaction never runs at all.
+    # Where the serving stack counts the requested output against the same
+    # window as the prompt — ``provider_reserves_output_in_context_window`` —
+    # every request whose prompt exceeds ``window - max output`` is refused,
+    # so that, and not the window, is the ceiling the trigger sits under. A
+    # provider that sizes its input window independently of the requested
+    # output gives that share back. Either way the request the runtime builds
+    # keeps ``request_context_safety_tokens`` unused for provider-side framing,
+    # and the check runs BEFORE a turn, so a turn's worth of headroom has to
+    # remain or the very turn the trigger was meant to precede is the one that
+    # overflows. A trigger above the ceiling is unreachable: the provider
+    # rejects the request before the history ever grows into it, and proactive
+    # compaction never runs at all.
+    output_reserve = (
+        int(max_context * rc.llm_output_max_tokens_ratio)
+        if rc.provider_reserves_output_in_context_window
+        else 0
+    )
     accept_ceiling = (
-        int(max_context * (1.0 - rc.llm_output_max_tokens_ratio))
+        max_context
+        - output_reserve
         - rc.request_context_safety_tokens
         - int(max_context * rc.compaction_trigger_turn_headroom_ratio)
     )

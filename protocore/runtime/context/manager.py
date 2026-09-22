@@ -501,6 +501,11 @@ class ContextManager:
                     prompts=self._prompts,
                     keep_recent_turns=force_keep_recent_turns,
                     compact_seeded_history=compact_seeded_history,
+                    # A forced pass runs when the alternative is the run
+                    # ending, so it tries every unit — including the ones the
+                    # routine gate has written off. A call that is probably
+                    # wasted is cheaper than a run that cannot continue.
+                    retry_failed_units=True,
                 )
             except Exception as exc:
                 compaction_state.retry_count += 1

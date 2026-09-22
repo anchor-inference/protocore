@@ -1200,7 +1200,16 @@ async def test_the_summariser_is_asked_for_a_word_budget_that_follows_the_unit()
         model_name="mock",
     )
 
-    expected = max(rc.compaction_summary_min_words, before // rc.compaction_summary_tokens_per_word)
+    scaled = max(rc.compaction_summary_min_words, before // rc.compaction_summary_tokens_per_word)
+    # The budget follows the unit until one of the caps on what the reply may
+    # hold takes over: the output cap less its envelope, and the grammar's own
+    # maxLength on the summary string.
+    expected = min(
+        scaled,
+        (rc.compaction_summary_max_output_tokens - rc.compaction_summary_envelope_tokens)
+        // rc.compaction_summary_output_tokens_per_word,
+        rc.compaction_summary_string_max_chars // rc.compaction_summary_chars_per_word,
+    )
     assert f"at most {expected} words" in llm.calls[0].messages[0].text
 
 

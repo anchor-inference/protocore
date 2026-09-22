@@ -53,6 +53,24 @@ class LoopConstants(BaseModel):
         le=1.0,
         description="Fraction of context window above which compaction is triggered.",
     )
+    provider_reserves_output_in_context_window: bool = Field(
+        default=True,
+        description=(
+            "Whether the serving stack counts the requested output budget "
+            "against the same context window as the prompt. Self-hosted "
+            "inference servers commonly do: they refuse any request whose "
+            "prompt plus max output exceeds the window, so the largest prompt "
+            "that is accepted is the window less the output reserve, and the "
+            "compaction trigger has to sit below THAT rather than below the "
+            "window. Hosted APIs commonly size the input window independently "
+            "of the requested output, and there the deduction only gives away "
+            "usable window. True by default because the deduction is safe "
+            "everywhere — it compacts earlier than strictly necessary — while "
+            "its absence is a run that cannot recover on a server that does "
+            "reserve. Set False on a provider that does not, to get the whole "
+            "window back."
+        ),
+    )
     compaction_trigger_turn_headroom_ratio: float = Field(
         default=0.15,
         ge=0.0,
@@ -473,6 +491,18 @@ class LoopConstants(BaseModel):
             "and a summary the cap cuts off is never valid JSON, never parsed "
             "and never committed — so the largest units are exactly the ones "
             "that never shrink, and the next pass pays for them again."
+        ),
+    )
+    compaction_summary_envelope_tokens: int = Field(
+        default=32,
+        ge=0,
+        description=(
+            "Tokens of the summariser's output cap reserved for the JSON "
+            "around the words — the opening brace, the key, the quotes and "
+            "whatever escaping the text forces. Subtracted from the cap before "
+            "the word budget is derived, so a summary that spends its whole "
+            "stated budget still closes its envelope instead of being cut one "
+            "token short of valid JSON and discarded."
         ),
     )
     compaction_summary_chars_per_word: int = Field(
@@ -2884,9 +2914,12 @@ class LoopConstants(BaseModel):
             "by different thresholds that no invariant relates. They compose "
             "safely — a compacted placeholder is never rewritten here, and "
             "persist keeps the whole value either way — but a deployment that "
-            "turns this on is choosing to shrink the prompt BEFORE compaction "
-            "has to run, and that is a choice about how much evidence the "
-            "model should still see, not a default anyone should inherit."
+            "turns this on is choosing to send the model less of what it "
+            "already read, and that is not a default anyone should inherit. "
+            "It does NOT delay compaction: the compaction gate measures the "
+            "whole durable transcript, not the trimmed request view, so this "
+            "buys a smaller and cheaper prompt at the provider and the same "
+            "number of compactions."
         ),
     )
     tool_result_fresh_count: int = Field(
@@ -3000,16 +3033,27 @@ class LoopConstants(BaseModel):
             raise ValueError(
                 "compaction_trigger_ratio must be < compaction_emergency_ratio"
             )
- # the effective trigger sits below the output reserve and a turn's headroom;
- # leave room for both, or there is no prompt size compaction could aim at
-        if (
+ # the effective trigger sits below the output reserve (where the provider
+ # keeps one inside the window) and a turn's headroom; leave room for both, or
+ # there is no prompt size compaction could aim at
+        output_reserve_ratio = (
             self.llm_output_max_tokens_ratio
-            + self.compaction_trigger_turn_headroom_ratio
-            >= 1.0
+            if self.provider_reserves_output_in_context_window
+            else 0.0
+        )
+ # the summariser must be able to spend the budget the prompt states: the
+ # output cap has to hold the words plus the envelope around them
+        if self.compaction_summary_envelope_tokens >= (
+            self.compaction_summary_max_output_tokens
         ):
             raise ValueError(
+                "compaction_summary_envelope_tokens must be < "
+                "compaction_summary_max_output_tokens"
+            )
+        if output_reserve_ratio + self.compaction_trigger_turn_headroom_ratio >= 1.0:
+            raise ValueError(
                 "llm_output_max_tokens_ratio + compaction_trigger_turn_headroom_ratio "
-                "must be < 1.0"
+                "must be < 1.0 while provider_reserves_output_in_context_window is set"
             )
  # combined overhead budgets must leave room for history
         fixed_overhead = (

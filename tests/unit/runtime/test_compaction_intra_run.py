@@ -598,9 +598,9 @@ async def test_tier2_provider_failure_keeps_the_deterministic_cleanup() -> None:
         "recent",
     ]
     assert state.summarised_turn_ids == set()
-    # The unit the call failed on carries the failure, so the next pass does
-    # not buy the same one.
-    assert list(state.failed_anchor_keys.values()) == [1]
+    # A transport failure says nothing about the unit, so nothing is written
+    # off: the next pass tries it again.
+    assert state.failed_anchor_keys == {}
 
 
 @pytest.mark.asyncio

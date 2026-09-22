@@ -97,3 +97,39 @@ def test_an_output_reserve_that_leaves_no_headroom_is_refused() -> None:
             llm_output_max_tokens_ratio=0.9,
             compaction_trigger_turn_headroom_ratio=0.15,
         )
+
+
+def test_a_provider_that_does_not_reserve_output_keeps_that_share_of_the_window() -> None:
+    """The output-reserve deduction answers a serving stack that counts the
+    requested output against the same window as the prompt. A provider that
+    sizes its input window independently gives that share back."""
+    window = 65_536
+    reserving = derive_budgets(LoopConstants(model_context_window=window))
+    independent = derive_budgets(
+        LoopConstants(
+            model_context_window=window,
+            provider_reserves_output_in_context_window=False,
+        )
+    )
+    rc = LoopConstants(model_context_window=window)
+    assert independent.compaction_trigger_tokens > reserving.compaction_trigger_tokens
+    # Without the reserve the ceiling rises above the configured ratio, which
+    # then binds — the operator gets back the trigger the ratio asks for.
+    assert independent.compaction_trigger_tokens == int(window * 0.8)
+    assert (
+        window
+        - rc.request_context_safety_tokens
+        - int(window * rc.compaction_trigger_turn_headroom_ratio)
+    ) > int(window * 0.8)
+
+
+def test_the_reserve_is_deducted_by_default_so_a_reserving_server_is_covered() -> None:
+    rc = LoopConstants(model_context_window=65_536)
+    assert rc.provider_reserves_output_in_context_window is True
+    budgets = derive_budgets(rc)
+    assert budgets.compaction_trigger_tokens == (
+        65_536
+        - int(65_536 * rc.llm_output_max_tokens_ratio)
+        - rc.request_context_safety_tokens
+        - int(65_536 * rc.compaction_trigger_turn_headroom_ratio)
+    )

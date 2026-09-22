@@ -1191,20 +1191,25 @@ class _SummaryOutcome:
     ``replacement`` is ``None`` for every way a call can fail to earn its
     keep — the provider raised, the reply carried no usable summary, or the
     summary came back no smaller than what it would replace. The caller commits
-    nothing in that case and the original messages stay as they are.
+    nothing in that case and the original messages stay as they are, and
+    ``repeatable_failure`` says whether trying again could plausibly differ.
     """
 
     anchor_key: str
     replacement: Message | None
     tokens_freed: int
-    failed: bool = False
-    """The CALL went wrong — it raised, would not fit, or brought back no
-    usable summary — as opposed to a summary that simply came back no smaller.
+    repeatable_failure: bool = False
+    """The call failed for a reason that belongs to THIS UNIT, so repeating it
+    produces the same failure: the request does not fit the summariser's own
+    window, or the reply carried no readable summary because the output cap cut
+    the envelope.
 
-    Only the former is counted against the unit: a summary that is no smaller
-    is a fact about this unit's size that says nothing about whether the next
-    attempt can succeed, while a call that cannot complete fails the same way
-    every time it is repeated.
+    Only this is counted against the unit. A transport failure — a rate limit,
+    a 5xx, a socket reset, a summariser pod recycling — says nothing about the
+    unit and everything about the moment, and counting it would let one blip
+    across a parallel batch retire several units permanently. Nor is a summary
+    that merely came back no smaller counted: that is a fact about the unit's
+    size, not about whether the call can complete.
     """
 
 
@@ -1291,8 +1296,21 @@ def _summary_word_budget(before_tokens: int, rc: LoopConstants) -> int:
     # What a word costs on the way out is a property of the script it is
     # written in and of the JSON around it, not of English —
     # ``compaction_summary_output_tokens_per_word`` carries that figure.
-    ceiling = rc.compaction_summary_max_output_tokens // rc.compaction_summary_output_tokens_per_word
-    return max(rc.compaction_summary_min_words, min(scaled, ceiling))
+    # The envelope around the words — the brace, the key, the quotes, the
+    # escaping — is paid out of the same cap, so it comes off the top: a budget
+    # that spends the cap exactly is a summary cut one token short of closing
+    # its JSON, which is the failure this ceiling exists to prevent.
+    ceiling = (
+        rc.compaction_summary_max_output_tokens - rc.compaction_summary_envelope_tokens
+    ) // rc.compaction_summary_output_tokens_per_word
+    # The grammar caps the summary string at decode time; asking for more
+    # characters than it will accept is asking for a reply it must cut. Both
+    # ceilings outrank the floor: a budget the reply cannot hold is worse than
+    # a budget too small to say much, because the first comes back unusable.
+    grammar_ceiling = (
+        rc.compaction_summary_string_max_chars // rc.compaction_summary_chars_per_word
+    )
+    return max(1, min(max(rc.compaction_summary_min_words, scaled), ceiling, grammar_ceiling))
 
 
 async def _run_summariser(
@@ -1340,24 +1358,37 @@ async def _run_summariser(
             unit_label,
             exc,
         )
+        # The unit does not fit the summariser's window. That is a property of
+        # the unit and every later pass meets it again.
         return _SummaryOutcome(
             anchor_key=anchor_key,
             replacement=None,
             tokens_freed=0,
-            failed=True,
+            repeatable_failure=True,
         )
     if record_request is not None:
         await record_request(request)
     try:
         response = await compaction_llm.complete_structured(request, build_summary_schema(rc))
-    except Exception as exc:
-        _logger.warning("summariser failed for %s; skipping (err=%s)", unit_label, exc)
+    except LLMContextWindowExceeded as exc:
+        # The provider itself says this unit is too large for the summariser.
+        # Unlike a transport failure, that verdict does not change with time.
+        _logger.warning(
+            "summariser rejected %s as too large; skipping (err=%s)", unit_label, exc
+        )
         return _SummaryOutcome(
             anchor_key=anchor_key,
             replacement=None,
             tokens_freed=0,
-            failed=True,
+            repeatable_failure=True,
         )
+    except Exception as exc:
+        # A rate limit, a 5xx, a reset socket, a summariser pod restarting: the
+        # unit did nothing wrong and the next pass may well succeed on it. The
+        # pass loses this call and nothing more — counting it would let one
+        # blip across a parallel batch retire several units for the whole run.
+        _logger.warning("summariser failed for %s; skipping (err=%s)", unit_label, exc)
+        return _SummaryOutcome(anchor_key=anchor_key, replacement=None, tokens_freed=0)
     summary_text = _summary_from_response(response.message.text, unit_label)
     if not summary_text:
         # A reply with no readable summary in it is the shape a cut-off reply
@@ -1368,7 +1399,7 @@ async def _run_summariser(
             anchor_key=anchor_key,
             replacement=None,
             tokens_freed=0,
-            failed=True,
+            repeatable_failure=True,
         )
     wrapped = _wrap_compaction_summary(anchor_key, summary_text)
     after_tokens = estimate_tokens(wrapped, rc)
@@ -1442,6 +1473,27 @@ async def _summarise_unit(
     )
 
 
+def _prune_failed_anchor_keys(state: CompactionState, history: list[Message]) -> None:
+    """Forget the units the history no longer holds.
+
+    A key whose anchor has been folded away, dropped at a checkpoint or
+    replaced describes nothing that can be summarised again, and every one of
+    them is written into every later snapshot. Runs on every exit from the
+    pass, including the ones that never reach a summariser call, because that
+    is exactly the shape a transcript takes once the fold has consumed it.
+    """
+    if not state.failed_anchor_keys:
+        return
+    present = {
+        _stable_turn_key(message)
+        for message in history
+        if not _is_compaction_summary(message)
+    }
+    state.failed_anchor_keys = {
+        key: count for key, count in state.failed_anchor_keys.items() if key in present
+    }
+
+
 async def run_tier2_summarisation(
     history: list[Message],
     compaction_llm: ILLMProvider,
@@ -1456,6 +1508,7 @@ async def run_tier2_summarisation(
     prompts: IPromptTemplateProvider | None = None,
     keep_recent_turns: int | None = None,
     compact_seeded_history: bool = False,
+    retry_failed_units: bool = False,
 ) -> Tier2Result:
     """Summarise old turns via the compaction LLM.
 
@@ -1468,6 +1521,11 @@ async def run_tier2_summarisation(
  makes seed-only units eligible and copies the seed tag to their replacement.
  Mixed seed/current units remain intact because one replacement cannot retain
  both persistence provenances exactly.
+
+ ``retry_failed_units`` is set by the forced passes: they ignore
+ ``CompactionState.failed_anchor_keys`` and try every eligible unit, because
+ they run when the alternative is the run ending. The routine gate honours the
+ census so a run does not buy the same failure once an iteration.
 
  tool pairing is atomic: an assistant ``tool_use`` turn and the
  tool-role ``tool_result`` message(s) that answer it are summarised (the
@@ -1531,6 +1589,7 @@ async def run_tier2_summarisation(
  Mutates ``history`` in place.
  """
     if not history:
+        state.failed_anchor_keys = {}
         return Tier2Result(turns_summarised=0, tokens_freed=0)
 
     original_history = history
@@ -1541,6 +1600,7 @@ async def run_tier2_summarisation(
     keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
     eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index)
     if eligible_upper == 0:
+        _prune_failed_anchor_keys(state, history)
         return Tier2Result(turns_summarised=0, tokens_freed=0)
 
     # Aged user-role recovery nudges are runtime control flow, not conversation
@@ -1620,11 +1680,15 @@ async def run_tier2_summarisation(
         if anchor_key in summarised_turn_ids:
             continue
         if (
-            failed_anchor_keys.get(anchor_key, 0)
+            not retry_failed_units
+            and failed_anchor_keys.get(anchor_key, 0)
             >= rc.compaction_summary_failed_unit_max_attempts
         ):
             # The summariser has failed on this unit as often as it may. Paying
             # again buys the same failure; the fold tier still gets its turn.
+            # A forced pass sets ``retry_failed_units`` and ignores the census:
+            # it runs when the alternative is the run ending, and a call that
+            # is probably wasted is cheaper than that.
             continue
         # Exhaustive across EVERY member of the unit (assistant turn + its
         # tool results), so the summary preserves the tool exchange.
@@ -1690,7 +1754,7 @@ async def run_tier2_summarisation(
                 # pass that lost one of five still commits the other four. An
                 # all-or-nothing pass meant one oversized unit could keep a run
                 # from shedding a single token.
-                if outcome.failed:
+                if outcome.repeatable_failure:
                     failed_anchor_keys[outcome.anchor_key] = (
                         failed_anchor_keys.get(outcome.anchor_key, 0) + 1
                     )
@@ -1725,6 +1789,7 @@ async def run_tier2_summarisation(
         original_history[:] = history
     state.summarised_turn_ids = summarised_turn_ids
     state.failed_anchor_keys = failed_anchor_keys
+    _prune_failed_anchor_keys(state, history)
 
     return Tier2Result(turns_summarised=summarised, tokens_freed=freed)
 

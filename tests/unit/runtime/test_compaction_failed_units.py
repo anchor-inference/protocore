@@ -13,7 +13,12 @@ from typing import Any
 
 import pytest
 
-from protocore.contracts.llm import LLMRequest, LLMResponse, StopReason
+from protocore.contracts.llm import (
+    LLMContextWindowExceeded,
+    LLMRequest,
+    LLMResponse,
+    StopReason,
+)
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import Message, MessageRole, TextBlock
 from protocore.runtime.context.compaction import (
@@ -49,7 +54,7 @@ def _history(*markers: str) -> list[Message]:
 
 
 class _Raising(InMemoryLLMProvider):
-    """Every summariser call raises, as an oversized request does."""
+    """Every call is refused because the unit does not fit the summariser."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -59,7 +64,21 @@ class _Raising(InMemoryLLMProvider):
         self, request: LLMRequest, response_schema: dict[str, Any]
     ) -> LLMResponse:
         self.structured_calls += 1
-        raise RuntimeError("output truncated by max_tokens")
+        raise LLMContextWindowExceeded("this unit does not fit")
+
+
+class _Flaky(InMemoryLLMProvider):
+    """Every call fails the way a rate limit or a recycled pod fails."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.structured_calls = 0
+
+    async def complete_structured(
+        self, request: LLMRequest, response_schema: dict[str, Any]
+    ) -> LLMResponse:
+        self.structured_calls += 1
+        raise RuntimeError("429 Too Many Requests")
 
 
 class _EmptyReply(InMemoryLLMProvider):
@@ -102,7 +121,7 @@ class _NoSmaller(InMemoryLLMProvider):
 
 
 class _OneUnitFails(InMemoryLLMProvider):
-    """Raises on the unit whose text carries ``marker``; summarises the rest."""
+    """Refuses the unit whose text carries ``marker``; summarises the rest."""
 
     def __init__(self, marker: str) -> None:
         super().__init__()
@@ -114,7 +133,7 @@ class _OneUnitFails(InMemoryLLMProvider):
     ) -> LLMResponse:
         self.structured_calls += 1
         if self._marker in request.messages[0].text:
-            raise RuntimeError("this unit never fits")
+            raise LLMContextWindowExceeded("this unit never fits")
         return LLMResponse(
             message=Message(
                 role=MessageRole.assistant,
@@ -125,7 +144,7 @@ class _OneUnitFails(InMemoryLLMProvider):
 
 
 @pytest.mark.asyncio
-async def test_a_unit_the_summariser_keeps_raising_on_is_left_alone_after_the_limit() -> None:
+async def test_a_unit_the_summariser_cannot_fit_is_left_alone_after_the_limit() -> None:
     rc = _rc(compaction_summary_failed_unit_max_attempts=2)
     history = _history("alpha")
     state = CompactionState()
@@ -228,3 +247,77 @@ async def test_the_failure_census_survives_a_snapshot_round_trip() -> None:
         history=history, compaction_llm=llm, state=rehydrated, rc=rc, model_name="mock"
     )
     assert llm.structured_calls == calls_so_far
+
+
+@pytest.mark.asyncio
+async def test_a_transport_failure_is_not_held_against_the_unit() -> None:
+    """A rate limit, a 5xx or a recycled summariser pod says nothing about the
+    unit. Counting one would let a single blip across a parallel batch retire
+    several units for the rest of the run — and across every resume, since the
+    census rides the snapshot."""
+    rc = _rc(compaction_summary_failed_unit_max_attempts=1)
+    history = _history("alpha", "bravo", "charlie")
+    state = CompactionState()
+    llm = _Flaky()
+
+    for _ in range(3):
+        await run_tier2_summarisation(
+            history=history, compaction_llm=llm, state=state, rc=rc, model_name="mock"
+        )
+
+    assert state.failed_anchor_keys == {}
+    # Every pass still tried every unit.
+    assert llm.structured_calls == 9
+
+
+@pytest.mark.asyncio
+async def test_a_forced_pass_tries_the_units_the_routine_gate_has_written_off() -> None:
+    """A forced pass runs when the alternative is the run ending, so it ignores
+    the census rather than inheriting a verdict reached under lighter pressure."""
+    rc = _rc(compaction_summary_failed_unit_max_attempts=1)
+    history = _history("alpha")
+    state = CompactionState()
+    llm = _Raising()
+
+    await run_tier2_summarisation(
+        history=history, compaction_llm=llm, state=state, rc=rc, model_name="mock"
+    )
+    assert list(state.failed_anchor_keys.values()) == [1]
+
+    # The routine gate now skips it.
+    calls_after_first = llm.structured_calls
+    await run_tier2_summarisation(
+        history=history, compaction_llm=llm, state=state, rc=rc, model_name="mock"
+    )
+    assert llm.structured_calls == calls_after_first
+
+    # The forced pass does not.
+    await run_tier2_summarisation(
+        history=history,
+        compaction_llm=llm,
+        state=state,
+        rc=rc,
+        model_name="mock",
+        retry_failed_units=True,
+    )
+    assert llm.structured_calls == calls_after_first + 1
+
+
+@pytest.mark.asyncio
+async def test_a_census_entry_whose_unit_has_left_the_history_is_forgotten() -> None:
+    rc = _rc(compaction_summary_failed_unit_max_attempts=5)
+    history = _history("alpha")
+    state = CompactionState()
+
+    await run_tier2_summarisation(
+        history=history, compaction_llm=_Raising(), state=state, rc=rc, model_name="mock"
+    )
+    assert len(state.failed_anchor_keys) == 1
+
+    # The unit is gone — folded away, dropped at a checkpoint, replaced.
+    history[:] = [Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")])]
+    await run_tier2_summarisation(
+        history=history, compaction_llm=_Raising(), state=state, rc=rc, model_name="mock"
+    )
+
+    assert state.failed_anchor_keys == {}

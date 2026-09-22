@@ -492,15 +492,18 @@ crashes. The shared assistant loop is **not** a single immutable path:
   every per-layer token budget, deterministically, with no cache. The
   compaction trigger it returns is the LOWER of two bounds: the configured
   `compaction_trigger_ratio` of the window, and the largest prompt the
-  provider would still accept — the window less the output reserve
-  (`llm_output_max_tokens_ratio`), less `request_context_safety_tokens`, less
-  `compaction_trigger_turn_headroom_ratio` of the window for the turn that is
-  about to be added. A server that reserves the output budget inside the
-  context window rejects any prompt above `window - max output`, so a trigger
-  derived from the ratio alone can sit above the cliff and never fire: on a
-  65 536-token window with the stock 0.25 output reserve, 0.8 of the window is
-  3 276 tokens past the point the request stops being accepted. Consumers read
-  the effective value — the emergency cliff is held strictly above it.
+  provider would still accept — the window less the output reserve, less
+  `request_context_safety_tokens`, less `compaction_trigger_turn_headroom_ratio`
+  of the window for the turn that is about to be added. A serving stack that
+  counts the requested output against the same window as the prompt rejects
+  anything above `window - max output`, so a trigger derived from the ratio
+  alone can sit above the cliff and never fire: on a 65 536-token window with
+  the stock 0.25 output reserve, 0.8 of the window is 3 276 tokens past the
+  point the request stops being accepted. The output-reserve term is gated on
+  `provider_reserves_output_in_context_window`, true by default — an endpoint
+  that sizes its input window independently of the requested output sets it
+  false and gets that share of the window back. Consumers read the effective
+  value; the emergency cliff is held strictly above it.
 - `runtime/context/compaction.py` — three passes over the transcript, in
   order, each one taking what the pass before it could not.
   **Tier 1** replaces an over-budget tool result with a placeholder and puts
@@ -552,22 +555,28 @@ crashes. The shared assistant loop is **not** a single immutable path:
   at what the output cap can hold at
   `compaction_summary_output_tokens_per_word` (four — the English figure of two
   understates JSON escaping and a non-Latin script, and a budget sized that way
-  comes back cut off, never parses and is never committed), calls go out
+  comes back cut off, never parses and is never committed) less
+  `compaction_summary_envelope_tokens` for the JSON around the words, and never
+  above what the grammar's own `maxLength` will accept, calls go out
   `compaction_summariser_parallelism` at a time instead of one after another
   while the run sits in `COMPACTING`, and the fold takes at most
   `compaction_fold_max_spans_per_pass` runs per pass. A summary that comes
   back no smaller than what it would replace is discarded, never committed.
 
-  A call that cannot complete at all — the provider raised, the request would
-  not fit, the reply carried no readable summary — is counted against ITS OWN
-  unit in `CompactionState.failed_anchor_keys`, and past
-  `compaction_summary_failed_unit_max_attempts` that unit is not sent again;
-  the fold tier still gets its turn at it. The other units in the batch commit
-  regardless, so one unit the summariser cannot handle no longer keeps a pass
-  from shedding anything. The census rides the run snapshot, so a run re-driven
-  on another pod does not start it from zero. A summary that is merely no
-  smaller is not counted: that says something about the unit's size, not about
-  whether the call can complete.
+  A call that fails for a reason belonging to the unit — the request does not
+  fit the summariser's own window, or the reply carried no readable summary
+  because the output cap cut the envelope — is counted against THAT unit in
+  `CompactionState.failed_anchor_keys`, and past
+  `compaction_summary_failed_unit_max_attempts` the routine gate stops sending
+  it; the fold tier still gets its turn at it. Nothing else is counted: a
+  transport failure (a rate limit, a 5xx, a recycled summariser) says nothing
+  about the unit, and neither does a summary that merely came back no smaller,
+  so neither retires anything. The other units in the batch commit regardless,
+  so one unit the summariser cannot handle no longer keeps a pass from shedding
+  anything. The forced passes ignore the census and try every unit — they run
+  when the alternative is the run ending. The census rides the run snapshot,
+  and entries whose unit has left the transcript are pruned at the end of every
+  pass, so it does not grow without bound.
 
 - `runtime/stale_result_trim.py` — the prompt-shrinking pass that costs no LLM
   call. RC-gated by `tool_result_stale_trim_enabled` (**off by default**), it
