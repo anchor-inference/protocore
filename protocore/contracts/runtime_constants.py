@@ -2994,7 +2994,7 @@ class LoopConstants(BaseModel):
         ),
     )
     tool_result_stale_trim_protected_prefixes: str = Field(
-        default="Cite exactly:,Cite:,cite_as:,catalog_url:",
+        default="Cite exactly:,Cite:,cite_as:,Source:",
         description=(
             "Comma-separated line prefixes stale-trimming carries over "
             "verbatim from the part of a result it cuts. A result that tells "

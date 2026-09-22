@@ -358,7 +358,7 @@ def test_every_configured_prefix_is_carried_and_others_are_not() -> None:
     body = "\n".join(
         [
             "Cite: Ross, Atlas of Mosses, 1961",
-            "catalog_url: https://example.invalid/records/8",
+            "Source: https://example.invalid/records/8",
             "note: the middle of the page nobody needs twice",
             "z" * 900,
         ]
@@ -377,7 +377,7 @@ def test_every_configured_prefix_is_carried_and_others_are_not() -> None:
     view, _ = trim_stale_results(history, _rc(tool_result_stale_max_chars=10), PROMPTS)
     content = _results(view)["page"].content
     assert "Cite: Ross, Atlas of Mosses, 1961" in content
-    assert "catalog_url: https://example.invalid/records/8" in content
+    assert "Source: https://example.invalid/records/8" in content
     assert "note: the middle of the page" not in content
 
 

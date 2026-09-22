@@ -592,7 +592,7 @@ crashes. The shared assistant loop is **not** a single immutable path:
   rebuilds the same prefix. Pins are honoured unless a later write has falsified
   them, and a compacted placeholder is never rewritten. Every line of the cut
   part starting with one of `tool_result_stale_trim_protected_prefixes` (by
-  default the `Cite exactly:` / `Cite:` / `cite_as:` / `catalog_url:` family) is
+  default the `Cite exactly:` / `Cite:` / `cite_as:` / `Source:` family) is
   carried over verbatim, so a result keeps its citation identity when it loses
   its body; the placeholder that replaces the rest names how many characters
   were kept and how many went, so a trimmed result cannot be read as complete

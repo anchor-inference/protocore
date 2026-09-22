@@ -584,7 +584,7 @@ class TestLoopGroup:
 
     def test_the_lines_a_trim_carries_over_are_dashboard_configurable(self) -> None:
         spec = build_loop_group().spec("tool_result_stale_trim_protected_prefixes")
-        assert spec.default == "Cite exactly:,Cite:,cite_as:,catalog_url:"
+        assert spec.default == "Cite exactly:,Cite:,cite_as:,Source:"
         assert spec.kind == "str"
 
     def test_context_overflow_retry_attempt_bound_is_dashboard_configurable(self) -> None:
