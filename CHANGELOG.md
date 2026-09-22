@@ -20,6 +20,20 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **The compaction retry budget charges failed passes, not passes.** A pass
+  that found nothing its profile may touch no longer spends a retry — the
+  proactive emergency pass over a history of turns seeded from earlier runs
+  leaves them alone by design, and used to spend one anyway. The reactive pass
+  after a provider rejection now keeps its own count,
+  `CompactionState.reactive_retry_count` (bounded by the same
+  `compaction_failed_max_retries`), so proactive failures can no longer use up
+  the one profile that may compact seeded history; before, an idle proactive
+  pass plus two reactive passes that lost their summariser calls exhausted the
+  default budget and sent the run to the output-cap ladder. A pass is charged
+  at most once: a tier that raised is no longer counted again by the
+  no-progress rule. `Tier2Result.units_attempted` and
+  `Tier3Result.spans_attempted` report the calls a pass made, and the new
+  counter rides the run snapshot.
 - **`RequestTokenCounterConformance` and `LifecycleRegistryConformance` are
   importable from `protocore.conformance`.** Both were in `SUITES` but only
   reachable through `protocore.conformance.suites`. The package's own tests now

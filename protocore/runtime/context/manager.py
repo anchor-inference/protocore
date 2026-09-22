@@ -271,7 +271,8 @@ class ContextManager:
         session's window shrink rather than the part that makes a request fit.
         Returning ``None`` — for a run with no compaction LLM, or for a fold
         the operator switched off — is how the caller tells "did not run" from
-        "ran and folded nothing".
+        "ran and folded nothing". A fold that raised did run, and reports one
+        attempted span so the pass is not mistaken for one with nothing to do.
         """
         if self._compaction_llm is None or not self._rc.compaction_fold_enabled:
             return None
@@ -291,7 +292,67 @@ class ContextManager:
             )
         except Exception as exc:
             _logger.warning("tier3 fold failed; skipping (err=%s)", exc)
-            return None
+            return Tier3Result(
+                spans_folded=0, messages_folded=0, tokens_freed=0, spans_attempted=1
+            )
+
+    def _settle_pass(
+        self,
+        *,
+        compaction_state: CompactionState,
+        attempt: CompactionAttempt,
+        reactive: bool,
+        error: Exception | None,
+        label: str,
+    ) -> None:
+        """Charge one finished pass to its retry budget — at most once.
+
+        A pass ends in one of three ways:
+
+        * **progress** — it freed tokens, or rewrote, summarised or folded
+          anything. Both budgets that pass could have spent are cleared.
+        * **nothing to do** — no tier raised and no tier found anything it was
+          allowed to touch under this pass's profile: Tier 1 modified nothing,
+          Tier 2 sent no unit and Tier 3 no span. A proactive pass over a
+          history of seeded turns lands here by design. It spends nothing:
+          there was no attempt to fail.
+        * **failed** — a tier raised, or a summariser call was made and nothing
+          came of it. One increment, however many tiers failed.
+
+        A reactive pass (after a provider rejection) spends
+        :attr:`CompactionState.reactive_retry_count`; every other pass spends
+        :attr:`CompactionState.retry_count`. Both are bounded by
+        :attr:`LoopConstants.compaction_failed_max_retries`, and breaching the
+        bound raises :class:`CompactionExhaustedError` chained to the tier
+        exception when there was one.
+        """
+        tier1, tier2, tier3 = attempt.tier1, attempt.tier2, attempt.tier3
+        progress = (
+            attempt.tokens_after < attempt.tokens_before
+            or (tier1 is not None and tier1.messages_modified > 0)
+            or (tier2 is not None and tier2.turns_summarised > 0)
+            or (tier3 is not None and tier3.spans_folded > 0)
+        )
+        if progress:
+            compaction_state.reset_retries()
+            if reactive:
+                compaction_state.reactive_retry_count = 0
+            return
+        tried = (
+            error is not None
+            or (tier2 is not None and tier2.units_attempted > 0)
+            or (tier3 is not None and tier3.spans_attempted > 0)
+        )
+        if not tried:
+            return
+        if reactive:
+            compaction_state.reactive_retry_count += 1
+            spent = compaction_state.reactive_retry_count
+        else:
+            compaction_state.retry_count += 1
+            spent = compaction_state.retry_count
+        if spent > self._rc.compaction_failed_max_retries:
+            raise CompactionExhaustedError(f"{label} exhausted retries") from error
 
     async def run_compaction(
         self,
@@ -306,8 +367,9 @@ class ContextManager:
     ) -> CompactionAttempt:
         """Run Tier 1 truncation; fall through to Tier 2 if needed.
 
-        Increments :attr:`CompactionState.retry_count` on every failed
-        attempt; raises :class:`CompactionExhaustedError` when
+        Charges :attr:`CompactionState.retry_count` once per failed pass and
+        nothing for a pass that found nothing to compact (see
+        :meth:`_settle_pass`); raises :class:`CompactionExhaustedError` when
         :attr:`LoopConstants.compaction_failed_max_retries` is breached.
 
         ``protect_tail_from_index`` (set only by the per-iteration gate)
@@ -331,14 +393,18 @@ class ContextManager:
                 protect_tail_from_index=protect_tail_from_index,
             )
         except Exception as exc:
-            compaction_state.retry_count += 1
-            if compaction_state.retry_count > self._rc.compaction_failed_max_retries:
-                raise CompactionExhaustedError("tier1 truncation exhausted retries") from exc
             # a failed Tier-1 pass freed nothing, but tokens_after
             # defaults to 0. Stamp the real current estimate before returning so
             # the caller's COMPACTION_COMPLETED event does not report a phantom
             # "full clear" (tokens_after=0 ≪ tokens_before).
             attempt.tokens_after = self._token_estimator.estimate_history(history, self._rc)
+            self._settle_pass(
+                compaction_state=compaction_state,
+                attempt=attempt,
+                reactive=False,
+                error=exc,
+                label="tier1 truncation",
+            )
             return attempt
 
         attempt.tier1 = tier1
@@ -351,6 +417,7 @@ class ContextManager:
             budgets.compaction_trigger_tokens
             * self._rc.compaction_routine_min_clear_ratio
         )
+        tier_error: Exception | None = None
         if tier1.tokens_freed < min_clear_target and self._compaction_llm is not None:
             try:
                 tier2 = await run_tier2_summarisation(
@@ -370,9 +437,7 @@ class ContextManager:
                     free_target_tokens=min_clear_target - tier1.tokens_freed,
                 )
             except Exception as exc:
-                compaction_state.retry_count += 1
-                if compaction_state.retry_count > self._rc.compaction_failed_max_retries:
-                    raise CompactionExhaustedError("tier2 summarisation exhausted retries") from exc
+                tier_error = exc
                 tier2 = Tier2Result(turns_summarised=0, tokens_freed=0)
             attempt.tier2 = tier2
 
@@ -388,16 +453,13 @@ class ContextManager:
         tokens_after = self._token_estimator.estimate_history(history, self._rc)
         attempt.tokens_after = tokens_after
 
-        # Success → reset retry counter for next compaction
-        if attempt.tokens_after < tokens_before:
-            compaction_state.reset_retries()
-        else:
-            compaction_state.retry_count += 1
-            if compaction_state.retry_count > self._rc.compaction_failed_max_retries:
-                raise CompactionExhaustedError(
-                    "compaction made no progress over retry budget"
-                )
-
+        self._settle_pass(
+            compaction_state=compaction_state,
+            attempt=attempt,
+            reactive=False,
+            error=tier_error,
+            label="compaction",
+        )
         return attempt
 
     async def force_compaction(
@@ -420,8 +482,11 @@ class ContextManager:
  request exceeds the window, so we must free as much as possible
  before re-streaming.
 
- Raises :class:`CompactionExhaustedError` per the same retry budget
- as :meth:`run_compaction`.
+ Raises :class:`CompactionExhaustedError` per :meth:`_settle_pass`. A
+ proactive pass shares :meth:`run_compaction`'s budget; a reactive pass has
+ its own, so proactive failures cannot use up the one profile that may still
+ compact seeded history. A pass that found nothing it was allowed to touch
+ spends neither.
 
  ``protect_tail_from_index`` (set only by the per-iteration
  emergency-cliff gate) exempts the current just-executed tool-result
@@ -454,6 +519,7 @@ class ContextManager:
         )
         compact_seeded_history = reactive
 
+        tier_error: Exception | None = None
         # Tier 1 always runs.
         try:
             tier1 = await run_tier1_truncation(
@@ -466,11 +532,7 @@ class ContextManager:
                 protect_tail_from_index=protect_tail_from_index,
             )
         except Exception as exc:
-            compaction_state.retry_count += 1
-            if compaction_state.retry_count > self._rc.compaction_failed_max_retries:
-                raise CompactionExhaustedError(
-                    "force_compaction tier1 truncation exhausted retries"
-                ) from exc
+            tier_error = exc
             tier1 = Tier1Result(
                 tokens_freed=0,
                 blob_refs_created=(),
@@ -508,11 +570,8 @@ class ContextManager:
                     retry_failed_units=True,
                 )
             except Exception as exc:
-                compaction_state.retry_count += 1
-                if compaction_state.retry_count > self._rc.compaction_failed_max_retries:
-                    raise CompactionExhaustedError(
-                        "force_compaction tier2 summarisation exhausted retries"
-                    ) from exc
+                if tier_error is None:
+                    tier_error = exc
                 tier2 = Tier2Result(turns_summarised=0, tokens_freed=0)
             attempt.tier2 = tier2
 
@@ -530,25 +589,15 @@ class ContextManager:
         tokens_after = self._token_estimator.estimate_history(history, self._rc)
         attempt.tokens_after = tokens_after
 
-        # Force-compaction success rule: ANY progress (tokens freed OR
-        # any Tier 1 messages_modified OR any Tier 2 summarisation) resets
-        # the retry counter. A no-progress force pass increments the
-        # counter the same as in :meth:`run_compaction`.
-        progress_made = (
-            tokens_after < tokens_before
-            or (attempt.tier1 is not None and attempt.tier1.messages_modified > 0)
-            or (attempt.tier2 is not None and attempt.tier2.turns_summarised > 0)
-            or (attempt.tier3 is not None and attempt.tier3.spans_folded > 0)
+        # ANY progress (tokens freed, or any Tier 1 / Tier 2 / Tier 3 rewrite)
+        # clears the budget; a pass that tried and failed is charged once.
+        self._settle_pass(
+            compaction_state=compaction_state,
+            attempt=attempt,
+            reactive=reactive,
+            error=tier_error,
+            label="reactive force_compaction" if reactive else "force_compaction",
         )
-        if progress_made:
-            compaction_state.reset_retries()
-        else:
-            compaction_state.retry_count += 1
-            if compaction_state.retry_count > self._rc.compaction_failed_max_retries:
-                raise CompactionExhaustedError(
-                    "force_compaction made no progress over retry budget"
-                )
-
         return attempt
 
     def current_prompt_tokens(

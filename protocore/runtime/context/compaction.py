@@ -137,6 +137,9 @@ class Tier2Result:
 
     turns_summarised: int
     tokens_freed: int
+    units_attempted: int = 0
+    """Summariser calls the pass issued. Zero with nothing summarised means the
+    pass found no unit it was allowed to send — nothing to do, not a failure."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +149,8 @@ class Tier3Result:
     spans_folded: int
     messages_folded: int
     tokens_freed: int
+    spans_attempted: int = 0
+    """Fold calls the pass issued; zero means no span qualified."""
 
 
 @dataclass(slots=True)
@@ -168,6 +173,13 @@ class CompactionState:
     """Per-engine compaction state — counts retries + tracks summarised IDs."""
 
     retry_count: int = 0
+    """Consecutive failed routine and proactive passes."""
+    reactive_retry_count: int = 0
+    """Consecutive failed reactive passes — the ones run after a provider
+    rejection, under the profile that may also compact seeded history. Kept
+    apart from :attr:`retry_count` because a proactive pass leaves that history
+    alone: its failures say nothing about what the reactive profile can still
+    free, and must not spend the budget the reactive profile is owed."""
     summarised_turn_ids: set[str] = field(default_factory=set)
     blob_refs_created: list[str] = field(default_factory=list)
     failed_anchor_keys: dict[str, int] = field(default_factory=dict)
@@ -1723,11 +1735,13 @@ async def run_tier2_summarisation(
     # seconds-long calls with the run parked in COMPACTING for the length of
     # it; the cap is what keeps the alternative from being an unbounded
     # fan-out at the provider.
+    attempted = 0
     batch_size = rc.compaction_summariser_parallelism
     for offset in range(0, len(jobs), batch_size):
         if free_target_tokens is not None and freed >= free_target_tokens:
             break
         batch = jobs[offset : offset + batch_size]
+        attempted += len(batch)
         outcomes = await asyncio.gather(
             *(
                 _summarise_unit(
@@ -1791,7 +1805,11 @@ async def run_tier2_summarisation(
     state.failed_anchor_keys = failed_anchor_keys
     _prune_failed_anchor_keys(state, history)
 
-    return Tier2Result(turns_summarised=summarised, tokens_freed=freed)
+    return Tier2Result(
+        turns_summarised=summarised,
+        tokens_freed=freed,
+        units_attempted=attempted,
+    )
 
 
 COMPACTION_FOLD_METADATA_KEY: Final[str] = "protocore.compaction_fold"
@@ -2109,7 +2127,12 @@ async def run_tier3_fold(
                 continue
             rebuilt.append(replacements.get(idx, history[idx]))
         history[:] = rebuilt
-    return Tier3Result(spans_folded=folded_spans, messages_folded=folded_messages, tokens_freed=freed)
+    return Tier3Result(
+        spans_folded=folded_spans,
+        messages_folded=folded_messages,
+        tokens_freed=freed,
+        spans_attempted=len(spans),
+    )
 
 
 __all__ = [

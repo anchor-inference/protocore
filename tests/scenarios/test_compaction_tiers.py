@@ -402,3 +402,19 @@ async def test_a_populated_failure_census_survives_a_cold_resume(
 
     restored = resumed.engine.compaction_state.failed_anchor_keys
     assert restored == {str(key): int(count) for key, count in census.items()}
+
+
+async def test_both_retry_budgets_survive_a_cold_resume(
+    scenario: ScenarioFactory,
+) -> None:
+    """A resumed run keeps what each profile has already spent."""
+    first = scenario(rc=_tiered_rc())
+    first.engine.compaction_state.retry_count = 1
+    first.engine.compaction_state.reactive_retry_count = 2
+    snapshot = first.engine.snapshot()
+
+    resumed = scenario(rc=_tiered_rc())
+    await resumed.engine.resume_from_snapshot(snapshot)
+
+    assert resumed.engine.compaction_state.retry_count == 1
+    assert resumed.engine.compaction_state.reactive_retry_count == 2

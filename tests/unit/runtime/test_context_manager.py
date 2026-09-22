@@ -441,14 +441,20 @@ async def test_a_fold_that_raises_does_not_abort_the_pass(
     for _ in range(4):
         llm.queue_response(text='{"summary": "folded"}')
 
+    state = CompactionState()
     attempt = await _folding_manager(llm).run_compaction(
         history=_foldable_history(),
-        compaction_state=CompactionState(),
+        compaction_state=state,
         tenant_id="t1",
         model_name="mock",
     )
 
-    assert attempt.tier3 is None
+    # The fold ran and failed: nothing folded, and the pass is charged as a
+    # failed attempt rather than passed off as one with nothing to do.
+    assert attempt.tier3 is not None
+    assert attempt.tier3.spans_folded == 0
+    assert attempt.tier3.spans_attempted == 1
+    assert state.retry_count == 1
 
 
 @pytest.mark.asyncio

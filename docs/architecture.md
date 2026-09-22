@@ -613,6 +613,21 @@ crashes. The shared assistant loop is **not** a single immutable path:
   and entries whose unit has left the transcript are pruned at the end of every
   pass, so it does not grow without bound.
 
+  Separately from the census, a pass is charged to a retry budget bounded by
+  `compaction_failed_max_retries`, and past it `CompactionExhaustedError` ends
+  the compaction. Only a pass that tried and failed is charged — a tier raised,
+  or a summariser call was made and nothing came of it — and it is charged once,
+  however many tiers failed. A pass that found nothing its profile may touch
+  spends nothing: the proactive emergency pass over a history of seeded turns
+  is the usual case. Routine and proactive passes share
+  `CompactionState.retry_count`; the reactive pass after a provider rejection
+  keeps `CompactionState.reactive_retry_count`, because it is the only profile
+  that may compact seeded history and proactive failures prove nothing about
+  it. Any progress clears the budget of the pass that made it. A transport
+  failure therefore costs the pass one retry and the unit nothing, while a
+  unit-shaped failure is counted against the unit as well; the forced passes
+  ignore the census either way. Both counters ride the run snapshot.
+
 - `runtime/stale_result_trim.py` — the prompt-shrinking pass that costs no LLM
   call. RC-gated by `tool_result_stale_trim_enabled` (**off by default**), it
   rewrites the REQUEST view only — `engine.history` keeps every byte, so

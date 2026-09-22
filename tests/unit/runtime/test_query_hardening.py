@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 
@@ -30,6 +31,7 @@ from protocore.contracts.types import (
     ToolUseBlock,
 )
 from protocore.prompts import bundled_prompt_provider
+from protocore.runtime.context.compaction import CompactionAttempt, CompactionExhaustedError
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
 
@@ -811,7 +813,10 @@ async def test_a_proactive_pass_is_followed_by_exactly_one_reactive_pass_after_o
     ]
 
     assert engine.state is LoopState.COMPLETED
-    assert engine.compaction_state.retry_count > 0
+    # Neither pass found anything its profile may touch: nothing to do is not
+    # a failure, so neither budget was spent.
+    assert engine.compaction_state.retry_count == 0
+    assert engine.compaction_state.reactive_retry_count == 0
     assert [request.max_tokens for request in failing_llm.calls] == [
         8_192,
         4_096,
@@ -828,7 +833,7 @@ async def test_a_proactive_pass_is_followed_by_exactly_one_reactive_pass_after_o
 async def test_an_exhausted_compaction_budget_hands_the_turn_back_to_the_cap_ladder(
     engine_factory, in_memory_runtime, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Nothing to compact twice over must not end a run the cap ladder can still save."""
+    """A reactive pass out of budget must not end a run the cap ladder can still save."""
     rc = LoopConstants(
         model_context_window=65_536,
         llm_output_max_tokens_ratio=0.125,
@@ -850,6 +855,15 @@ async def test_an_exhausted_compaction_budget_hands_the_turn_back_to_the_cap_lad
     engine.context_manager._compaction_llm = failing_llm  # type: ignore[attr-defined]
     engine.compaction_llm = failing_llm  # type: ignore[assignment]
     monkeypatch.setattr(engine, "needs_emergency_compaction", lambda: True)
+    real_force = engine.context_manager.force_compaction
+
+    async def _reactive_exhausts(**kwargs: Any) -> CompactionAttempt:
+        if kwargs.get("reactive"):
+            raise CompactionExhaustedError("reactive force_compaction exhausted retries")
+        attempt: CompactionAttempt = await real_force(**kwargs)
+        return attempt
+
+    monkeypatch.setattr(engine.context_manager, "force_compaction", _reactive_exhausts)
 
     events = [
         event
@@ -1380,9 +1394,11 @@ async def test_force_compaction_exhaustion_raises(
 
     history = [
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")]),
+        # Large enough to be worth a summariser call: a unit below the floor
+        # is never sent, and a pass that sends nothing has nothing to fail.
         Message(
             role=MessageRole.assistant,
-            content_blocks=[TextBlock(text="response one")],
+            content_blocks=[TextBlock(text="response one " * 400)],
         ),
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="more")]),
         Message(

@@ -2571,6 +2571,7 @@ class QueryEngine:
             ),
             "compaction": {
                 "retry_count": self.compaction_state.retry_count,
+                "reactive_retry_count": self.compaction_state.reactive_retry_count,
                 "summarised_turn_ids": list(self.compaction_state.summarised_turn_ids),
                 "blob_refs_created": list(self.compaction_state.blob_refs_created),
                 # The per-unit failure census. Without it a resumed run starts
@@ -3065,6 +3066,7 @@ class QueryEngine:
         compaction = snapshot.get("compaction", {})
         restored_compaction = CompactionState(
             retry_count=int(compaction.get("retry_count", 0)),
+            reactive_retry_count=int(compaction.get("reactive_retry_count", 0)),
             summarised_turn_ids=set(compaction.get("summarised_turn_ids", [])),
             blob_refs_created=list(compaction.get("blob_refs_created", [])),
             failed_anchor_keys={
