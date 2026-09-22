@@ -568,6 +568,27 @@ crashes. The shared assistant loop is **not** a single immutable path:
   on another pod does not start it from zero. A summary that is merely no
   smaller is not counted: that says something about the unit's size, not about
   whether the call can complete.
+
+- `runtime/stale_result_trim.py` — the prompt-shrinking pass that costs no LLM
+  call. RC-gated by `tool_result_stale_trim_enabled` (**off by default**), it
+  rewrites the REQUEST view only — `engine.history` keeps every byte, so
+  persistence, replay and compaction see an untouched transcript. A tool result
+  longer than `tool_result_stale_max_chars` is cut to that head once the run has
+  moved past it; the newest `tool_result_fresh_count` results and every result
+  of the latest round of tool calls are never touched, whatever their size,
+  because that is what the model is about to read. Nothing is cut until the
+  trimmable excess crosses `tool_result_stale_trim_batch_chars`, so the prompt
+  prefix moves for a batch and not for one result, and a trimmed id is sticky
+  for the run (`trimmed_tool_result_ids` in the snapshot), so a resumed run
+  rebuilds the same prefix. Pins are honoured unless a later write has falsified
+  them, and a compacted placeholder is never rewritten. Every line of the cut
+  part starting with one of `tool_result_stale_trim_protected_prefixes` (by
+  default the `Cite exactly:` / `Cite:` / `cite_as:` / `catalog_url:` family) is
+  carried over verbatim, so a result keeps its citation identity when it loses
+  its body; the placeholder that replaces the rest names how many characters
+  were kept and how many went, so a trimmed result cannot be read as complete
+  evidence. It runs after the compaction checkpoint and before the split
+  projection, and sizes its head so the split cannot cut its own pointer.
 - `runtime/loop_state.py` — `LoopState` is a pure 7-state machine:
   `PENDING → RUNNING → {AWAITING | COMPACTING} → {COMPLETED | FAILED |
   CANCELLED}`. `assert_transition()` enforces the legal-edge table;

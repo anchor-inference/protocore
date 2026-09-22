@@ -307,6 +307,22 @@ def test_rearm_keeps_every_attribute_it_preserves(engine_factory) -> None:
     assert not replaced, f"rearm discarded continuity it must carry forward: {replaced}"
 
 
+def test_a_trimmed_result_stays_trimmed_across_a_rearm(engine_factory) -> None:
+    """The set is what keeps the prompt prefix still, so a turn may not clear it.
+
+    Cleared at a turn boundary, every result the request view had already cut
+    comes back whole on the next build and is cut again on the one after —
+    which is the cache miss the batching exists to avoid, paid twice per turn.
+    """
+    engine = engine_factory()
+    engine._trimmed_tool_result_ids = frozenset({"toolu_1"})
+    _spend_a_turn(engine)
+
+    engine.rearm()
+
+    assert engine._trimmed_tool_result_ids == frozenset({"toolu_1"})
+
+
 # ── what the gaps did to a living agent ─────────────────────────────────────
 
 

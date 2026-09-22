@@ -310,6 +310,18 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "is persisted is the whole of what the session has said, because that "
         "is what the next process reads back when it seeds an engine"
     ),
+    "protocore/runtime/stale_result_trim.py::trim_stale_results": _whole(
+        "prompt assembly over the outbound view it is handed: cuts oversized "
+        "tool results down to their head. Every result the request carries "
+        "costs what it costs, seeded or not, so the whole view is what has to "
+        "be measured"
+    ),
+    "protocore/runtime/stale_result_trim.py::_calls_of_the_latest_round": _whole(
+        "prompt assembly over the outbound view it is handed: finds the last "
+        "message in it carrying tool calls, so the results answering that "
+        "batch can be left whole. A later message cannot be shadowed by an "
+        "earlier one, so the whole sequence is the cheapest place to look"
+    ),
     "protocore/runtime/result_eviction.py::evict_history_for_llm": _whole(
         "prompt assembly over the sequence it is handed: replaces unmarked "
         "Read/Grep results in the outbound copy"

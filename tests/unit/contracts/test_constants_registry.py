@@ -555,6 +555,38 @@ class TestLoopGroup:
         assert spec.exclusive_minimum is True
         assert spec.kind == "int"
 
+    def test_stale_result_trimming_is_off_until_a_deployment_asks(self) -> None:
+        # It shrinks the request before compaction has to run, which is a
+        # choice about how much evidence the model still sees — not a default
+        # an existing deployment inherits on an upgrade.
+        spec = build_loop_group().spec("tool_result_stale_trim_enabled")
+        assert spec.default is False
+        assert spec.kind == "bool"
+
+    def test_the_stale_trim_window_and_head_are_dashboard_configurable(self) -> None:
+        fresh = build_loop_group().spec("tool_result_fresh_count")
+        assert fresh.default == 6
+        assert fresh.minimum == 0.0
+        assert fresh.exclusive_minimum is False
+        assert fresh.kind == "int"
+        head = build_loop_group().spec("tool_result_stale_max_chars")
+        assert head.default == 2000
+        assert head.minimum == 0.0
+        assert head.exclusive_minimum is True
+        assert head.kind == "int"
+
+    def test_the_stale_trim_batch_threshold_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("tool_result_stale_trim_batch_chars")
+        assert spec.default == 40000
+        assert spec.minimum == 0.0
+        assert spec.exclusive_minimum is False
+        assert spec.kind == "int"
+
+    def test_the_lines_a_trim_carries_over_are_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("tool_result_stale_trim_protected_prefixes")
+        assert spec.default == "Cite exactly:,Cite:,cite_as:,catalog_url:"
+        assert spec.kind == "str"
+
     def test_context_overflow_retry_attempt_bound_is_dashboard_configurable(self) -> None:
         spec = build_loop_group().spec("context_overflow_retry_max_attempts")
         assert spec.default == 13

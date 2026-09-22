@@ -992,6 +992,22 @@ def _llm_history(engine: QueryEngine) -> tuple[list[Message], list[str]]:
         roles=engine.config.tool_roles,
     )
     view = apply_checkpoint(view, getattr(engine, "compact_checkpoint", None))
+    if engine.config.rc.tool_result_stale_trim_enabled:
+        from protocore.runtime.stale_result_trim import trim_stale_results
+
+        # After the checkpoint, so a compacted head is already a summary and
+        # cannot be cut twice; before the split, which the trimmer knows and
+        # keeps a shortened result under the split's own limit for, so it
+        # passes through untouched whichever way the two limits are set. The
+        # decision is sticky, and the engine is where it is kept.
+        view, engine._trimmed_tool_result_ids = trim_stale_results(
+            view,
+            engine.config.rc,
+            engine.prompt_provider,
+            pinned_ids=engine._pinned_tool_result_ids,
+            already_trimmed=engine._trimmed_tool_result_ids,
+            roles=engine.config.tool_roles,
+        )
     if engine.config.rc.tool_result_split_enabled:
         from protocore.contracts.types import ToolResultBlock
         from protocore.runtime.tool_result_split import project_result_content

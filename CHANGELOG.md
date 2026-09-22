@@ -47,6 +47,23 @@ All notable changes to this project are recorded here. The format follows
   The template gains a `max_chars` variable; a per-tenant override that does
   not use it is unaffected.
 
+### Added
+
+- **Stale tool results can be cut down in the request view.** With
+  `tool_result_stale_trim_enabled` (off by default), a tool result the run has
+  moved past is sent as its first `tool_result_stale_max_chars` characters plus
+  a line naming how much was kept and how much was removed, while
+  `engine.history` keeps the whole value. The newest `tool_result_fresh_count`
+  results and every result of the latest round of tool calls are never cut, and
+  nothing is cut until the trimmable excess crosses
+  `tool_result_stale_trim_batch_chars`, so the prompt prefix moves for a batch
+  rather than for one result. A trimmed result stays trimmed for the run and the
+  decision travels in the snapshot as `trimmed_tool_result_ids`. Lines starting
+  with one of `tool_result_stale_trim_protected_prefixes` are carried over
+  verbatim, so a result whose text names how to cite it keeps that line when it
+  loses its body. Pinned results are spared unless a later write falsified the
+  pin, and compacted placeholders are never rewritten.
+
 ## [2.0.0a16]
 
 ### Fixed
