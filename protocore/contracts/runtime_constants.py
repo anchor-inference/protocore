@@ -2812,6 +2812,66 @@ class LoopConstants(BaseModel):
         gt=0,
         description="Maximum characters of tool result content sent to the next LLM request.",
     )
+    tool_result_stale_trim_enabled: bool = Field(
+        default=False,
+        description=(
+            "When true, a tool result the run has moved past is cut to its "
+            "head in the next LLM request, with a line saying how much was "
+            "kept, how much went and that the tool can be called again. "
+            "Age-aware, unlike ``tool_result_split_enabled``: the newest "
+            "results and the latest round of calls are never touched. Off by "
+            "default, which is also what keeps it from cutting twice with "
+            "tier-1 truncation: tier-1 moves an over-threshold result out of "
+            "DURABLE history into a blob when the window is already tight, "
+            "while this rewrites only the outbound copy, and the two are sized "
+            "by different thresholds that no invariant relates. They compose "
+            "safely — a compacted placeholder is never rewritten here, and "
+            "persist keeps the whole value either way — but a deployment that "
+            "turns this on is choosing to shrink the prompt BEFORE compaction "
+            "has to run, and that is a choice about how much evidence the "
+            "model should still see, not a default anyone should inherit."
+        ),
+    )
+    tool_result_fresh_count: int = Field(
+        default=6,
+        ge=0,
+        description=(
+            "How many of the newest tool results stale-trimming leaves alone, "
+            "however long they are, on top of the latest round of calls, which "
+            "is exempt whatever its size. This is the window in which the "
+            "model is still working from what it read, so cutting inside it "
+            "takes away the result the run is about to use."
+        ),
+    )
+    tool_result_stale_max_chars: int = Field(
+        default=2000,
+        gt=0,
+        description=(
+            "Head kept of a tool result stale-trimming cuts. A result shorter "
+            "than this is never cut: there is nothing to win."
+        ),
+    )
+    tool_result_stale_trim_batch_chars: int = Field(
+        default=40000,
+        ge=0,
+        description=(
+            "How much trimmable excess must stand in the view before stale-"
+            "trimming does anything. Every trim changes the prompt prefix and "
+            "so costs a cache miss on the whole request, which is worth paying "
+            "for a batch of results and not for one — so the rule waits until "
+            "there is a batch."
+        ),
+    )
+    tool_result_stale_trim_protected_prefixes: str = Field(
+        default="Cite exactly:,Cite:,cite_as:,catalog_url:",
+        description=(
+            "Comma-separated line prefixes stale-trimming carries over "
+            "verbatim from the part of a result it cuts. A result that tells "
+            "the model how to cite what it read loses that line with the body "
+            "otherwise, and a citation the model cannot see is one it invents. "
+            "Empty turns the carry-over off."
+        ),
+    )
 
     # ----- Intent, ledger, session tree, lanes (all default off) -----
     intent_settlement_enabled: bool = Field(
