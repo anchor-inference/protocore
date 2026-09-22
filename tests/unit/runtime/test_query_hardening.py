@@ -409,6 +409,47 @@ async def test_context_window_retry_uses_provider_reported_prompt_size(
 
 
 @pytest.mark.asyncio
+async def test_compacted_overflow_gets_one_measured_corrective_retry(
+    engine_factory, in_memory_runtime
+) -> None:
+    rc = LoopConstants(
+        model_context_window=65_536,
+        request_context_safety_tokens=2_048,
+        llm_output_max_tokens_ratio=0.25,
+        compaction_keep_recent_turns=1,
+    )
+    engine = engine_factory(rc=rc)
+    llm = _ScriptedFailureLLM(
+        exceptions=[
+            LLMContextWindowExceeded("pre-compaction overflow"),
+            LLMContextWindowExceeded(
+                "compacted request overflowed",
+                context_window=65_536,
+                input_tokens=58_475,
+                requested_output_tokens=7_062,
+            ),
+        ],
+    )
+    engine.llm = llm  # type: ignore[assignment]
+    engine.context_manager._compaction_llm = llm  # type: ignore[attr-defined]
+    engine.compaction_llm = llm  # type: ignore[assignment]
+
+    events = [
+        event
+        async for event in engine.run(
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+        )
+    ]
+
+    assert engine.state is LoopState.COMPLETED
+    assert [request.max_tokens for request in llm.calls] == [16_384, 8_192, 3_531]
+    assert any(
+        event.payload.get("reason") == "context_overflow_corrective_retry"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
 async def test_context_window_retry_ceiling_does_not_leak_to_the_next_tool_iteration(
     engine_factory, in_memory_runtime
 ) -> None:
@@ -684,12 +725,14 @@ def test_reset_recovery_state_resets_compaction_attempted(
     engine._compaction_attempted_for_current_turn = True
     engine._last_fitted_request_max_tokens = 8_192
     engine._context_overflow_retry_max_tokens = 4_096
+    engine._context_overflow_corrective_retry_attempted = True
 
     engine.reset_recovery_state()
 
     assert engine._compaction_attempted_for_current_turn is False
     assert engine._last_fitted_request_max_tokens is None
     assert engine._context_overflow_retry_max_tokens is None
+    assert engine._context_overflow_corrective_retry_attempted is False
 
 
 def test_context_window_retry_cap_only_applies_inside_the_recovery_boundary(

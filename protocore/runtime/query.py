@@ -5096,6 +5096,37 @@ def _calibrate_token_estimate(engine: QueryEngine, request: LLMRequest, observed
     engine.set_token_estimate_calibration(smoothed, model_name=request.model)
 
 
+def _context_overflow_rejected_wire_cap(
+    engine: QueryEngine, exc: LLMContextWindowExceeded
+) -> int | None:
+    rejected_max_tokens = engine._last_fitted_request_max_tokens
+    if rejected_max_tokens is None:
+        return None
+    if exc.requested_output_tokens is not None:
+        return min(rejected_max_tokens, exc.requested_output_tokens)
+    return rejected_max_tokens
+
+
+def _context_overflow_retry_cap(
+    engine: QueryEngine, exc: LLMContextWindowExceeded
+) -> int | None:
+    rejected_wire_cap = _context_overflow_rejected_wire_cap(engine, exc)
+    if rejected_wire_cap is None:
+        return None
+    retry_max_tokens = int(
+        rejected_wire_cap * engine.config.rc.context_overflow_retry_output_ratio
+    )
+    if exc.context_window is not None and exc.input_tokens is not None:
+        provider_safe_output = (
+            exc.context_window
+            - exc.input_tokens
+            - engine.config.rc.request_context_safety_tokens
+        )
+        if provider_safe_output > 0:
+            retry_max_tokens = min(retry_max_tokens, provider_safe_output)
+    return retry_max_tokens
+
+
 async def _handle_context_window_exceeded(
     engine: QueryEngine,
     exc: LLMContextWindowExceeded,
@@ -5103,33 +5134,40 @@ async def _handle_context_window_exceeded(
     """Recover from a context-window overflow — force_compaction once and
     re-stream, else terminal.
 
-    Tracked via ``engine._compaction_attempted_for_current_turn``: a second
-    overflow within the same message drives terminal FAILED.
+    The first overflow compacts and retries. If that rebuilt request is still
+    rejected and the provider reports its measured sizes, one strictly smaller
+    corrective retry is allowed without compacting again. A later overflow is
+    terminal.
     """
+    retry_max_tokens = _context_overflow_retry_cap(engine, exc)
     if engine._compaction_attempted_for_current_turn:
-        # Already retried — go terminal LLM error.
+        rejected_wire_cap = _context_overflow_rejected_wire_cap(engine, exc)
+        if (
+            not engine._context_overflow_corrective_retry_attempted
+            and exc.context_window is not None
+            and exc.input_tokens is not None
+            and exc.requested_output_tokens is not None
+            and retry_max_tokens is not None
+            and rejected_wire_cap is not None
+            and retry_max_tokens >= 1
+            and retry_max_tokens < rejected_wire_cap
+        ):
+            engine._context_overflow_retry_max_tokens = retry_max_tokens
+            engine._context_overflow_corrective_retry_attempted = True
+            yield _emit_state_change(
+                engine,
+                engine.state,
+                engine.state,
+                reason="context_overflow_corrective_retry",
+            )
+            return
+        # The compacted request and its one measured correction both failed.
         # Death-spiral guard via _emit_llm_terminal.
         async for evt in _emit_llm_terminal(engine, exc, kind="llm_context_window_exceeded"):
             yield evt
         return
 
-    rejected_max_tokens = engine._last_fitted_request_max_tokens
-    if rejected_max_tokens is not None:
-        if exc.requested_output_tokens is not None:
-            rejected_max_tokens = min(
-                rejected_max_tokens, exc.requested_output_tokens
-            )
-        retry_max_tokens = int(
-            rejected_max_tokens * engine.config.rc.context_overflow_retry_output_ratio
-        )
-        if exc.context_window is not None and exc.input_tokens is not None:
-            provider_safe_output = (
-                exc.context_window
-                - exc.input_tokens
-                - engine.config.rc.request_context_safety_tokens
-            )
-            if provider_safe_output > 0:
-                retry_max_tokens = min(retry_max_tokens, provider_safe_output)
+    if retry_max_tokens is not None:
         if retry_max_tokens < 1:
             async for evt in _emit_llm_terminal(
                 engine, exc, kind="llm_context_window_exceeded"

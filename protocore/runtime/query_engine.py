@@ -937,6 +937,9 @@ class QueryEngine:
         # rejection. Derived from the rejected wire cap, never from the
         # pre-fit output budget, so partial compaction cannot raise the retry.
         self._context_overflow_retry_max_tokens: int | None = None
+        # A measured overflow of the compacted request may receive one final,
+        # smaller retry without compacting the same history a second time.
+        self._context_overflow_corrective_retry_attempted: bool = False
         # Iterations the per-iteration compaction gate still skips after a pass that freed nothing.
         self.compaction_backoff_left: int = 0
         # Max-output-tokens recovery: count of "Resume directly" retries
@@ -2147,6 +2150,7 @@ class QueryEngine:
         self._compaction_attempted_for_current_turn = False
         self._last_fitted_request_max_tokens = None
         self._context_overflow_retry_max_tokens = None
+        self._context_overflow_corrective_retry_attempted = False
         self.compaction_backoff_left = 0
         if self._terminal_backstop_turn_active:
             self._terminal_backstop_turn_active = False
