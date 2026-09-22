@@ -6,6 +6,22 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0a18]
+
+### Fixed
+
+- **A proactive compaction pass no longer forfeits the reactive one.** With the
+  lower effective trigger, a history made of turns seeded from earlier runs
+  crosses the proactive window at turn start; the routine profile leaves seeds
+  alone and frees nothing, but the pass was carried into the message as "the
+  compaction attempt", so the provider's rejection was answered by the
+  output-cap ladder alone and the run died on a prompt that fit the window
+  once seeds were summarised. The rejection handler now tracks the reactive
+  pass separately and runs it once, after which the ladder applies.
+- **An exhausted compaction budget hands the turn back to the output-cap
+  ladder** when a strictly smaller cap is still available, instead of ending
+  the run on the budget.
+
 ## [2.0.0a17]
 
 ### Added
