@@ -8,6 +8,17 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
+- **`LLMRequest.temperature` is unset unless the caller states one.** The
+  contract defaulted it to `0.7`, and `build_llm_request` filled that default
+  into every request, so the action stream and the deep loop's plan calls
+  always carried a temperature nobody had chosen, and an adapter could not tell
+  "no opinion" from "0.7". The field is now `float | None = None`; the
+  builder passes `None` through, and `RequestManifest.temperature` records it
+  as such. Paths that need a value — the compaction summariser, with
+  `compaction_summary_temperature` — still state it. A host adapter should omit
+  the wire field when it is `None` (or apply its own per-model setting); an
+  adapter that serialises it as-is now sends `null`.
+
 - **The wind-down notice asks for the answer, not the work log.** The default
   `soft_stop_notice_text` told the model to report what it did and what it
   found, which invited a narration of the run's steps into the user-facing

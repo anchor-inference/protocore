@@ -186,7 +186,10 @@ class LLMRequest(BaseModel):
     messages: Sequence[Message]
     tools: Sequence[ToolDefinition] = Field(default_factory=list)
     max_tokens: int = 4096
-    temperature: float = 0.7
+    #: ``None`` means the caller has no opinion: an adapter omits the field and
+    #: the host (a per-model setting, or the server's own generation config)
+    #: decides. A number is the caller's explicit choice and wins over both.
+    temperature: float | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
     observability: LLMObservabilityContext | None = None
 

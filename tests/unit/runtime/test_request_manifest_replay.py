@@ -200,6 +200,9 @@ async def test_the_manifest_states_what_the_request_was_made_of() -> None:
     assert manifest.model == MODEL == request.model
     assert manifest.max_tokens == request.max_tokens
     assert manifest.temperature == request.temperature
+    # The action stream has no temperature of its own; the manifest records
+    # that the host was left to decide, not a number nobody chose.
+    assert manifest.temperature is None
     assert manifest.message_count == len(request.messages)
     assert manifest.tool_count == len(request.tools) == 2
     assert manifest.provider_chain_position == 0

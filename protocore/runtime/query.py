@@ -1536,14 +1536,6 @@ def _observability_context(
     )
 
 
-# The request contract's own default, so the one temperature policy below
-# states a value on every path without repeating a literal that already lives
-# on the contract.
-_DEFAULT_REQUEST_TEMPERATURE: Final[float] = float(
-    LLMRequest.model_fields["temperature"].default
-)
-
-
 def build_llm_request(
     *,
     model: str,
@@ -1575,8 +1567,11 @@ def build_llm_request(
       native single-tool ``tool_choice`` shape its wire wants. Stating the same
       intent in two spellings meant a single reader could not tell whether a
       turn had been forced.
-    * **the temperature**. Stated on every request: the caller's value, or the
-      request contract's default when the caller has no opinion.
+    * **the temperature**. The caller's value when it has one, and ``None``
+      otherwise. A path with no opinion (the action stream, the deep loop's
+      plan call and its fallback) leaves the choice to the host, which may
+      apply a per-model setting or let the server's own generation config
+      decide; a path that needs a specific value (the summariser) states it.
 
     ``thinking_enabled`` and ``reasoning_effort`` travel as a pair or not at
     all — the effort bounds the CoT, and thinking requested without it was
@@ -1609,9 +1604,7 @@ def build_llm_request(
         messages=list(messages),
         tools=list(tools),
         max_tokens=max_tokens,
-        temperature=(
-            _DEFAULT_REQUEST_TEMPERATURE if temperature is None else temperature
-        ),
+        temperature=temperature,
         extra=extra,
         observability=observability,
     )
