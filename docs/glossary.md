@@ -187,9 +187,11 @@ Finalization gate (host-owned)
   (`run_tier2_summarisation`) replaces whole old non-system turns with a system
   summary, keeping the recent N turns. A pass that tried and failed is
   charged once to a retry budget (`compaction_failed_max_retries`; the
-  reactive pass after a provider rejection has its own), a pass with nothing
-  eligible is not charged, and past the budget `CompactionExhaustedError`
-  transitions the loop to `FAILED`. Operator
+  reactive pass after a provider rejection has its own), and a proactive pass
+  with nothing eligible is not opened at all. Past the budget
+  `CompactionExhaustedError` suspends proactive compaction until the provider
+  rejects a request; after a rejection it hands the turn to the output-cap
+  ladder, and only when no smaller cap is left does the loop go to `FAILED`. Operator
   `/compact` is a separate `CompactCheckpoint` path
   (`runtime/compact_checkpoint.py`, `compaction_manual_enabled` default
   `False`). Cross-run fold lives in `runtime/context/session_memory.py`

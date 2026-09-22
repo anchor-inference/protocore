@@ -145,13 +145,17 @@ async def test_a_prompt_over_the_cliff_is_compacted_unconditionally(
             compaction_emergency_ratio=0.8,
             compaction_keep_recent_turns=1,
         ),
-        tools=[ScriptedTool(tool_name="Note", content="x" * 4_000)],
+        tools=[ScriptedTool(tool_name="Note", content="x" * 1_700)],
     )
-    run.llm.queue_tool_call_response(
-        tool_call_id="call-1",
-        tool_name="Note",
-        tool_input={},
-    )
+    # Two results: the second is the batch just produced and stays protected,
+    # so the first is what the forced pass has to work on. A pass with nothing
+    # eligible is not opened at all, so it would show no reason to assert on.
+    for call_id in ("call-1", "call-2"):
+        run.llm.queue_tool_call_response(
+            tool_call_id=call_id,
+            tool_name="Note",
+            tool_input={},
+        )
     run.llm.queue_response(text="after the cliff was cleared")
 
     produced = await run.run("small question")
@@ -162,6 +166,7 @@ async def test_a_prompt_over_the_cliff_is_compacted_unconditionally(
         if evt.type is EventType.COMPACTION_STARTED
     ]
     assert "proactive_per_iteration_emergency" in reasons
+    assert "reactive_413" not in reasons
 
 
 async def test_the_cliff_switch_leaves_the_ordinary_gate_running(
@@ -177,13 +182,16 @@ async def test_the_cliff_switch_leaves_the_ordinary_gate_running(
             compaction_emergency_proactive_enabled=False,
             compaction_keep_recent_turns=1,
         ),
-        tools=[ScriptedTool(tool_name="Note", content="x" * 2_400)],
+        tools=[ScriptedTool(tool_name="Note", content="x" * 1_100)],
     )
-    run.llm.queue_tool_call_response(
-        tool_call_id="call-1",
-        tool_name="Note",
-        tool_input={},
-    )
+    # The first result is the one outside the protected batch, so the pass
+    # has something to work on and is opened.
+    for call_id in ("call-1", "call-2"):
+        run.llm.queue_tool_call_response(
+            tool_call_id=call_id,
+            tool_name="Note",
+            tool_input={},
+        )
     run.llm.queue_response(text="after the ordinary compaction")
 
     produced = await run.run("small question")

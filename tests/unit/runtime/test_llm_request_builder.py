@@ -576,6 +576,11 @@ async def test_live_model_override_reaches_the_compaction_summariser() -> None:
         return CompactionAttempt()
 
     engine.context_manager.run_compaction = _record  # type: ignore[method-assign]
+    # The history here holds nothing to compact, and a pass with nothing to do
+    # is never opened; the question is only what an opened pass is handed.
+    engine.context_manager.has_proactive_work = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: True
+    )
     [evt async for evt in _run_compaction(engine)]
 
     assert seen["model_name"] == OVERRIDE_MODEL

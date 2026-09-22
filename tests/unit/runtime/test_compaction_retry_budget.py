@@ -261,3 +261,115 @@ async def test_a_routine_pass_with_nothing_eligible_spends_nothing() -> None:
 
     assert llm.structured_calls == 0
     assert state.retry_count == 0
+
+
+def _probe_shapes() -> dict[str, list[Message]]:
+    """Histories on either side of the proactive profile's eligibility line."""
+    from protocore.contracts.types import (
+        SYNTHETIC_RECOVERY_METADATA_KEY,
+        ToolResultBlock,
+        ToolUseBlock,
+    )
+
+    task = Message(role=MessageRole.user, content_blocks=[TextBlock(text="task")])
+    tail = [
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="latest")]),
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="go on")]),
+    ]
+    return {
+        "empty": [],
+        "seeded only": _seeded_history(),
+        "current run": _current_run_history(),
+        "small turns": [
+            task,
+            Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="ok")]),
+            *tail,
+        ],
+        "aged reasoning": [
+            task,
+            Message(
+                role=MessageRole.assistant,
+                content_blocks=[TextBlock(text="ok")],
+                reasoning_content="thinking " * 200,
+            ),
+            *tail,
+        ],
+        "large tool result": [
+            task,
+            Message(
+                role=MessageRole.assistant,
+                content_blocks=[
+                    ToolUseBlock(tool_call_id="c1", name="read", arguments_json="{}")
+                ],
+            ),
+            Message(
+                role=MessageRole.tool,
+                content_blocks=[ToolResultBlock(tool_call_id="c1", content="r" * 60_000)],
+            ),
+            *tail,
+        ],
+        "aged recovery nudge": [
+            task,
+            Message(
+                role=MessageRole.user,
+                content_blocks=[TextBlock(text="continue")],
+                metadata={SYNTHETIC_RECOVERY_METADATA_KEY: "nudge"},
+            ),
+            Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="ok")]),
+            *tail,
+        ],
+    }
+
+
+@pytest.mark.parametrize("force", [True, False])
+@pytest.mark.parametrize("shape", list(_probe_shapes()))
+@pytest.mark.asyncio
+async def test_the_probe_agrees_with_the_pass_it_stands_in_for(shape: str, force: bool) -> None:
+    """``has_proactive_work`` is False exactly when the pass would change and call nothing."""
+    rc = LoopConstants(model_context_window=65_536, compaction_keep_recent_turns=1)
+    llm = _FlakySummariser()
+    manager = _manager(llm, rc)
+    history = _probe_shapes()[shape]
+    state = CompactionState()
+
+    predicted = manager.has_proactive_work(history, state, force=force)
+    before = [message.model_dump_json() for message in history]
+    if force:
+        await _force(manager, history, state, reactive=False)
+    else:
+        await manager.run_compaction(
+            history=history, compaction_state=state, tenant_id="tenant", model_name="model"
+        )
+    changed = [message.model_dump_json() for message in history] != before
+
+    assert predicted == (changed or llm.structured_calls > 0), shape
+
+
+def test_a_written_off_unit_is_work_only_for_the_forced_pass() -> None:
+    """The routine pass honours the census; the forced pass ignores it, and so do their probes."""
+    rc = LoopConstants(model_context_window=65_536, compaction_keep_recent_turns=1)
+    manager = _manager(_FlakySummariser(), rc)
+    history = _current_run_history()
+    state = CompactionState()
+    # Every unit written off, as unit-shaped failures would leave the census.
+    from protocore.runtime.context.compaction import _stable_turn_key
+
+    state.failed_anchor_keys = {
+        _stable_turn_key(message): rc.compaction_summary_failed_unit_max_attempts
+        for message in history
+    }
+
+    assert manager.has_proactive_work(history, state, force=True)
+    assert not manager.has_proactive_work(history, state, force=False)
+
+
+@pytest.mark.asyncio
+async def test_progress_of_either_profile_clears_both_budgets() -> None:
+    manager = _manager(_FlakySummariser(), LoopConstants(model_context_window=65_536))
+    state = CompactionState(retry_count=2, reactive_retry_count=2)
+
+    attempt = await _force(manager, _current_run_history(), state, reactive=False)
+
+    assert attempt.tokens_after < attempt.tokens_before
+    assert state.retry_count == 0
+    assert state.reactive_retry_count == 0

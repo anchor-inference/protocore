@@ -465,6 +465,25 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/context/compaction.py::run_tier3_fold": _whole(
         "folds runs of old summaries and operator turns anywhere in the transcript"
     ),
+    "protocore/runtime/context/compaction.py::tier1_has_work": _whole(
+        "asks, without rewriting, what Tier 1 would shed anywhere in the transcript"
+    ),
+    "protocore/runtime/context/compaction.py::_plan_tier2": _whole(
+        "decides which units anywhere in the transcript Tier 2 would send"
+    ),
+    "protocore/runtime/context/compaction.py::tier2_has_work": _whole(
+        "asks, without calling the summariser, whether Tier 2 has a unit to send"
+    ),
+    "protocore/runtime/context/compaction.py::tier3_has_work": _whole(
+        "asks, without folding, whether the transcript holds a span to fold"
+    ),
+    "protocore/runtime/context/manager.py::ContextManager.has_proactive_work": _whole(
+        "asks every tier whether a proactive pass over the transcript would change it"
+    ),
+    "protocore/runtime/query.py::_proactive_pass_is_idle": _whole(
+        "compares the transcript with the one the last idle probe saw, then asks "
+        "the tiers about all of it, as the pass itself would"
+    ),
     "protocore/runtime/context/manager.py::ContextManager._fold": _whole(
         "hands the whole transcript to the Tier-3 fold after Tier-2"
     ),
@@ -1465,6 +1484,10 @@ _SEED_KEY_DERIVED_ELSEWHERE: dict[str, str] = {
     "protocore/runtime/context/compaction.py::run_tier2_summarisation": (
         "reactive compaction preserves seed provenance while replacing units "
         "by INDEX into the whole list"
+    ),
+    "protocore/runtime/context/compaction.py::_plan_tier2": (
+        "a unit that mixes seeded and current turns is left intact, decided "
+        "by INDEX into the whole list before any call is made"
     ),
     "protocore/runtime/context/compaction.py::_foldable_indices.is_foldable": (
         "reactive folding classifies each indexed message without losing its "

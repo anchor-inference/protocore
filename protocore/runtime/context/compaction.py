@@ -193,7 +193,14 @@ class CompactionState:
     """
 
     def reset_retries(self) -> None:
+        """Clear both retry budgets.
+
+        Any progress clears both: a pass that changed the history ends the
+        run of consecutive failures for either profile, since the next pass of
+        either kind faces a different history.
+        """
         self.retry_count = 0
+        self.reactive_retry_count = 0
 
 
 def _strip_injection_patterns(text: str) -> str:
@@ -660,6 +667,72 @@ def _content_preview(text: str, max_chars: int) -> str:
     return f"{flat[:head_len]}…{flat[-tail_len:]}"
 
 
+def _tier1_sheds_reasoning(message: Message, rc: LoopConstants) -> bool:
+    """An aged assistant turn whose re-emitted reasoning Tier 1 would drop."""
+    return (
+        rc.compaction_shed_reasoning_enabled
+        and message.role is MessageRole.assistant
+        and bool(message.reasoning_content)
+    )
+
+
+def _tier1_reference_candidate(message: Message, rc: LoopConstants) -> bool:
+    """A frozen reference block Tier 1 owns — shed or not, no other branch applies."""
+    if not message.content_blocks:
+        return False
+    block = message.content_blocks[0]
+    return (
+        rc.compaction_bound_reference_blocks_enabled
+        and message.role is not MessageRole.tool
+        and message.metadata.get(COMPACTION_REFERENCE_METADATA_KEY) is True
+        and isinstance(block, TextBlock)
+        and not _content_is_already_compacted(block.text)
+    )
+
+
+def _tier1_sheds_result(block: ContentBlock, rc: LoopConstants, threshold: int) -> bool:
+    """A tool result large enough, and not yet shed, for Tier 1 to blob."""
+    return (
+        isinstance(block, ToolResultBlock)
+        and not _content_is_already_compacted(block.content)
+        and estimate_tokens(block.content, rc) >= threshold
+    )
+
+
+def tier1_has_work(
+    history: list[Message],
+    rc: LoopConstants,
+    truncation_threshold_tokens: int,
+    *,
+    keep_recent_turns: int | None = None,
+    protect_tail_from_index: int | None = None,
+) -> bool:
+    """Whether :func:`run_tier1_truncation` would rewrite anything — without rewriting it."""
+    if not history:
+        return False
+    keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
+    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index)
+    for message in history[:eligible_upper]:
+        if _tier1_sheds_reasoning(message, rc) and estimate_tokens(
+            message.reasoning_content or "", rc
+        ) > 0:
+            return True
+        if _tier1_reference_candidate(message, rc):
+            block = message.content_blocks[0]
+            if (
+                isinstance(block, TextBlock)
+                and estimate_tokens(block.text, rc) >= truncation_threshold_tokens
+            ):
+                return True
+            continue
+        if message.role is MessageRole.tool and any(
+            _tier1_sheds_result(block, rc, truncation_threshold_tokens)
+            for block in message.content_blocks
+        ):
+            return True
+    return False
+
+
 async def run_tier1_truncation(
     history: list[Message],
     blob_store: IBlobStore,
@@ -738,11 +811,7 @@ async def run_tier1_truncation(
         # Free the tokens BEFORE the tool-result branch's continue so a
         # tool-pairing assistant turn with bloated CoT is still trimmed even
         # when its tool result is the thing being blobbed.
-        if (
-            rc.compaction_shed_reasoning_enabled
-            and message.role is MessageRole.assistant
-            and message.reasoning_content
-        ):
+        if _tier1_sheds_reasoning(message, rc) and message.reasoning_content:
             freed = estimate_tokens(message.reasoning_content, rc)
             if freed > 0:
                 history[idx] = message.model_copy(update={"reasoning_content": None})
@@ -756,13 +825,7 @@ async def run_tier1_truncation(
         block = message.content_blocks[0]
 
         # ── A2(2) — bound an over-budget FROZEN reference block (bootstrap).
-        if (
-            rc.compaction_bound_reference_blocks_enabled
-            and message.role is not MessageRole.tool
-            and message.metadata.get(COMPACTION_REFERENCE_METADATA_KEY) is True
-            and isinstance(block, TextBlock)
-            and not _content_is_already_compacted(block.text)
-        ):
+        if _tier1_reference_candidate(message, rc) and isinstance(block, TextBlock):
             ref_tokens = estimate_tokens(block.text, rc)
             if ref_tokens >= truncation_threshold_tokens:
                 ref_bytes = block.text.encode("utf-8")
@@ -811,16 +874,12 @@ async def run_tier1_truncation(
         new_blocks: list[ContentBlock] = []
         msg_modified = False
         for block in message.content_blocks:
-            if not isinstance(block, ToolResultBlock):
-                new_blocks.append(block)
-                continue
-            if _content_is_already_compacted(block.content):
+            if not isinstance(block, ToolResultBlock) or not _tier1_sheds_result(
+                block, rc, truncation_threshold_tokens
+            ):
                 new_blocks.append(block)
                 continue
             original_tokens = estimate_tokens(block.content, rc)
-            if original_tokens < truncation_threshold_tokens:
-                new_blocks.append(block)
-                continue
 
             # What gets stored is the CANONICAL value, not the text in front
             # of the model. A tool that handed back a short view of a long
@@ -1506,6 +1565,175 @@ def _prune_failed_anchor_keys(state: CompactionState, history: list[Message]) ->
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _Tier2Plan:
+    """What a Tier 2 pass would do, worked out before any call is made."""
+
+    synthetic_removed: int
+    synthetic_tokens_freed: int
+    jobs: list[tuple[_SummarisationUnit, str, list[Message], int, bool]]
+
+
+def _plan_tier2(
+    history: list[Message],
+    state: CompactionState,
+    rc: LoopConstants,
+    *,
+    keep_recent_turns: int | None,
+    protect_tail_from_index: int | None,
+    compact_seeded_history: bool,
+    retry_failed_units: bool,
+) -> _Tier2Plan | None:
+    """Decide which units a Tier 2 pass would send, without sending any.
+
+    ``history`` is the pass's working copy: aged recovery nudges are removed
+    from it here, and the jobs' indices refer to it afterwards. ``None`` means
+    the keep window leaves nothing eligible at all.
+    """
+    keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
+    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index)
+    if eligible_upper == 0:
+        return None
+
+    # Aged user-role recovery nudges are runtime control flow, not conversation
+    # content. Sending them to the summariser lets it misattribute the runtime's
+    # instruction to the operator; protecting them instead makes them immortal.
+    # They have no tool-pairing role, so remove them deterministically before
+    # building Tier-2 units while the recent tail remains untouched. Every
+    # nudge is appended as the trailing message of the request it steers, so
+    # even the one-message reactive keep window keeps the live nudge.
+    synthetic_nudges = {
+        idx
+        for idx in range(eligible_upper)
+        if history[idx].role is MessageRole.user
+        and history[idx].metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
+    }
+    synthetic_tokens_freed = sum(
+        estimate_message_tokens(history[idx], rc) for idx in synthetic_nudges
+    )
+    if synthetic_nudges:
+        history[:] = [
+            message for idx, message in enumerate(history) if idx not in synthetic_nudges
+        ]
+        eligible_upper -= len(synthetic_nudges)
+
+    protected: frozenset[int] = frozenset()
+    if rc.compaction_protect_first_user_turn:
+        first_user = _first_user_turn_index(history)
+        if first_user is not None:
+            protected = frozenset({first_user})
+
+    # Every operator turn stays verbatim. An instruction sent mid-run — a
+    # steer, a correction, a follow-up — is short, so summarising it frees
+    # almost nothing, and it is specific, so a paraphrase of it is exactly the
+    # loss this pass cannot afford: "remove the model-name field from the
+    # header" becomes "the user asked for changes to the header" and the run
+    # goes on to do something else. What condenses them instead is Tier 3,
+    # which keeps their wording as quotes.
+    protected = protected | frozenset(_operator_turn_indices(history))
+
+    # Routine compaction protects prior-run seeds. Reactive compaction may
+    # summarise seed-only units, but every replacement retains the seed tag so
+    # the host's finalization filter still excludes it from persistence.
+    seed_indices = _session_history_seed_indices(history)
+    if seed_indices and not compact_seeded_history:
+        protected = protected | seed_indices
+
+    # Reference blocks are a Tier-1-ONLY shed surface (A2(2) recoverable blob
+    # path). Tier-2 must never collapse them — un-blobbed, that loses frozen
+    # bootstrap context; blobbed, the placeholder is the only in-history
+    # pointer to the blob and summarising it both wastes an LLM call on the
+    # raw placeholder marker and erases the blob ref. See
+    # ``_compaction_reference_indices``.
+    reference_indices = _compaction_reference_indices(history)
+    if reference_indices:
+        protected = protected | reference_indices
+
+    units = _build_summarisation_units(history, eligible_upper, protected_indices=protected)
+    # Which units are worth a call at all, decided before any call is made:
+    # not already summarised, and big enough that a summary could come back
+    # smaller than what it replaces.
+    jobs: list[tuple[_SummarisationUnit, str, list[Message], int, bool]] = []
+    for unit in units:
+        anchor = history[unit.anchor_idx]
+        # A4 idempotency — never re-summarise an existing compaction summary
+        # (would nest <compacted-turn> wrappers and decay the summary).
+        if _is_compaction_summary(anchor):
+            continue
+        anchor_key = _stable_turn_key(anchor)
+        if anchor_key in state.summarised_turn_ids:
+            continue
+        if (
+            not retry_failed_units
+            and state.failed_anchor_keys.get(anchor_key, 0)
+            >= rc.compaction_summary_failed_unit_max_attempts
+        ):
+            # The summariser has failed on this unit as often as it may. Paying
+            # again buys the same failure; the fold tier still gets its turn.
+            # A forced pass sets ``retry_failed_units`` and ignores the census:
+            # it runs when the alternative is the run ending, and a call that
+            # is probably wasted is cheaper than that.
+            continue
+        # Exhaustive across EVERY member of the unit (assistant turn + its
+        # tool results), so the summary preserves the tool exchange.
+        unit_messages = [history[member] for member in unit.indices]
+        seeded_members = [
+            member.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True
+            for member in unit_messages
+        ]
+        # A single replacement cannot preserve exact persistence provenance for
+        # a mixed seed/current unit. Leave it intact rather than turning either
+        # side into the other.
+        if any(seeded_members) and not all(seeded_members):
+            continue
+        seed_only = all(seeded_members)
+        before_tokens = sum(estimate_message_tokens(member, rc) for member in unit_messages)
+        # No-net-gain floor — a unit at or below the empty-wrapper size cannot
+        # shrink; replacing it would only GROW history (the inflation the
+        # max(0, ...) freed clamp would mask). The operator's own minimum sits
+        # on top of that floor: a summariser writes a sentence or three
+        # whatever it is handed, so below some size the call is spent to
+        # discover the summary is no smaller.
+        floor = max(
+            _compaction_wrapper_floor_tokens(anchor_key, rc),
+            rc.compaction_summary_min_unit_tokens,
+        )
+        if before_tokens <= floor:
+            continue
+        jobs.append((unit, anchor_key, unit_messages, before_tokens, seed_only))
+
+    return _Tier2Plan(
+        synthetic_removed=len(synthetic_nudges),
+        synthetic_tokens_freed=synthetic_tokens_freed,
+        jobs=jobs,
+    )
+
+
+def tier2_has_work(
+    history: list[Message],
+    state: CompactionState,
+    rc: LoopConstants,
+    *,
+    keep_recent_turns: int | None = None,
+    protect_tail_from_index: int | None = None,
+    compact_seeded_history: bool = False,
+    retry_failed_units: bool = False,
+) -> bool:
+    """Whether :func:`run_tier2_summarisation` would send or drop anything."""
+    if not history:
+        return False
+    plan = _plan_tier2(
+        list(history),
+        state,
+        rc,
+        keep_recent_turns=keep_recent_turns,
+        protect_tail_from_index=protect_tail_from_index,
+        compact_seeded_history=compact_seeded_history,
+        retry_failed_units=retry_failed_units,
+    )
+    return plan is not None and (plan.synthetic_removed > 0 or bool(plan.jobs))
+
+
 async def run_tier2_summarisation(
     history: list[Message],
     compaction_llm: ILLMProvider,
@@ -1609,126 +1837,26 @@ async def run_tier2_summarisation(
     summarised_turn_ids = set(state.summarised_turn_ids)
     failed_anchor_keys = dict(state.failed_anchor_keys)
 
-    keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
-    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index)
-    if eligible_upper == 0:
+    plan = _plan_tier2(
+        history,
+        state,
+        rc,
+        keep_recent_turns=keep_recent_turns,
+        protect_tail_from_index=protect_tail_from_index,
+        compact_seeded_history=compact_seeded_history,
+        retry_failed_units=retry_failed_units,
+    )
+    if plan is None:
         _prune_failed_anchor_keys(state, history)
         return Tier2Result(turns_summarised=0, tokens_freed=0)
-
-    # Aged user-role recovery nudges are runtime control flow, not conversation
-    # content. Sending them to the summariser lets it misattribute the runtime's
-    # instruction to the operator; protecting them instead makes them immortal.
-    # They have no tool-pairing role, so remove them deterministically before
-    # building Tier-2 units while the recent tail remains untouched. Every
-    # nudge is appended as the trailing message of the request it steers, so
-    # even the one-message reactive keep window keeps the live nudge.
-    synthetic_nudges = {
-        idx
-        for idx in range(eligible_upper)
-        if history[idx].role is MessageRole.user
-        and history[idx].metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
-    }
-    synthetic_tokens_freed = sum(
-        estimate_message_tokens(history[idx], rc) for idx in synthetic_nudges
-    )
-    if synthetic_nudges:
-        history[:] = [
-            message for idx, message in enumerate(history) if idx not in synthetic_nudges
-        ]
-        eligible_upper -= len(synthetic_nudges)
-
-    protected: frozenset[int] = frozenset()
-    if rc.compaction_protect_first_user_turn:
-        first_user = _first_user_turn_index(history)
-        if first_user is not None:
-            protected = frozenset({first_user})
-
-    # Every operator turn stays verbatim. An instruction sent mid-run — a
-    # steer, a correction, a follow-up — is short, so summarising it frees
-    # almost nothing, and it is specific, so a paraphrase of it is exactly the
-    # loss this pass cannot afford: "remove the model-name field from the
-    # header" becomes "the user asked for changes to the header" and the run
-    # goes on to do something else. What condenses them instead is Tier 3,
-    # which keeps their wording as quotes.
-    protected = protected | frozenset(_operator_turn_indices(history))
-
-    # Routine compaction protects prior-run seeds. Reactive compaction may
-    # summarise seed-only units, but every replacement retains the seed tag so
-    # the host's finalization filter still excludes it from persistence.
-    seed_indices = _session_history_seed_indices(history)
-    if seed_indices and not compact_seeded_history:
-        protected = protected | seed_indices
-
-    # Reference blocks are a Tier-1-ONLY shed surface (A2(2) recoverable blob
-    # path). Tier-2 must never collapse them — un-blobbed, that loses frozen
-    # bootstrap context; blobbed, the placeholder is the only in-history
-    # pointer to the blob and summarising it both wastes an LLM call on the
-    # raw placeholder marker and erases the blob ref. See
-    # ``_compaction_reference_indices``.
-    reference_indices = _compaction_reference_indices(history)
-    if reference_indices:
-        protected = protected | reference_indices
-
-    units = _build_summarisation_units(history, eligible_upper, protected_indices=protected)
+    jobs = plan.jobs
     resolved_prompts = prompts if prompts is not None else bundled_prompt_provider()
 
     summarised = 0
-    freed = synthetic_tokens_freed
+    freed = plan.synthetic_tokens_freed
     # Replacement Message keyed by anchor index; indices to delete after the loop.
     replacements: dict[int, Message] = {}
     indices_to_drop: set[int] = set()
-
-    # Which units are worth a call at all, decided before any call is made:
-    # not already summarised, and big enough that a summary could come back
-    # smaller than what it replaces.
-    jobs: list[tuple[_SummarisationUnit, str, list[Message], int, bool]] = []
-    for unit in units:
-        anchor = history[unit.anchor_idx]
-        # A4 idempotency — never re-summarise an existing compaction summary
-        # (would nest <compacted-turn> wrappers and decay the summary).
-        if _is_compaction_summary(anchor):
-            continue
-        anchor_key = _stable_turn_key(anchor)
-        if anchor_key in summarised_turn_ids:
-            continue
-        if (
-            not retry_failed_units
-            and failed_anchor_keys.get(anchor_key, 0)
-            >= rc.compaction_summary_failed_unit_max_attempts
-        ):
-            # The summariser has failed on this unit as often as it may. Paying
-            # again buys the same failure; the fold tier still gets its turn.
-            # A forced pass sets ``retry_failed_units`` and ignores the census:
-            # it runs when the alternative is the run ending, and a call that
-            # is probably wasted is cheaper than that.
-            continue
-        # Exhaustive across EVERY member of the unit (assistant turn + its
-        # tool results), so the summary preserves the tool exchange.
-        unit_messages = [history[member] for member in unit.indices]
-        seeded_members = [
-            member.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True
-            for member in unit_messages
-        ]
-        # A single replacement cannot preserve exact persistence provenance for
-        # a mixed seed/current unit. Leave it intact rather than turning either
-        # side into the other.
-        if any(seeded_members) and not all(seeded_members):
-            continue
-        seed_only = all(seeded_members)
-        before_tokens = sum(estimate_message_tokens(member, rc) for member in unit_messages)
-        # No-net-gain floor — a unit at or below the empty-wrapper size cannot
-        # shrink; replacing it would only GROW history (the inflation the
-        # max(0, ...) freed clamp would mask). The operator's own minimum sits
-        # on top of that floor: a summariser writes a sentence or three
-        # whatever it is handed, so below some size the call is spent to
-        # discover the summary is no smaller.
-        floor = max(
-            _compaction_wrapper_floor_tokens(anchor_key, rc),
-            rc.compaction_summary_min_unit_tokens,
-        )
-        if before_tokens <= floor:
-            continue
-        jobs.append((unit, anchor_key, unit_messages, before_tokens, seed_only))
 
     # Calls go out in small parallel batches, oldest unit first, and stop once
     # the pass has freed its budget. Sequentially this was one chain of
@@ -2028,6 +2156,31 @@ async def _fold_span(
     )
 
 
+def tier3_has_work(
+    history: list[Message],
+    rc: LoopConstants,
+    *,
+    protect_tail_from_index: int | None = None,
+    keep_recent_turns: int | None = None,
+    compact_seeded_history: bool = False,
+) -> bool:
+    """Whether :func:`run_tier3_fold` would find a span to fold."""
+    if not history or not rc.compaction_fold_enabled or rc.compaction_fold_max_spans_per_pass < 1:
+        return False
+    keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
+    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index)
+    if eligible_upper == 0:
+        return False
+    return bool(
+        _fold_spans(
+            history,
+            eligible_upper,
+            rc,
+            compact_seeded_history=compact_seeded_history,
+        )
+    )
+
+
 async def run_tier3_fold(
     history: list[Message],
     compaction_llm: ILLMProvider,
@@ -2148,4 +2301,7 @@ __all__ = [
     "run_tier1_truncation",
     "run_tier2_summarisation",
     "run_tier3_fold",
+    "tier1_has_work",
+    "tier2_has_work",
+    "tier3_has_work",
 ]

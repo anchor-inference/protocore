@@ -47,6 +47,11 @@ from ._tool_fixtures import MockTool
 # "I thought about it" the thing that fails, not the thing that is assumed.
 _RESET_ON_REARM: frozenset[str] = frozenset(
     {
+        # Proactive compaction's own memory: a suspension waiting for a
+        # rejection, and the last probe that found nothing to do. The next
+        # question starts with a fresh budget, so both start over with it.
+        "_proactive_compaction_suspended",
+        "_idle_compaction_probe",
         # The state machine and the run's own totals.
         "state",
         "turn_count",

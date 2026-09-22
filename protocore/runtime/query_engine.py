@@ -946,6 +946,17 @@ class QueryEngine:
         # request that follows it. The next recovery reset consumes this latch
         # and marks that message's one compaction allowance as already spent.
         self._proactive_compaction_attempted_for_next_message: bool = False
+        # Set when a proactive pass exhausted the retry budget. Proactive
+        # compaction then stops until the provider rejects a request, which is
+        # what the reactive path needs to run and what lifts this.
+        self._proactive_compaction_suspended: bool = False
+        # The last proactive probe that found nothing to do: its profile
+        # (forced, protected tail) and the history it saw. Messages are
+        # immutable, so the same list of the same objects is the same answer,
+        # and the gate is skipped without asking the tiers again.
+        self._idle_compaction_probe: (
+            tuple[tuple[bool, int | None], tuple[Message, ...]] | None
+        ) = None
         # Actual max_tokens on the most recent fitted assistant request. Kept
         # only until this assistant-message boundary so an upstream context
         # rejection can derive a retry ceiling from what was really sent.
@@ -2085,6 +2096,10 @@ class QueryEngine:
         # subagents that may still be drawing on it — but the per-run streaks
         # and one-shot signals inside it are allowances like any other.
         self.run_state.clear_run_scoped_streaks()
+        # The compaction state is continuity — what was summarised, what was
+        # shed, which units the summariser cannot handle — but its retry
+        # budgets are allowances sized for one question, like the rest.
+        self.compaction_state.reset_retries()
 
     def transition_to(self, new_state: LoopState) -> None:
         """Validate then apply a state transition.

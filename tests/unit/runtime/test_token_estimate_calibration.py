@@ -10,7 +10,7 @@ import pytest
 
 from protocore.contracts.llm import LLMRequest
 from protocore.contracts.runtime_constants import LoopConstants
-from protocore.contracts.types import Message, MessageRole, StopReason, TextBlock
+from protocore.contracts.types import Message, MessageRole, TextBlock
 from protocore.runtime.context.compaction import estimate_history_tokens, estimate_message_tokens
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
@@ -248,7 +248,7 @@ async def test_empty_routine_pass_backs_the_gate_off() -> None:
         calls.append(reason)
         yield TurnEvent(type=EventType.COMPACTION_COMPLETED, run_id="r", payload={"tokens_before": 60_000, "tokens_after": 59_900})
 
-    policy = PerIterationCompactionPolicy(compact=compact, protect_index=lambda h: None, pair_orphans=lambda e: None, message_stop=lambda e, s: TurnEvent(type=EventType.MESSAGE_STOP, run_id="r", payload={"stop_reason": StopReason.error.value}))
+    policy = PerIterationCompactionPolicy(compact=compact, protect_index=lambda h: None)
 
     async def run() -> list[TurnEvent]:
         turn = type("Turn", (), {"engine": engine, "outcome": type("O", (), {"directive": None, "reason": None})()})()

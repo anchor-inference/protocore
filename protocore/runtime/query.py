@@ -2229,25 +2229,6 @@ async def _drive_turn(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
             reason="proactive_emergency" if _emergency_turn_start else "routine",
         ):
             yield evt
-        # If compaction transitioned to FAILED, surface the terminal
-        # message_stop now and bail.
-        if engine.state is LoopState.FAILED:
-            # a compaction-exhausted FAILED terminal can persist a
-            # history whose last assistant turn (or a turn compaction kept)
-            # carries a tool_use with no result; pair it before the snapshot.
-            _synthesize_missing_tool_results(
-                engine.history,
-                error_content=engine.prompt_text("tool_result_interrupted"),
-            )
-            yield TurnEvent(
-                type=EventType.MESSAGE_STOP,
-                run_id=engine.config.run_id,
-                payload={
-                    "turn_id": engine.turn_id(),
-                    "stop_reason": StopReason.error.value,
-                },
-            )
-            return
 
     # ── 3. UserPromptSubmit hook ─────────────────────────────────────
     hook_result = await _safe_hook_invoke(
@@ -2464,6 +2445,57 @@ async def _drive_turn(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
 # ----------------------------------------------------------------------
 
 
+def _proactive_pass_is_idle(
+    engine: QueryEngine,
+    *,
+    force: bool,
+    protect_tail_from_index: int | None,
+) -> bool:
+    """Whether a proactive pass should not be opened at all.
+
+    Three reasons, cheapest first:
+
+    * proactive compaction is suspended — an earlier pass exhausted the retry
+      budget and the provider has not rejected a request since;
+    * the last probe found nothing to do, and the history is the same list of
+      the same (immutable) messages under the same profile, so the answer is
+      the same;
+    * the tiers, asked without running, find nothing this profile may touch.
+
+    A pass with nothing to do would otherwise flip the run into
+    ``COMPACTING``, fire hooks, write a usage row and a snapshot on every
+    iteration while the estimate stays over the gate — and change nothing.
+    """
+    if engine._proactive_compaction_suspended:
+        return True
+    history = engine.history
+    profile = (force, protect_tail_from_index)
+    probe = engine._idle_compaction_probe
+    if (
+        probe is not None
+        and probe[0] == profile
+        and len(probe[1]) == len(history)
+        and all(seen is current for seen, current in zip(probe[1], history, strict=True))
+    ):
+        return True
+    if engine.context_manager.has_proactive_work(
+        history,
+        engine.compaction_state,
+        force=force,
+        protect_tail_from_index=protect_tail_from_index,
+    ):
+        engine._idle_compaction_probe = None
+        return False
+    engine._idle_compaction_probe = (profile, tuple(history))
+    _logger.warning(
+        "DIAG compaction.nothing_eligible run=%s force=%s messages=%d",
+        engine.config.run_id,
+        force,
+        len(history),
+    )
+    return True
+
+
 async def _run_compaction(
     engine: QueryEngine,
     *,
@@ -2487,8 +2519,24 @@ async def _run_compaction(
     >keep parallel batch's fresh, unconsumed results are never
     blobbed/summarised before the next assistant stream consumes them. The
     turn-start gate and reactive-413 path pass ``None`` (no in-flight batch).
+
+    Every pass driven from here is proactive — decided on an estimate, before
+    the provider has refused anything. Two consequences:
+
+    * A pass that would find nothing its profile may touch is not opened at
+      all (:func:`_proactive_pass_is_idle`): no ``COMPACTING`` flip, no events,
+      hooks, usage row or snapshot.
+    * A pass that exhausts the retry budget does not end the run. The request
+      still goes out, proactive compaction stops until the provider rejects a
+      request, and the reactive path — the only one that may compact seeded
+      history — handles that rejection.
     """
     from protocore.runtime.context.budgets import derive_budgets
+
+    if _proactive_pass_is_idle(
+        engine, force=force, protect_tail_from_index=protect_tail_from_index
+    ):
+        return
 
     from_state = engine.state
     engine.transition_to(LoopState.COMPACTING)
@@ -2583,18 +2631,25 @@ async def _run_compaction(
         )
         if rollback_evt is not None:
             yield rollback_evt
+        # Nothing has been rejected yet: the estimate that opened this pass is
+        # not proof the request does not fit, and the profile that failed is
+        # not the one that may compact seeded history. Stop compacting
+        # proactively and let the request go out; a real rejection reaches the
+        # reactive path, which lifts the suspension.
+        engine._proactive_compaction_suspended = True
+        _logger.warning(
+            "DIAG compaction.proactive_suspended run=%s reason=%s err=%s",
+            engine.config.run_id,
+            reason,
+            exc,
+        )
         compacting_from = engine.state
-        engine.transition_to(LoopState.FAILED)
+        engine.transition_to(LoopState.RUNNING)
         yield _emit_state_change(
             engine,
             compacting_from,
-            LoopState.FAILED,
-            reason=str(exc),
-        )
-        yield TurnEvent(
-            type=EventType.ERROR,
-            run_id=engine.config.run_id,
-            payload={"kind": "compaction_exhausted", "message": str(exc)},
+            LoopState.RUNNING,
+            reason="compaction_exhausted_proactive_suspended",
         )
         return
 
@@ -5399,6 +5454,11 @@ async def _handle_context_window_exceeded(
 
     engine._compaction_attempted_for_current_turn = True
     engine._reactive_compaction_attempted_for_current_turn = True
+    # The provider has now refused a request: the evidence a suspended
+    # proactive gate was waiting for. Whatever this pass achieves, the history
+    # the gate sees next is judged afresh.
+    engine._proactive_compaction_suspended = False
+    engine._idle_compaction_probe = None
     from_state = engine.state
     engine.transition_to(LoopState.COMPACTING)
     yield _emit_state_change(engine, from_state, LoopState.COMPACTING, reason="reactive_413")
@@ -12298,8 +12358,6 @@ _CORE_TURN_POLICIES: Final[TurnPolicyRegistry] = TurnPolicyRegistry(
         PerIterationCompactionPolicy(
             compact=_run_compaction,
             protect_index=current_tool_batch_protect_index,
-            pair_orphans=_policy_pair_orphan_tool_calls,
-            message_stop=_policy_message_stop,
         ),
         TerminalNudgePolicy(
             required=_terminal_tool_nudge_required,

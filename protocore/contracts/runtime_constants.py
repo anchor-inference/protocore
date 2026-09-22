@@ -467,7 +467,14 @@ class LoopConstants(BaseModel):
     compaction_failed_max_retries: int = Field(
         default=2,
         ge=0,
-        description="Max compaction retries before run transitions to FAILED.",
+        description=(
+            "Consecutive failed compaction passes allowed before compaction "
+            "gives up, counted apart for proactive and reactive passes. A pass "
+            "with nothing eligible is not a failure. Past the bound a proactive "
+            "pass suspends proactive compaction until the provider rejects a "
+            "request; a reactive pass hands the turn to the output-cap ladder, "
+            "or fails the run when no smaller cap is left."
+        ),
     )
     compaction_shed_reasoning_enabled: bool = Field(
         default=True,

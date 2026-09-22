@@ -20,20 +20,35 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
-- **The compaction retry budget charges failed passes, not passes.** A pass
-  that found nothing its profile may touch no longer spends a retry — the
-  proactive emergency pass over a history of turns seeded from earlier runs
-  leaves them alone by design, and used to spend one anyway. The reactive pass
-  after a provider rejection now keeps its own count,
-  `CompactionState.reactive_retry_count` (bounded by the same
-  `compaction_failed_max_retries`), so proactive failures can no longer use up
-  the one profile that may compact seeded history; before, an idle proactive
+- **The compaction retry budget charges failed passes, not passes.** Only a
+  pass that tried and failed is charged, and only once however many tiers
+  failed; a tier that raised is no longer counted again by the no-progress
+  rule. The reactive pass after a provider rejection keeps its own count,
+  `CompactionState.reactive_retry_count` (same `compaction_failed_max_retries`
+  bound, rides the run snapshot), so proactive failures can no longer use up
+  the one profile that may compact seeded history. Before, an idle proactive
   pass plus two reactive passes that lost their summariser calls exhausted the
-  default budget and sent the run to the output-cap ladder. A pass is charged
-  at most once: a tier that raised is no longer counted again by the
-  no-progress rule. `Tier2Result.units_attempted` and
-  `Tier3Result.spans_attempted` report the calls a pass made, and the new
-  counter rides the run snapshot.
+  default budget. Progress by either profile clears both counts, and so does
+  `rearm()`. A routine pass that rewrote a Tier 1 block now counts as progress
+  even when the estimate did not move.
+- **A proactive pass with nothing to do is not opened.** The routine,
+  turn-start and per-iteration gates ask `ContextManager.has_proactive_work`
+  first. When no tier would change anything under the proactive profile — a
+  history of turns seeded from earlier runs is the usual case — there is no
+  `COMPACTING` state, no compaction events, hooks, usage row or snapshot. The
+  engine then skips the gate without asking again until the history changes.
+  Before, such a pass ran on every iteration once the estimate crossed the
+  gate. `Tier2Result.units_attempted` and `Tier3Result.spans_attempted` report
+  the calls a pass made. `tier1_has_work`, `tier2_has_work` and
+  `tier3_has_work` answer the same question for each tier. A fold that raises
+  now reports a zero `Tier3Result` instead of `None`.
+- **Proactive compaction running out of budget no longer fails the run.**
+  Nothing has been rejected at that point. Proactive compaction is suspended
+  (one `compaction_exhausted_proactive_suspended` state change, no `ERROR`
+  event), the request goes out, and the next provider rejection lifts the
+  suspension and runs the reactive pass. `PerIterationCompactionPolicy` no
+  longer takes `pair_orphans` or `message_stop`, since it no longer ends the
+  turn.
 - **`RequestTokenCounterConformance` and `LifecycleRegistryConformance` are
   importable from `protocore.conformance`.** Both were in `SUITES` but only
   reachable through `protocore.conformance.suites`. The package's own tests now

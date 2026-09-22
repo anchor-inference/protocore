@@ -23,6 +23,7 @@ from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY,
     SESSION_HISTORY_SEED_METADATA_KEY,
+    HookEvent,
     Message,
     MessageRole,
     StopReason,
@@ -31,7 +32,6 @@ from protocore.contracts.types import (
     ToolUseBlock,
 )
 from protocore.prompts import bundled_prompt_provider
-from protocore.runtime.context.compaction import CompactionAttempt, CompactionExhaustedError
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
 
@@ -777,12 +777,13 @@ async def test_lower_bound_overflow_repeatedly_reduces_cap_after_one_compaction(
 async def test_a_proactive_pass_is_followed_by_exactly_one_reactive_pass_after_overflow(
     engine_factory, in_memory_runtime, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A proactive pass that freed nothing does not use up the reactive attempt.
+    """A proactive gate with nothing to do does not use up the reactive attempt.
 
     The two passes run different profiles: the proactive one keeps the routine
     window and leaves seeded history alone, the reactive one may shrink it.
-    After the provider's rejection the reactive pass therefore still runs
-    once; a second rejection is answered by the output-cap ladder alone.
+    Here the proactive profile finds nothing eligible, so its pass is never
+    opened. After the provider's rejection the reactive pass still runs once;
+    a second rejection is answered by the output-cap ladder alone.
     """
     rc = LoopConstants(
         model_context_window=65_536,
@@ -826,19 +827,35 @@ async def test_a_proactive_pass_is_followed_by_exactly_one_reactive_pass_after_o
         event.payload.get("reason")
         for event in events
         if event.type is EventType.COMPACTION_STARTED
-    ] == ["proactive_emergency", "reactive_413"]
+    ] == ["reactive_413"]
+
+
+class _DeadSummariser(_ScriptedFailureLLM):
+    """A summariser whose every call fails in transport."""
+
+    def __init__(self) -> None:
+        super().__init__(exceptions=[])
+        self.summary_calls = 0
+
+    async def complete_structured(self, request, schema):  # type: ignore[no-untyped-def]
+        self.summary_calls += 1
+        raise RuntimeError("summariser unavailable")
 
 
 @pytest.mark.asyncio
 async def test_an_exhausted_compaction_budget_hands_the_turn_back_to_the_cap_ladder(
-    engine_factory, in_memory_runtime, monkeypatch: pytest.MonkeyPatch
+    engine_factory, in_memory_runtime
 ) -> None:
-    """A reactive pass out of budget must not end a run the cap ladder can still save."""
+    """A reactive pass out of budget must not end a run the cap ladder can still save.
+
+    Reached for real: seeded history the reactive profile tries to summarise,
+    a summariser that fails every call, and a reactive budget already spent by
+    earlier messages' failed passes — the count a resumed snapshot carries.
+    """
     rc = LoopConstants(
         model_context_window=65_536,
         llm_output_max_tokens_ratio=0.125,
         compaction_keep_recent_turns=1,
-        compaction_failed_max_retries=1,
     )
     engine = engine_factory(rc=rc)
     failing_llm = _ScriptedFailureLLM(
@@ -851,19 +868,26 @@ async def test_an_exhausted_compaction_budget_hands_the_turn_back_to_the_cap_lad
             for cap in (8_192, 4_096)
         ],
     )
+    summariser = _DeadSummariser()
     engine.llm = failing_llm  # type: ignore[assignment]
-    engine.context_manager._compaction_llm = failing_llm  # type: ignore[attr-defined]
-    engine.compaction_llm = failing_llm  # type: ignore[assignment]
-    monkeypatch.setattr(engine, "needs_emergency_compaction", lambda: True)
-    real_force = engine.context_manager.force_compaction
-
-    async def _reactive_exhausts(**kwargs: Any) -> CompactionAttempt:
-        if kwargs.get("reactive"):
-            raise CompactionExhaustedError("reactive force_compaction exhausted retries")
-        attempt: CompactionAttempt = await real_force(**kwargs)
-        return attempt
-
-    monkeypatch.setattr(engine.context_manager, "force_compaction", _reactive_exhausts)
+    engine.context_manager._compaction_llm = summariser  # type: ignore[attr-defined]
+    engine.compaction_llm = summariser  # type: ignore[assignment]
+    seed = {SESSION_HISTORY_SEED_METADATA_KEY: True}
+    engine.history.extend(
+        [
+            Message(
+                role=MessageRole.user,
+                content_blocks=[TextBlock(text="prior task " * 1_200)],
+                metadata=seed,
+            ),
+            Message(
+                role=MessageRole.assistant,
+                content_blocks=[TextBlock(text="prior answer " * 1_200)],
+                metadata=seed,
+            ),
+        ]
+    )
+    engine.compaction_state.reactive_retry_count = rc.compaction_failed_max_retries
 
     events = [
         event
@@ -873,6 +897,7 @@ async def test_an_exhausted_compaction_budget_hands_the_turn_back_to_the_cap_lad
     ]
 
     assert engine.state is LoopState.COMPLETED
+    assert summariser.summary_calls > 0
     assert [request.max_tokens for request in failing_llm.calls] == [8_192, 4_096, 2_048]
     reasons = [
         event.payload.get("reason")
@@ -3811,3 +3836,225 @@ async def test_truncated_tool_call_mixed_batch_dispatches_both(
     # Run completed cleanly — round 2 (text-only "ok") flushed the loop.
     assert engine.state is LoopState.COMPLETED
     assert len(llm.calls) == 2
+
+
+def _seeded_prior_turns() -> list[Message]:
+    seed = {SESSION_HISTORY_SEED_METADATA_KEY: True}
+    return [
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text="prior task " * 1_200)],
+            metadata=seed,
+        ),
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[TextBlock(text="prior answer " * 1_200)],
+            metadata=seed,
+        ),
+    ]
+
+
+def _compaction_traces(events: list[TurnEvent]) -> list[TurnEvent]:
+    return [
+        event
+        for event in events
+        if event.type in (EventType.COMPACTION_STARTED, EventType.COMPACTION_COMPLETED)
+        or (event.type is EventType.USAGE_COMMITTED and event.payload.get("kind") == "compaction")
+        or (
+            event.type is EventType.STATE_CHANGED
+            and event.payload.get("to") == LoopState.COMPACTING.value
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_proactive_pass_with_nothing_eligible_is_never_opened(
+    engine_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Over the cliff on seeded history alone: no transaction, no trace of one."""
+    engine = engine_factory(rc=LoopConstants(model_context_window=65_536))
+    summariser = _DeadSummariser()
+    engine.llm = _ScriptedFailureLLM(exceptions=[])  # type: ignore[assignment]
+    engine.context_manager._compaction_llm = summariser  # type: ignore[attr-defined]
+    engine.compaction_llm = summariser  # type: ignore[assignment]
+    engine.history.extend(_seeded_prior_turns())
+    monkeypatch.setattr(engine, "needs_emergency_compaction", lambda: True)
+    persisted: list[int] = []
+    real_persist = engine._persist_snapshot
+
+    async def _count_persist() -> None:
+        persisted.append(len(engine.history))
+        await real_persist()
+
+    monkeypatch.setattr(engine, "_persist_snapshot", _count_persist)
+    pre_compact_fired: list[object] = []
+    import protocore.runtime.correctness_bind as correctness_bind
+
+    real_fire = correctness_bind.fire_lifecycle
+
+    async def _watch_fire(engine_: Any, event: HookEvent, payload: Any) -> Any:
+        if event is HookEvent.pre_compact:
+            pre_compact_fired.append(payload)
+        return await real_fire(engine_, event, payload)
+
+    monkeypatch.setattr(correctness_bind, "fire_lifecycle", _watch_fire)
+
+    events = [
+        event
+        async for event in engine.run(
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+        )
+    ]
+
+    assert engine.state is LoopState.COMPLETED
+    assert _compaction_traces(events) == []
+    assert pre_compact_fired == []
+    assert summariser.summary_calls == 0
+    assert engine.compaction_state.retry_count == 0
+    assert engine._idle_compaction_probe is not None
+
+
+def test_an_idle_probe_is_not_repeated_until_the_history_changes(
+    engine_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from protocore.runtime.query import _proactive_pass_is_idle
+
+    engine = engine_factory(
+        rc=LoopConstants(model_context_window=65_536, compaction_keep_recent_turns=1)
+    )
+    engine.history.extend(_seeded_prior_turns())
+    asked: list[bool] = []
+    real_probe = engine.context_manager.has_proactive_work
+
+    def _count_probe(*args: Any, **kwargs: Any) -> bool:
+        asked.append(kwargs["force"])
+        result: bool = real_probe(*args, **kwargs)
+        return result
+
+    monkeypatch.setattr(engine.context_manager, "has_proactive_work", _count_probe)
+
+    for _ in range(3):
+        assert _proactive_pass_is_idle(engine, force=True, protect_tail_from_index=None)
+    assert asked == [True]
+
+    # Another profile is another question.
+    assert _proactive_pass_is_idle(engine, force=False, protect_tail_from_index=None)
+    assert asked == [True, False]
+
+    # A changed history is asked about again — here it now holds a large
+    # current-run turn the proactive profile may summarise.
+    engine.history.append(
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="current " * 2_000)])
+    )
+    engine.history.append(Message(role=MessageRole.user, content_blocks=[TextBlock(text="go on")]))
+    assert not _proactive_pass_is_idle(engine, force=True, protect_tail_from_index=None)
+    assert asked == [True, False, True]
+    assert engine._idle_compaction_probe is None
+
+
+@pytest.mark.asyncio
+async def test_proactive_exhaustion_suspends_proactive_compaction_instead_of_failing(
+    engine_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing was rejected, so the request goes out and the run completes."""
+    rc = LoopConstants(model_context_window=65_536, compaction_keep_recent_turns=1)
+    engine = engine_factory(rc=rc)
+    summariser = _DeadSummariser()
+    llm = _ScriptedFailureLLM(exceptions=[])
+    engine.llm = llm  # type: ignore[assignment]
+    engine.context_manager._compaction_llm = summariser  # type: ignore[attr-defined]
+    engine.compaction_llm = summariser  # type: ignore[assignment]
+    # Current-run turns: the proactive profile may summarise them, and every
+    # summariser call fails.
+    engine.history.extend(
+        [message.model_copy(update={"metadata": {}}) for message in _seeded_prior_turns()]
+    )
+    engine.compaction_state.retry_count = rc.compaction_failed_max_retries
+    monkeypatch.setattr(engine, "needs_emergency_compaction", lambda: True)
+
+    events = [
+        event
+        async for event in engine.run(
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+        )
+    ]
+
+    assert engine.state is LoopState.COMPLETED
+    assert summariser.summary_calls > 0
+    assert len(llm.calls) == 1
+    assert not [event for event in events if event.type is EventType.ERROR]
+    reasons = [
+        event.payload.get("reason")
+        for event in events
+        if event.type is EventType.STATE_CHANGED
+    ]
+    assert reasons.count("compaction_exhausted_proactive_suspended") == 1
+    assert engine._proactive_compaction_suspended is True
+
+    # Suspended: the next gate is not opened, and makes no summariser call.
+    calls_before = summariser.summary_calls
+    from protocore.runtime.query import _run_compaction
+
+    engine.state = LoopState.RUNNING
+    assert [event async for event in _run_compaction(engine, force=True)] == []
+    assert summariser.summary_calls == calls_before
+
+
+@pytest.mark.asyncio
+async def test_a_provider_rejection_lifts_the_proactive_suspension(
+    engine_factory,
+) -> None:
+    rc = LoopConstants(
+        model_context_window=65_536,
+        llm_output_max_tokens_ratio=0.125,
+        compaction_keep_recent_turns=1,
+    )
+    engine = engine_factory(rc=rc)
+    engine.llm = _ScriptedFailureLLM(  # type: ignore[assignment]
+        exceptions=[
+            LLMContextWindowExceeded(
+                "prompt contains at least a lower bound",
+                context_window=65_536,
+                requested_output_tokens=8_192,
+            )
+        ],
+    )
+    engine._proactive_compaction_suspended = True
+
+    events = [
+        event
+        async for event in engine.run(
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+        )
+    ]
+
+    assert engine.state is LoopState.COMPLETED
+    assert "reactive_413" in [
+        event.payload.get("reason")
+        for event in events
+        if event.type is EventType.COMPACTION_STARTED
+    ]
+    assert engine._proactive_compaction_suspended is False
+
+
+@pytest.mark.asyncio
+async def test_rearm_starts_both_retry_budgets_over(engine_factory) -> None:
+    engine = engine_factory(rc=LoopConstants(model_context_window=65_536))
+    engine.llm = _ScriptedFailureLLM(exceptions=[])  # type: ignore[assignment]
+    [
+        event
+        async for event in engine.run(
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+        )
+    ]
+    engine.compaction_state.retry_count = 2
+    engine.compaction_state.reactive_retry_count = 2
+    engine.compaction_state.summarised_turn_ids.add("kept")
+    engine._proactive_compaction_suspended = True
+
+    engine.rearm()
+
+    assert engine.compaction_state.retry_count == 0
+    assert engine.compaction_state.reactive_retry_count == 0
+    assert engine.compaction_state.summarised_turn_ids == {"kept"}
+    assert engine._proactive_compaction_suspended is False

@@ -31,6 +31,9 @@ from protocore.runtime.context.compaction import (
     run_tier1_truncation,
     run_tier2_summarisation,
     run_tier3_fold,
+    tier1_has_work,
+    tier2_has_work,
+    tier3_has_work,
 )
 from protocore.runtime.token_counting import LanguageProfile, detect_profile
 
@@ -310,7 +313,8 @@ class ContextManager:
         A pass ends in one of three ways:
 
         * **progress** — it freed tokens, or rewrote, summarised or folded
-          anything. Both budgets that pass could have spent are cleared.
+          anything. Both budgets are cleared, whichever profile made it: the
+          history the next pass of either kind faces is a different one.
         * **nothing to do** — no tier raised and no tier found anything it was
           allowed to touch under this pass's profile: Tier 1 modified nothing,
           Tier 2 sent no unit and Tier 3 no span. A proactive pass over a
@@ -335,8 +339,6 @@ class ContextManager:
         )
         if progress:
             compaction_state.reset_retries()
-            if reactive:
-                compaction_state.reactive_retry_count = 0
             return
         tried = (
             error is not None
@@ -353,6 +355,48 @@ class ContextManager:
             spent = compaction_state.retry_count
         if spent > self._rc.compaction_failed_max_retries:
             raise CompactionExhaustedError(f"{label} exhausted retries") from error
+
+    def has_proactive_work(
+        self,
+        history: list[Message],
+        compaction_state: CompactionState,
+        *,
+        force: bool,
+        protect_tail_from_index: int | None = None,
+    ) -> bool:
+        """Whether a proactive pass would find anything its profile may touch.
+
+        Asked before the pass opens: a pass with nothing to do would still flip
+        the run into ``COMPACTING``, fire the compaction hooks, write a usage
+        row and a snapshot, and tell the client it is compacting — once an
+        iteration, for as long as the estimate stays over the gate. The answer
+        mirrors the tiers' own eligibility (the proactive profile: routine keep
+        window, seeded history untouched), so a ``False`` here is exactly a
+        pass that would have changed nothing and called nothing. ``force``
+        selects :meth:`force_compaction`'s rules, under which units the
+        failure census has written off are still eligible.
+        """
+        budgets = derive_budgets(self._rc)
+        if tier1_has_work(
+            history,
+            self._rc,
+            budgets.tool_result_truncation_threshold,
+            protect_tail_from_index=protect_tail_from_index,
+        ):
+            return True
+        if self._compaction_llm is None:
+            return False
+        if tier2_has_work(
+            history,
+            compaction_state,
+            self._rc,
+            protect_tail_from_index=protect_tail_from_index,
+            retry_failed_units=force,
+        ):
+            return True
+        return tier3_has_work(
+            history, self._rc, protect_tail_from_index=protect_tail_from_index
+        )
 
     async def run_compaction(
         self,
