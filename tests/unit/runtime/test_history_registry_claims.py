@@ -34,6 +34,7 @@ from protocore.contracts.llm import LLMRequest, LLMStreamEvent
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     SESSION_HISTORY_SEED_METADATA_KEY,
+    SYNTHETIC_RECOVERY_BACKGROUND_WAKE,
     SYNTHETIC_RECOVERY_METADATA_KEY,
     SYNTHETIC_RECOVERY_PROSE_GATE_REPAIR,
     TERMINAL_TOOL_METADATA_KEY,
@@ -301,6 +302,32 @@ def test_produced_output_is_output_and_not_merely_a_turn(engine_factory) -> None
             role=MessageRole.user,
             content_blocks=[TextBlock(text="wrap up now")],
             metadata={SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_PROSE_GATE_REPAIR},
+        ),
+    ]
+    assert _run_produced_output(engine) is True
+
+
+def test_a_background_wake_message_does_not_move_the_output_boundary(engine_factory) -> None:
+    """The wake-up the runtime writes when background tasks finish is scaffolding.
+
+    It is a user-role message, so anchoring on "the caller's last message"
+    would restart the boundary at it and judge a run that already read
+    evidence to have produced nothing — the exact case the wind-down protects.
+    """
+    engine: QueryEngine = engine_factory()
+    engine.history = [
+        _user(_NEW_TASK),
+        _assistant(ToolUseBlock(tool_call_id="call-1", name="Read", arguments_json="{}")),
+        Message(
+            role=MessageRole.tool,
+            content_blocks=[
+                ToolResultBlock(tool_call_id="call-1", content="42 lines", is_error=False)
+            ],
+        ),
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text="background tasks finished: build ok")],
+            metadata={SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_BACKGROUND_WAKE},
         ),
     ]
     assert _run_produced_output(engine) is True

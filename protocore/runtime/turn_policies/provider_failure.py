@@ -33,7 +33,7 @@ reader has already seen.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any
+from typing import Any, Final
 
 from protocore.contracts.llm import (
     LLMContextWindowExceeded,
@@ -401,6 +401,12 @@ class ProviderFailurePolicy:
         # wait itself ends early on a cancel; the loop's own cancel checkpoint
         # is what then routes the restarted turn to its cancelled terminal.
         await self._await_backoff(engine, delay)
+        if not self._may_retry(engine):
+            # The pause ended because the run was told to stop or ran out of
+            # wall clock. Opening another provider request now would only be
+            # cancelled at its first delta; leave the directive as it stands
+            # so the loop's own cancel checkpoint takes the turn.
+            return
         turn.outcome.directive = TurnDirective.restart_turn
         turn.outcome.rebuild_context = True
         turn.outcome.reason = "transient_llm_error_retry"
@@ -443,6 +449,37 @@ class ProviderFailurePolicy:
         turn.outcome.reason = INTERNAL_ERROR_KIND
 
 
+#: Classified reasons that name a permanent answer. An adapter that attaches
+#: one of these has already said the request will not succeed by being sent
+#: again; the class default of the exception it raised must not overrule it.
+_PERMANENT_FAILURE_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        "auth",
+        "auth_permanent",
+        "billing",
+        "context_overflow",
+        "format_error",
+        "image_too_large",
+        "llama_cpp_grammar_pattern",
+        "long_context_tier",
+        "model_not_found",
+        "oauth_long_context_beta_forbidden",
+        "payload_too_large",
+        "provider_policy_blocked",
+        "thinking_signature",
+    }
+)
+
+
+def _classified_reason(exc: BaseException) -> str:
+    """The adapter's attached verdict on ``exc``, or ``""`` when it carries none."""
+    classified = getattr(exc, "classified", None)
+    reason = getattr(classified, "reason", None) if classified is not None else None
+    if reason is None:
+        return ""
+    return str(getattr(reason, "value", reason))
+
+
 def _says_retryable(exc: LLMError) -> bool:
     """Whether the adapter that raised ``exc`` says another attempt is worth it.
 
@@ -450,9 +487,13 @@ def _says_retryable(exc: LLMError) -> bool:
     adapter is the only party that saw the response: it classifies the status
     and the body and pins the verdict on what it raises. The class defaults in
     :mod:`protocore.contracts.llm` are what an adapter that classified nothing
-    gets, so this policy never has to guess.
+    gets, so this policy never has to guess. An adapter may also attach its
+    classification without touching the flag; a reason that names a permanent
+    answer then outranks the class default.
     """
-    return exc.retryable
+    if not exc.retryable:
+        return False
+    return _classified_reason(exc) not in _PERMANENT_FAILURE_REASONS
 
 
 __all__ = ["ProviderFailurePolicy"]

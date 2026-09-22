@@ -246,6 +246,11 @@ SYNTHETIC_RECOVERY_PRE_DISPATCH_TERMINAL_VERIFY = "pre_dispatch_terminal_verify"
 """``SYNTHETIC_RECOVERY_METADATA_KEY`` value for pre-dispatch terminal verification."""
 
 SYNTHETIC_RECOVERY_CIRCUIT_BREAKER = "tool_error_circuit_breaker"
+
+#: The wake-up the runtime appends when background tasks finish mid-run. It is
+#: scaffolding the loop wrote for itself, not a caller turn, so nothing that
+#: anchors on "the caller's last message" may treat it as one.
+SYNTHETIC_RECOVERY_BACKGROUND_WAKE = "background_tasks_finished"
 """``SYNTHETIC_RECOVERY_METADATA_KEY`` value for the repeated-tool-error
 circuit-breaker corrective turn — injected ONCE when a tool crosses
 ``LoopConstants.max_consecutive_tool_errors`` consecutive failures of the same

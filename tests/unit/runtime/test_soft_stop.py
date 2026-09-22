@@ -877,6 +877,75 @@ def test_a_retry_is_refused_once_the_run_is_stopping() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_classified_permanent_failure_is_not_retried_even_when_the_flag_is_unset() -> None:
+    """An adapter that attaches a verdict need not also touch the flag.
+
+    The class default says a provider error may be transient; a classification
+    naming a bad key or a missing model says it is not, and the classification
+    was made by the party that saw the response.
+    """
+
+    class _Classified:
+        def __init__(self, reason: str) -> None:
+            self.reason = reason
+
+    rc = LoopConstants(
+        model_context_window=4_096,
+        soft_stop_enabled=False,
+        llm_transient_error_retry_backoff_base_seconds=0.0,
+    )
+    exc = LLMProviderError("no such model")
+    exc.classified = _Classified("model_not_found")  # type: ignore[attr-defined]
+    llm = _AlwaysFailsLLM(exc)
+    engine = _build_engine(rc=rc, llm=llm, tools=[_FinalizeTool()])
+
+    events = [evt async for evt in engine.run(_user())]
+
+    assert _retry_events(events) == 0
+    assert len(llm.calls) == 1
+    assert engine.state is LoopState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_a_stop_during_the_backoff_opens_no_further_request() -> None:
+    """A cancel that lands in the pause ends the run without one more stream."""
+    rc = LoopConstants(
+        model_context_window=4_096,
+        soft_stop_enabled=False,
+        llm_transient_error_retry_max_attempts=3,
+        llm_transient_error_retry_backoff_base_seconds=5.0,
+        llm_transient_error_retry_backoff_max_seconds=5.0,
+    )
+
+    class _StopsOnFirstFailure(_AlwaysFailsLLM):
+        def __init__(self, exc: Exception, engine_ref: list[QueryEngine]) -> None:
+            super().__init__(exc)
+            self._engine_ref = engine_ref
+
+        async def stream_with_tools(  # type: ignore[no-untyped-def]
+            self, request: LLMRequest
+        ) -> AsyncIterator[LLMStreamEvent]:
+            self.calls.append(request)
+            self._engine_ref[0].stop()
+            if False:  # pragma: no cover — generator protocol marker
+                yield LLMStreamEvent(name="never", payload={})
+            raise self._exc
+
+    holder: list[QueryEngine] = []
+    llm = _StopsOnFirstFailure(LLMProviderError("provider down"), holder)
+    engine = _build_engine(rc=rc, llm=llm, tools=[_FinalizeTool()])
+    holder.append(engine)
+
+    started = time.monotonic()
+    events = [evt async for evt in engine.run(_user())]
+
+    assert time.monotonic() - started < 3.0
+    assert len(llm.calls) == 1
+    assert engine.state is not LoopState.COMPLETED
+    assert _retry_events(events) <= 1
+
+
+@pytest.mark.asyncio
 async def test_a_backoff_ends_the_moment_the_run_is_told_to_stop() -> None:
     """The pause is the one place a failing run holds still for whole seconds."""
     rc = LoopConstants(model_context_window=4_096)

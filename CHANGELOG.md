@@ -6,58 +6,6 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
-### Fixed
-
-- **The compaction trigger now sits below the prompt size the provider will
-  still accept.** `derive_budgets` takes the lower of
-  `model_context_window * compaction_trigger_ratio` and the window less the
-  output reserve, less `request_context_safety_tokens`, less the new
-  `compaction_trigger_turn_headroom_ratio` (0.15) for the turn about to be
-  added. A server that reserves the output budget inside the context window
-  rejects any prompt above `window - max output`; with the stock 0.8 trigger
-  and 0.25 output reserve the trigger on a 65 536-token window stood above
-  that cliff, so proactive compaction could not fire before the rejection.
-  The emergency cliff is held strictly above the effective trigger. The
-  output-reserve part of the deduction is gated on
-  `provider_reserves_output_in_context_window` (default true): a provider that
-  sizes its input window independently of the requested output gives that
-  share of the window back by setting it false.
-- **A summary's word budget is sized for the script it is written in.** The
-  ceiling was half the summariser's output cap, two tokens a word being the
-  English figure; JSON escaping and a non-Latin script cost three or four, so
-  the summary of every large unit outgrew the cap, came back cut off, never
-  parsed and never committed — and the next pass paid for the same units
-  again. The rate is now `compaction_summary_output_tokens_per_word` (4), and
-  it caps the fold target the same way.
-
-### Changed
-
-- **A summariser failure costs its own unit, not the whole pass.** Tier 2 used
-  to discard everything a pass had produced as soon as one call failed, so one
-  unit the summariser cannot handle kept a run from shedding a single token
-  and the next pass bought the same failure again. Failures are now counted
-  per unit in `CompactionState.failed_anchor_keys`; past
-  `compaction_summary_failed_unit_max_attempts` (2) the unit is left to the
-  fold tier, and the other units in the batch commit. The census is carried in
-  the run snapshot. A reply carrying no readable summary now counts as a
-  failed call — that is the shape a cut-off reply takes — while a summary that
-  is merely no smaller than the original does not — nor does a transport
-  failure (a rate limit, a 5xx, a reset socket): only a unit that does not fit
-  the summariser's window or whose reply the output cap cut is counted, since
-  only those repeat. The forced passes ignore the census entirely and try
-  every unit, and entries whose unit has left the history are pruned.
-- **The per-turn summariser prompt states its budget in characters too.** It
-  now also says that a longer reply is cut off and discarded, asks for a
-  count and the records that matter instead of a copy of a long tool result,
-  and names the single key it wants. A model that listed every record of a
-  long result wrote a reply the output cap cut, and a cut reply is never
-  parsed. `compaction_summary_chars_per_word` (6) converts the word budget,
-  `compaction_summary_envelope_tokens` (32) reserves room for the JSON around
-  the words before the budget is derived, and the budget is also clamped to
-  what `compaction_summary_string_max_chars` will accept at decode time.
-  The template gains a `max_chars` variable; a per-tenant override that does
-  not use it is unaffected.
-
 ### Added
 
 - **Stale tool results can be cut down in the request view.** With
@@ -89,6 +37,32 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
+- **A summariser failure costs its own unit, not the whole pass.** Tier 2 used
+  to discard everything a pass had produced as soon as one call failed, so one
+  unit the summariser cannot handle kept a run from shedding a single token
+  and the next pass bought the same failure again. Failures are now counted
+  per unit in `CompactionState.failed_anchor_keys`; past
+  `compaction_summary_failed_unit_max_attempts` (2) the unit is left to the
+  fold tier, and the other units in the batch commit. The census is carried in
+  the run snapshot. A reply carrying no readable summary now counts as a
+  failed call — that is the shape a cut-off reply takes — while a summary that
+  is merely no smaller than the original does not — nor does a transport
+  failure (a rate limit, a 5xx, a reset socket): only a unit that does not fit
+  the summariser's window or whose reply the output cap cut is counted, since
+  only those repeat. The forced passes ignore the census entirely and try
+  every unit, and entries whose unit has left the history are pruned.
+- **The per-turn summariser prompt states its budget in characters too.** It
+  now also says that a longer reply is cut off and discarded, asks for a
+  count and the records that matter instead of a copy of a long tool result,
+  and names the single key it wants. A model that listed every record of a
+  long result wrote a reply the output cap cut, and a cut reply is never
+  parsed. `compaction_summary_chars_per_word` (6) converts the word budget,
+  `compaction_summary_envelope_tokens` (32) reserves room for the JSON around
+  the words before the budget is derived, and the budget is also clamped to
+  what `compaction_summary_string_max_chars` will accept at decode time.
+  The template gains a `max_chars` variable; a per-tenant override that does
+  not use it is unaffected.
+
 - **Transient provider failures are retried on the verdict the adapter gives,
   not on the exception type alone.** `LLMError` now carries `retryable`, which
   an adapter sets per raise — `LLMProviderError("no such model",
@@ -100,6 +74,30 @@ All notable changes to this project are recorded here. The format follows
   whose wall-clock budget leaves room only to finalise, starts no further
   attempt, and a cancel during a backoff ends the pause immediately. Every
   attempt logs a WARNING naming the run and the attempt number.
+
+### Fixed
+
+- **The compaction trigger now sits below the prompt size the provider will
+  still accept.** `derive_budgets` takes the lower of
+  `model_context_window * compaction_trigger_ratio` and the window less the
+  output reserve, less `request_context_safety_tokens`, less the new
+  `compaction_trigger_turn_headroom_ratio` (0.15) for the turn about to be
+  added. A server that reserves the output budget inside the context window
+  rejects any prompt above `window - max output`; with the stock 0.8 trigger
+  and 0.25 output reserve the trigger on a 65 536-token window stood above
+  that cliff, so proactive compaction could not fire before the rejection.
+  The emergency cliff is held strictly above the effective trigger. The
+  output-reserve part of the deduction is gated on
+  `provider_reserves_output_in_context_window` (default true): a provider that
+  sizes its input window independently of the requested output gives that
+  share of the window back by setting it false.
+- **A summary's word budget is sized for the script it is written in.** The
+  ceiling was half the summariser's output cap, two tokens a word being the
+  English figure; JSON escaping and a non-Latin script cost three or four, so
+  the summary of every large unit outgrew the cap, came back cut off, never
+  parsed and never committed — and the next pass paid for the same units
+  again. The rate is now `compaction_summary_output_tokens_per_word` (4), and
+  it caps the fold target the same way.
 
 ## [2.0.0a16]
 

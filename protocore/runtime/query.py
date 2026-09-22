@@ -117,6 +117,7 @@ from protocore.contracts.turn_policy import (
 from protocore.contracts.types import (
     PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY,
     SESSION_HISTORY_SEED_METADATA_KEY,
+    SYNTHETIC_RECOVERY_BACKGROUND_WAKE,
     SYNTHETIC_RECOVERY_CIRCUIT_BREAKER,
     SYNTHETIC_RECOVERY_GUARANTEED_TERMINAL,
     SYNTHETIC_RECOVERY_LONGFILE_CONTINUE,
@@ -1384,6 +1385,7 @@ async def _maybe_place_background_wakes(
         Message(
             role=MessageRole.user,
             content_blocks=[TextBlock(text=text)],
+            metadata={SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_BACKGROUND_WAKE},
         )
     )
     persist_history(engine)
