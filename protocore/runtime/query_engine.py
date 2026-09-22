@@ -929,6 +929,10 @@ class QueryEngine:
         # Only one force_compaction attempt allowed per message
         # before the run goes terminal FAILED.
         self._compaction_attempted_for_current_turn: bool = False
+        # A proactive pass performed between assistant messages belongs to the
+        # request that follows it. The next recovery reset consumes this latch
+        # and marks that message's one compaction allowance as already spent.
+        self._proactive_compaction_attempted_for_next_message: bool = False
         # Actual max_tokens on the most recent fitted assistant request. Kept
         # only until this assistant-message boundary so an upstream context
         # rejection can derive a retry ceiling from what was really sent.
@@ -938,9 +942,10 @@ class QueryEngine:
         # pre-fit output budget, so direct correction or partial compaction
         # cannot raise the retry.
         self._context_overflow_retry_max_tokens: int | None = None
-        # A measured overflow may receive one smaller retry before or after the
-        # message's single compaction attempt.
-        self._context_overflow_corrective_retry_attempted: bool = False
+        # Number of strictly smaller output caps issued after context-window
+        # rejections in this message. A separate latch still limits compaction
+        # to one attempt.
+        self._context_overflow_corrective_retry_count: int = 0
         # Iterations the per-iteration compaction gate still skips after a pass that freed nothing.
         self.compaction_backoff_left: int = 0
         # Max-output-tokens recovery: count of "Resume directly" retries
@@ -2121,13 +2126,14 @@ class QueryEngine:
 
         * ``_compaction_attempted_for_current_turn`` — a run that ate two
           distinct PTLs in two separate model calls still gets one recovery
-          attempt each.
+          attempt each. The caller consumes the proactive-compaction latch
+          immediately after this reset when a turn-start or per-iteration pass
+          already prepared the message that is about to open.
         * ``_last_fitted_request_max_tokens`` and
           ``_context_overflow_retry_max_tokens`` — the rejected wire cap and
           its derived retry ceiling belong only to that same model call.
-        * ``_context_overflow_corrective_retry_attempted`` — the message gets
-          at most one provider-measured corrective retry, before or after
-          compaction.
+        * ``_context_overflow_corrective_retry_count`` — the message gets a
+          bounded sequence of strictly smaller corrective output caps.
         * ``_max_output_recovery_count`` — only consecutive
           truncations within one message exhaust the budget.
 
@@ -2154,7 +2160,7 @@ class QueryEngine:
         self._compaction_attempted_for_current_turn = False
         self._last_fitted_request_max_tokens = None
         self._context_overflow_retry_max_tokens = None
-        self._context_overflow_corrective_retry_attempted = False
+        self._context_overflow_corrective_retry_count = 0
         self.compaction_backoff_left = 0
         if self._terminal_backstop_turn_active:
             self._terminal_backstop_turn_active = False

@@ -50,10 +50,10 @@ class LLMContextWindowExceeded(LLMError):
     """Request exceeded provider context window.
 
     Triggers bounded reactive-413 recovery in :mod:`protocore.runtime.query`.
-    When measured provider sizes prove that a smaller output cap fits, the
-    request receives one corrective retry before history is rewritten.
-    Otherwise the runtime force-compacts once. A later overflow may use whichever
-    one of those two actions remains; after both are spent, the run fails.
+    When exact provider sizes prove that a smaller output cap fits, the request
+    may receive one corrective retry before history is rewritten. Otherwise the
+    runtime force-compacts once, then retries with strictly decreasing output
+    caps until one succeeds or the configured attempt bound is exhausted.
     """
 
     def __init__(

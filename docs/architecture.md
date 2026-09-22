@@ -467,6 +467,13 @@ crashes. The shared assistant loop is **not** a single immutable path:
   (`commit_usage`, `fire_lifecycle`, `mark_intent_recovery`,
   `persist_correctness`). Those older recovery branches remain model-agnostic
   and RC-gated.
+
+  Context-window recovery preserves at most one compaction per assistant
+  message. An exact provider prompt count can justify one smaller-cap retry
+  before compaction. A missing or lower-bound count compacts first; subsequent
+  rejections repeatedly reduce the rejected wire cap by
+  `context_overflow_retry_output_ratio`, always strictly, and stop after
+  `context_overflow_retry_max_attempts` or when no smaller positive cap exists.
 - `runtime/loop_strategies.py` — `select_strategy(run_mode)` is the single
   branch point. `DirectStrategy` contributes no pre-action step (the
   auto-tool loop). `DeepStrategy` runs a forced planning tool

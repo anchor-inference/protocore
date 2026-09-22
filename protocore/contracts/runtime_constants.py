@@ -850,10 +850,19 @@ class LoopConstants(BaseModel):
         gt=0.0,
         lt=1.0,
         description=(
-            "Fraction of the rejected assistant output cap used for the single "
-            "provider-measured corrective retry after a context-window rejection. "
-            "The retry runs before compaction when its measured prompt and reduced "
-            "output provably fit; otherwise recovery compacts history first."
+            "Fraction of the rejected assistant output cap used for each bounded "
+            "corrective retry after a context-window rejection. An exact provider "
+            "prompt measurement may permit one retry before compaction; otherwise "
+            "recovery compacts history first and then repeatedly lowers the cap."
+        ),
+    )
+    context_overflow_retry_max_attempts: int = Field(
+        default=13,
+        ge=1,
+        description=(
+            "Maximum number of strictly smaller assistant output caps attempted "
+            "for one message after context-window rejections. The default permits "
+            "halving an 8192-token cap down through the one-token floor."
         ),
     )
     pinned_tool_max_count: int = Field(

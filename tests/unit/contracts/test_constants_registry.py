@@ -548,6 +548,12 @@ class TestLoopGroup:
         assert spec.maximum == 1.0
         assert spec.exclusive_maximum is True
 
+    def test_context_overflow_retry_attempt_bound_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("context_overflow_retry_max_attempts")
+        assert spec.default == 13
+        assert spec.minimum == 1.0
+        assert spec.kind == "int"
+
     def test_a_constant_without_a_bound_has_none(self) -> None:
         spec = build_loop_group().spec("continue_prompt_text")
         assert spec.minimum is None and spec.maximum is None

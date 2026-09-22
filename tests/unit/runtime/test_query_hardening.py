@@ -567,7 +567,11 @@ async def test_context_window_retry_ceiling_does_not_leak_to_the_next_tool_itera
 async def test_context_window_retry_persists_streamed_partial_attempt(
     engine_factory, in_memory_runtime
 ) -> None:
-    rc = LoopConstants(model_context_window=4096, compaction_keep_recent_turns=1)
+    rc = LoopConstants(
+        model_context_window=4096,
+        compaction_keep_recent_turns=1,
+        context_overflow_retry_max_attempts=1,
+    )
     engine = engine_factory(rc=rc)
     llm = _PartialTextThenFailLLM(
         exception=LLMContextWindowExceeded("stream exceeded context"),
@@ -653,6 +657,7 @@ async def test_context_window_exceeded_second_failure_is_terminal(
         model_context_window=65_536,
         llm_output_max_tokens_ratio=0.125,
         compaction_keep_recent_turns=1,
+        context_overflow_retry_max_attempts=1,
     )
     engine = engine_factory(rc=rc)
     failing_llm = _ScriptedFailureLLM(
@@ -688,6 +693,7 @@ async def test_context_window_corrective_retry_is_bounded(
         request_context_safety_tokens=2_048,
         llm_output_max_tokens_ratio=0.125,
         compaction_keep_recent_turns=1,
+        context_overflow_retry_max_attempts=2,
     )
     engine = engine_factory(rc=rc)
     failing_llm = _ScriptedFailureLLM(
@@ -718,6 +724,135 @@ async def test_context_window_corrective_retry_is_bounded(
 
     assert engine.state is LoopState.FAILED
     assert [request.max_tokens for request in failing_llm.calls] == [8_192, 4_096, 1_488]
+
+
+@pytest.mark.asyncio
+async def test_lower_bound_overflow_repeatedly_reduces_cap_after_one_compaction(
+    engine_factory, in_memory_runtime
+) -> None:
+    rc = LoopConstants(
+        model_context_window=65_536,
+        llm_output_max_tokens_ratio=0.125,
+        compaction_keep_recent_turns=1,
+    )
+    engine = engine_factory(rc=rc)
+    failing_llm = _ScriptedFailureLLM(
+        exceptions=[
+            LLMContextWindowExceeded(
+                "prompt contains at least a lower bound",
+                context_window=65_536,
+                requested_output_tokens=cap,
+            )
+            for cap in (8_192, 4_096, 2_048)
+        ],
+    )
+    engine.llm = failing_llm  # type: ignore[assignment]
+    engine.context_manager._compaction_llm = failing_llm  # type: ignore[attr-defined]
+    engine.compaction_llm = failing_llm  # type: ignore[assignment]
+
+    events = [
+        event
+        async for event in engine.run(
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+        )
+    ]
+
+    assert engine.state is LoopState.COMPLETED
+    assert [request.max_tokens for request in failing_llm.calls] == [
+        8_192,
+        4_096,
+        2_048,
+        1_024,
+    ]
+    assert sum(event.type is EventType.COMPACTION_STARTED for event in events) == 1
+
+
+@pytest.mark.asyncio
+async def test_proactive_no_progress_compaction_is_not_repeated_after_overflow(
+    engine_factory, in_memory_runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rc = LoopConstants(
+        model_context_window=65_536,
+        llm_output_max_tokens_ratio=0.125,
+        compaction_keep_recent_turns=1,
+    )
+    engine = engine_factory(rc=rc)
+    failing_llm = _ScriptedFailureLLM(
+        exceptions=[
+            LLMContextWindowExceeded(
+                "prompt contains at least a lower bound",
+                context_window=65_536,
+                requested_output_tokens=cap,
+            )
+            for cap in (8_192, 4_096)
+        ],
+    )
+    engine.llm = failing_llm  # type: ignore[assignment]
+    engine.context_manager._compaction_llm = failing_llm  # type: ignore[attr-defined]
+    engine.compaction_llm = failing_llm  # type: ignore[assignment]
+    monkeypatch.setattr(engine, "needs_emergency_compaction", lambda: True)
+
+    events = [
+        event
+        async for event in engine.run(
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+        )
+    ]
+
+    assert engine.state is LoopState.COMPLETED
+    assert engine.compaction_state.retry_count > 0
+    assert [request.max_tokens for request in failing_llm.calls] == [
+        8_192,
+        4_096,
+        2_048,
+    ]
+    assert [
+        event.payload.get("reason")
+        for event in events
+        if event.type is EventType.COMPACTION_STARTED
+    ] == ["proactive_emergency"]
+
+
+@pytest.mark.asyncio
+async def test_lower_bound_overflow_stops_at_configured_reduction_bound(
+    engine_factory, in_memory_runtime
+) -> None:
+    rc = LoopConstants(
+        model_context_window=65_536,
+        llm_output_max_tokens_ratio=0.125,
+        compaction_keep_recent_turns=1,
+        context_overflow_retry_max_attempts=3,
+    )
+    engine = engine_factory(rc=rc)
+    failing_llm = _ScriptedFailureLLM(
+        exceptions=[
+            LLMContextWindowExceeded(
+                "prompt contains at least a lower bound",
+                context_window=65_536,
+                requested_output_tokens=cap,
+            )
+            for cap in (8_192, 4_096, 2_048, 1_024)
+        ],
+    )
+    engine.llm = failing_llm  # type: ignore[assignment]
+    engine.context_manager._compaction_llm = failing_llm  # type: ignore[attr-defined]
+    engine.compaction_llm = failing_llm  # type: ignore[assignment]
+
+    events = [
+        event
+        async for event in engine.run(
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+        )
+    ]
+
+    assert engine.state is LoopState.FAILED
+    assert [request.max_tokens for request in failing_llm.calls] == [
+        8_192,
+        4_096,
+        2_048,
+        1_024,
+    ]
+    assert sum(event.type is EventType.COMPACTION_STARTED for event in events) == 1
 
 
 # ----------------------------------------------------------------------
@@ -848,14 +983,14 @@ def test_reset_recovery_state_resets_compaction_attempted(
     engine._compaction_attempted_for_current_turn = True
     engine._last_fitted_request_max_tokens = 8_192
     engine._context_overflow_retry_max_tokens = 4_096
-    engine._context_overflow_corrective_retry_attempted = True
+    engine._context_overflow_corrective_retry_count = 1
 
     engine.reset_recovery_state()
 
     assert engine._compaction_attempted_for_current_turn is False
     assert engine._last_fitted_request_max_tokens is None
     assert engine._context_overflow_retry_max_tokens is None
-    assert engine._context_overflow_corrective_retry_attempted is False
+    assert engine._context_overflow_corrective_retry_count == 0
 
 
 def test_context_window_retry_cap_only_applies_inside_the_recovery_boundary(
@@ -882,6 +1017,7 @@ def test_new_engine_has_recovery_flags_reset(engine_factory) -> None:
     assert engine._compaction_attempted_for_current_turn is False
     assert engine._last_fitted_request_max_tokens is None
     assert engine._context_overflow_retry_max_tokens is None
+    assert engine._context_overflow_corrective_retry_count == 0
     assert engine._max_output_recovery_count == 0
     assert engine._provider_chain_advances == 0
 
@@ -1709,7 +1845,11 @@ async def test_death_spiral_guard_set_on_post_retry_ptl(
     engine_factory, in_memory_runtime
 ) -> None:
     """``LLMContextWindowExceeded`` after the recovery retry MUST set the guard."""
-    rc = LoopConstants(model_context_window=4096, compaction_keep_recent_turns=1)
+    rc = LoopConstants(
+        model_context_window=4096,
+        compaction_keep_recent_turns=1,
+        context_overflow_retry_max_attempts=1,
+    )
     engine = engine_factory(rc=rc)
     failing_llm = _ScriptedFailureLLM(
         exceptions=[
