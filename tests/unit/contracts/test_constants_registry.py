@@ -587,6 +587,20 @@ class TestLoopGroup:
         assert spec.default == "Cite exactly:,Cite:,cite_as:,Source:"
         assert spec.kind == "str"
 
+    def test_exact_token_counting_is_dashboard_configurable(self) -> None:
+        group = build_loop_group()
+        enabled = group.spec("exact_token_count_enabled")
+        assert enabled.default is True and enabled.kind == "bool"
+        margin = group.spec("exact_token_count_margin_ratio")
+        assert margin.default == 0.75
+        assert margin.minimum == 0.0 and margin.maximum == 1.0
+        cache = group.spec("exact_token_count_cache_max_entries")
+        assert cache.default == 32 and cache.kind == "int"
+        assert cache.exclusive_minimum is True
+        timeout = group.spec("exact_token_count_timeout_seconds")
+        assert timeout.default == 5.0 and timeout.kind == "float"
+        assert timeout.exclusive_minimum is True
+
     def test_context_overflow_retry_attempt_bound_is_dashboard_configurable(self) -> None:
         spec = build_loop_group().spec("context_overflow_retry_max_attempts")
         assert spec.default == 13

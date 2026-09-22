@@ -512,14 +512,26 @@ crashes. The shared assistant loop is **not** a single immutable path:
   `IRequestTokenCounter` capability is asked what the request renders to, and
   that count is used instead. The same question is asked of the durable history
   when it is within the margin of the compaction trigger, so the gate decides
-  on the provider's tokens. An exact count sets `token_estimate_calibration`
-  outright; a usage report after the call moves it half-way; a rejection for
-  length raises it to the floor the rejection proves (the prompt was at least
-  the window less the output cap the loop sent). Counts are kept per request
-  content (`exact_token_count_cache_max_entries`); a count that fails is logged
-  and the estimate is used; a provider without the capability sends exactly
-  the requests it sent before. Each count logs the estimate beside the
-  measurement, which is the drift between the two.
+  on the provider's tokens — until a fit has counted the turn's full request,
+  after which the gate reads the factor that count set instead of paying a
+  second round-trip. The default margin, 0.75, is `1 - 1/4`: an undercount by
+  a factor `f` is only caught when the margin is at least `1 - 1/f`, the
+  heuristic was measured running 1.76x short on JSON and 3.53x on hexadecimal
+  text, and 4 is the largest factor calibration can express. An exact count
+  sets `token_estimate_calibration` outright, and does so before the fit is
+  attempted, so a count that proves the request cannot fit raises the factor
+  first and the refusal goes to compaction sized in the counted tokens; a usage
+  report after the call moves it half-way; a rejection for length raises it to
+  the floor the rejection proves (the prompt was at least the window less the
+  output cap the loop sent). Counts are kept per request content
+  (`exact_token_count_cache_max_entries`); a count that fails or does not
+  arrive within `exact_token_count_timeout_seconds` is logged and the estimate
+  is used; a provider without the capability sends exactly the requests it
+  sent before. Each fresh count logs the estimate beside the measurement,
+  which is the drift between the two. The learned factor lives in the run's
+  snapshot and survives a resume on the same model; a new run starts from the
+  configured `token_estimate_calibration`, so a host that knows its content
+  runs dense seeds that value per scope.
 - `runtime/context/compaction.py` — three passes over the transcript, in
   order, each one taking what the pass before it could not.
   **Tier 1** replaces an over-budget tool result with a placeholder and puts

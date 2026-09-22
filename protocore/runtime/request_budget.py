@@ -10,6 +10,7 @@ kept per request content so a retry of the same request is not counted twice.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
@@ -150,13 +151,19 @@ async def count_request_tokens_exactly(
     rc: LoopConstants,
     *,
     cache: ExactTokenCountCache | None = None,
+    estimate: int | None = None,
 ) -> int | None:
     """Ask ``provider`` what ``request`` renders to; ``None`` when it cannot say.
 
     ``None`` covers a provider without the capability, the capability switched
-    off, an endpoint that has no counting route, and a count that failed. A
+    off, an endpoint that has no counting route, and a count that failed or did
+    not arrive within :attr:`LoopConstants.exact_token_count_timeout_seconds`. A
     failure is logged; the others are the ordinary state of most providers and
     are not.
+
+    A fresh count is logged beside ``estimate``, when one is given — that line
+    is the drift between the heuristic and the provider. A count served from
+    ``cache`` was logged when it was made and is not logged again.
     """
     if not rc.exact_token_count_enabled:
         return None
@@ -173,7 +180,9 @@ async def count_request_tokens_exactly(
         if cached is not None:
             return cached
     try:
-        measured = await counter(request)
+        measured = await asyncio.wait_for(
+            counter(request), timeout=rc.exact_token_count_timeout_seconds
+        )
     except Exception as exc:
         _logger.warning(
             "exact request token count failed for model=%s; using the estimate (err=%s)",
@@ -192,6 +201,15 @@ async def count_request_tokens_exactly(
         return None
     if key is not None and cache is not None:
         cache.put(key, measured, max_entries=rc.exact_token_count_cache_max_entries)
+    if estimate is not None:
+        _logger.warning(
+            "DIAG request_budget.exact_count model=%s estimate=%d measured=%d "
+            "drift_ratio=%.3f",
+            request.model,
+            estimate,
+            measured,
+            measured / estimate if estimate > 0 else 0.0,
+        )
     return measured
 
 
@@ -214,6 +232,7 @@ async def fit_request_to_context_measured(
     provider: object,
     *,
     cache: ExactTokenCountCache | None = None,
+    on_measured: Callable[[int], None] | None = None,
 ) -> FittedRequest:
     """:func:`fit_request_to_context`, sized by the provider near the edge.
 
@@ -225,6 +244,17 @@ async def fit_request_to_context_measured(
     request itself is not changed by being counted: with no counter, or with a
     count that failed, the result is exactly what :func:`fit_request_to_context`
     returns.
+
+    ``on_measured`` receives the count BEFORE the fit is attempted. A count
+    that proves the request cannot fit is the strongest evidence the loop ever
+    gets about its estimate, and the fit raises on exactly that count; handed
+    over afterwards, it would be lost with the exception and the recovery that
+    follows would size history with the undercount the count had just exposed.
+
+    A refusal that rests on a count says so in its message, and deliberately
+    carries no sizes: the rejection handler reads sizes as proof that a smaller
+    output cap fits, and a prompt that alone fills the window is answered by
+    compaction, never by a smaller cap.
     """
     estimate = estimate_request_prompt_tokens(request, rc)
     # Recovered from the calibrated figure rather than estimated a second time:
@@ -236,19 +266,22 @@ async def fit_request_to_context_measured(
         rc.model_context_window - rc.request_context_safety_tokens - request.max_tokens
     )
     if near_limit(estimate, clip_limit, rc):
-        measured = await count_request_tokens_exactly(request, provider, rc, cache=cache)
-    if measured is not None:
-        _logger.warning(
-            "DIAG request_budget.exact_count model=%s estimate=%d measured=%d "
-            "drift_ratio=%.3f",
-            request.model,
-            estimate,
-            measured,
-            measured / estimate if estimate > 0 else 0.0,
+        measured = await count_request_tokens_exactly(
+            request, provider, rc, cache=cache, estimate=estimate
         )
-    fitted = _fit_to_prompt_tokens(
-        request, rc, measured if measured is not None else estimate
-    )
+    if measured is None:
+        fitted = _fit_to_prompt_tokens(request, rc, estimate)
+    else:
+        if on_measured is not None:
+            on_measured(measured)
+        try:
+            fitted = _fit_to_prompt_tokens(request, rc, measured)
+        except LLMContextWindowExceeded as exc:
+            raise LLMContextWindowExceeded(
+                "counted prompt fills the usable model context window "
+                f"({measured} tokens; context={rc.model_context_window}, "
+                f"safety={rc.request_context_safety_tokens})"
+            ) from exc
     return FittedRequest(
         request=fitted,
         raw_estimate=raw,

@@ -951,6 +951,8 @@ class QueryEngine:
         self._last_dispatched_prompt: tuple[str, int] | None = None
         # Exact counts a provider has already made of this run's requests.
         self._exact_token_counts = ExactTokenCountCache()
+        # The model an exact count last calibrated the estimate for, this turn.
+        self._exact_count_model: str | None = None
         # One-shot ceiling for a rebuilt request after an upstream context
         # rejection. Derived from the rejected wire cap, never from the
         # pre-fit output budget, so direct correction or partial compaction

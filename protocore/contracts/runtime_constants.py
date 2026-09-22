@@ -132,7 +132,11 @@ class LoopConstants(BaseModel):
             "text, by a factor that depends on the content; when a provider reports "
             "the true size of a prompt, the loop sets this so that the tiers size "
             "units, budgets and gains in the provider's tokens rather than in an "
-            "undercount that leaves them nothing to shrink. 1.0 = uncalibrated."
+            "undercount that leaves them nothing to shrink. 1.0 = uncalibrated. "
+            "What a run learns is kept in its snapshot and restored on resume for "
+            "the same model, but a new run starts from this value: a host that "
+            "knows its model and content runs above the heuristic sets it per "
+            "scope, and every new run starts from that instead of from 1.0."
         ),
     )
     token_estimate_calibration_enabled: bool = Field(
@@ -152,7 +156,7 @@ class LoopConstants(BaseModel):
         ),
     )
     exact_token_count_margin_ratio: float = Field(
-        default=0.5,
+        default=0.75,
         ge=0.0,
         le=1.0,
         description=(
@@ -160,10 +164,22 @@ class LoopConstants(BaseModel):
             "asked for an exact count, as a share of that limit: the count is "
             "requested once the estimate reaches limit * (1 - ratio). The limits "
             "are the prompt size at which the output cap starts being clipped and "
-            "the compaction trigger. The estimate can run several times short of "
-            "the real tokenizer on dense text such as hexadecimal or base64, so a "
-            "narrow margin lets exactly the prompts that need counting slip past. "
-            "0 asks only once the estimate itself is over the limit."
+            "the compaction trigger. A prompt the estimate undercounts by a factor "
+            "f is only caught when ratio >= 1 - 1/f. Measured against a vLLM "
+            "tokenizer (Qwen 3.6), the heuristic undercounts JSON by 1.76x and "
+            "hexadecimal text by 3.53x, which needs 0.72; 0.75 is 1 - 1/4, the "
+            "largest undercount token_estimate_calibration can express. 0 asks "
+            "only once the estimate itself is over the limit."
+        ),
+    )
+    exact_token_count_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0.0,
+        description=(
+            "How long the loop waits for a provider's exact count before it "
+            "sizes the request by its estimate instead. The count is asked before "
+            "the stream opens, outside the stream's idle watchdog, so an endpoint "
+            "that does not answer would otherwise hold the turn."
         ),
     )
     exact_token_count_cache_max_entries: int = Field(

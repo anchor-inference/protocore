@@ -10,8 +10,10 @@ capability sends exactly the requests it sent before.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import secrets
 from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import MagicMock
@@ -26,13 +28,21 @@ from protocore.contracts.llm import (
     LLMStreamEvent,
 )
 from protocore.contracts.runtime_constants import LoopConstants
-from protocore.contracts.types import Message, MessageRole, StopReason, TextBlock
+from protocore.contracts.types import (
+    Message,
+    MessageRole,
+    StopReason,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 from protocore.runtime.loop_state import LoopState
 from protocore.runtime.query import _calibrate_near_compaction_trigger
 from protocore.runtime.request_budget import (
     ExactTokenCountCache,
     count_request_tokens_exactly,
     estimate_request_prompt_tokens,
+    estimate_request_prompt_tokens_uncalibrated,
     fit_request_to_context,
     fit_request_to_context_measured,
     near_limit,
@@ -70,10 +80,10 @@ class _Provider:
     async def complete_structured(  # type: ignore[no-untyped-def]
         self, request: LLMRequest, schema: dict[str, Any]
     ) -> LLMResponse:
-        return LLMResponse(content='{"summary": "s"}', stop_reason=StopReason.end_turn)
+        return LLMResponse(message=_msg("brief summary", MessageRole.assistant), stop_reason=StopReason.end_turn)
 
     async def complete_text(self, request: LLMRequest) -> LLMResponse:
-        return LLMResponse(content="s", stop_reason=StopReason.end_turn)
+        return LLMResponse(message=_msg("brief summary", MessageRole.assistant), stop_reason=StopReason.end_turn)
 
     def count_tokens(self, text: str, model: str | None = None) -> int:
         return len(text) // 4
@@ -311,7 +321,7 @@ async def test_a_rejection_for_length_raises_calibration_to_the_proven_floor(
     floor = rc.model_context_window - rejected.max_tokens + 1
     expected = round(min(floor / raw, 4.0), 3)
     assert expected > 1.0
-    assert engine.config.rc.token_estimate_calibration >= expected
+    assert engine.config.rc.token_estimate_calibration == expected
 
 
 @pytest.mark.asyncio
@@ -330,7 +340,7 @@ async def test_a_quoted_prompt_size_is_used_as_the_floor(engine_factory: Any) ->
         pass
     rejected = provider.calls[0]
     raw = round(estimate_request_prompt_tokens(rejected, rc) / rc.token_estimate_calibration)
-    assert engine.config.rc.token_estimate_calibration >= round(min(60_000 / raw, 4.0), 3)
+    assert engine.config.rc.token_estimate_calibration == round(min(60_000 / raw, 4.0), 3)
 
 
 @pytest.mark.asyncio
@@ -398,3 +408,134 @@ async def test_the_gate_asks_nothing_far_from_the_trigger(engine_factory: Any) -
 
     assert provider.counted == []
     assert engine.config.rc.token_estimate_calibration == 1.0
+
+
+class _FitOnlyCounter(_CountingProvider):
+    """Counts only the requests the fit sizes — the built ones, which carry observability.
+
+    The compaction gate counts the bare history; leaving it unanswered isolates
+    what the fit does with a count that proves the request cannot fit.
+    """
+
+    def __init__(self, *, ratio: float, rc: LoopConstants) -> None:
+        super().__init__()
+        self.ratio = ratio
+        self.rc = rc
+
+    async def count_request_tokens(self, request: LLMRequest) -> int | None:
+        if request.observability is None:
+            return None
+        self.counted.append(request)
+        return round(estimate_request_prompt_tokens_uncalibrated(request, self.rc) * self.ratio)
+
+
+@pytest.mark.asyncio
+async def test_a_count_that_proves_overflow_calibrates_before_the_refusal(
+    engine_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rc = _turn_rc()
+    engine = engine_factory(rc=rc)
+    provider = _FitOnlyCounter(ratio=3.5, rc=rc)
+    _install(engine, provider)
+    compactions = 0
+    force_compaction = engine.context_manager.force_compaction
+
+    async def tracked(**kwargs: Any) -> Any:
+        nonlocal compactions
+        compactions += 1
+        return await force_compaction(**kwargs)
+
+    monkeypatch.setattr(engine.context_manager, "force_compaction", tracked)
+    # Earlier turns of this session read dense tool output: hexadecimal, which
+    # the heuristic undercounts by about 3.5x against a real tokenizer.
+    engine.history.append(_msg("dump the device registers"))
+    for i in range(12):
+        engine.history.append(
+            Message(
+                role=MessageRole.assistant,
+                content_blocks=[
+                    ToolUseBlock(tool_call_id=f"t{i}", name="Bash", arguments_json='{"cmd":"xxd"}')
+                ],
+            )
+        )
+        engine.history.append(
+            Message(
+                role=MessageRole.tool,
+                content_blocks=[ToolResultBlock(tool_call_id=f"t{i}", content=secrets.token_hex(3_500))],
+            )
+        )
+    engine.history.append(_msg("done", MessageRole.assistant))
+
+    async for _ in engine.run(_msg(secrets.token_hex(1_000))):
+        pass
+
+    counted = provider.counted[0]
+    raw = estimate_request_prompt_tokens_uncalibrated(counted, rc)
+    measured = round(raw * 3.5)
+    assert measured >= rc.model_context_window - rc.request_context_safety_tokens
+    # The factor is the counted ratio, set before the fit refused the request —
+    # not the 1.0 the refusal used to leave behind.
+    assert engine.config.rc.token_estimate_calibration == round(measured / raw, 3)
+    # The refusal went to the same recovery a provider rejection gets.
+    assert compactions >= 1
+    # And the recovery, sized in the counted tokens, got the turn through.
+    assert engine.state is LoopState.COMPLETED
+    assert provider.calls
+
+
+class _SlowCounter(_CountingProvider):
+    async def count_request_tokens(self, request: LLMRequest) -> int | None:
+        self.counted.append(request)
+        await asyncio.sleep(3600)
+        return 1
+
+
+@pytest.mark.asyncio
+async def test_a_counter_that_does_not_answer_in_time_falls_back(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rc = _rc(exact_token_count_timeout_seconds=0.01)
+    request = _near_edge_request(rc)
+    with caplog.at_level(logging.WARNING, logger="protocore.runtime.request_budget"):
+        fitted = await fit_request_to_context_measured(request, rc, _SlowCounter())
+    assert fitted.measured is None
+    assert fitted.request.model_dump_json() == fit_request_to_context(request, rc).model_dump_json()
+    assert any("exact request token count failed" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_the_drift_line_is_written_once_per_count_not_per_cache_hit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rc = _rc()
+    request = _near_edge_request(rc)
+    provider = _CountingProvider(count=1_000)
+    cache = ExactTokenCountCache()
+    with caplog.at_level(logging.WARNING, logger="protocore.runtime.request_budget"):
+        for _ in range(3):
+            await fit_request_to_context_measured(request, rc, provider, cache=cache)
+    drift = [r for r in caplog.records if "request_budget.exact_count" in r.getMessage()]
+    assert len(provider.counted) == 1
+    assert len(drift) == 1
+
+
+@pytest.mark.asyncio
+async def test_after_the_fit_has_counted_the_gate_does_not_count_again(engine_factory: Any) -> None:
+    rc = _turn_rc()
+    engine = engine_factory(rc=rc)
+    provider = _CountingProvider(count=rc.model_context_window // 2)
+    _install(engine, provider)
+    engine.history.append(_msg("0123456789abcdef" * 6_000))
+
+    await _calibrate_near_compaction_trigger(engine)
+    assert len(provider.counted) == 1
+    engine._exact_count_model = engine.effective_model_name
+    await _calibrate_near_compaction_trigger(engine)
+    assert len(provider.counted) == 1
+
+
+def test_the_default_margin_covers_the_largest_undercount_calibration_can_express() -> None:
+    rc = LoopConstants()
+    ceiling = LoopConstants.model_fields["token_estimate_calibration"].metadata
+    largest = max(getattr(m, "le", 0) or 0 for m in ceiling)
+    assert rc.exact_token_count_margin_ratio >= 1 - 1 / largest

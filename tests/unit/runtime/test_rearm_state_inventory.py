@@ -74,6 +74,7 @@ _RESET_ON_REARM: frozenset[str] = frozenset(
         # same request, and the counts made of this turn's requests.
         "_last_dispatched_prompt",
         "_exact_token_counts",
+        "_exact_count_model",
         "_wire_round_seq",
         "_pending_tool_call_names",
         "_pending_interrupts",

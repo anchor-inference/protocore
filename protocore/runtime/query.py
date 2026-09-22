@@ -4687,12 +4687,17 @@ async def _drive_one_stream(
     # same exception a provider does, and the rejection handler must not read
     # a size the provider never saw as evidence about this request.
     engine._last_dispatched_prompt = None
+    counted_request = request
     fitted = await fit_request_to_context_measured(
-        request, rc, engine.llm, cache=engine._exact_token_counts
+        request,
+        rc,
+        engine.llm,
+        cache=engine._exact_token_counts,
+        on_measured=lambda measured: _calibrate_token_estimate(
+            engine, counted_request, measured, exact=True
+        ),
     )
     request = fitted.request
-    if fitted.measured is not None:
-        _calibrate_token_estimate(engine, request, fitted.measured, exact=True)
 
     block_idx = engine.next_block_idx()
     # Track the KIND of the currently-open content block, not a bare
@@ -5179,6 +5184,8 @@ def _calibrate_token_estimate(
     raw = estimate_request_prompt_tokens_uncalibrated(request, rc)
     if raw <= 0:
         return
+    if exact:
+        engine._exact_count_model = request.model
     measured = min(max(observed / raw, 1.0), 4.0)
     current = rc.token_estimate_calibration
     smoothed = round(measured if exact else current + (measured - current) * 0.5, 3)
@@ -5262,22 +5269,23 @@ async def _calibrate_near_compaction_trigger(engine: QueryEngine) -> None:
     rc = engine.config.rc
     if not rc.exact_token_count_enabled or not engine.history:
         return
+    if engine._exact_count_model == engine.effective_model_name:
+        # The factor already comes from a count the fit made of this turn's
+        # full request, which is this history plus the system prompt and the
+        # tools. Counting the history alone as well would be a second
+        # round-trip per iteration for a figure the next fit refreshes anyway,
+        # and a request that has outgrown the window since is refused by that
+        # fit on its own count and sent to compaction.
+        return
     estimate = engine.context_manager.current_prompt_tokens(engine.history)
     if not near_limit(estimate, derive_budgets(rc).compaction_trigger_tokens, rc):
         return
     request = LLMRequest(model=engine.effective_model_name, messages=list(engine.history))
     measured = await count_request_tokens_exactly(
-        request, engine.llm, rc, cache=engine._exact_token_counts
+        request, engine.llm, rc, cache=engine._exact_token_counts, estimate=estimate
     )
     if measured is None:
         return
-    _logger.warning(
-        "DIAG request_budget.exact_count_gate run=%s model=%s estimate=%d measured=%d",
-        engine.config.run_id,
-        request.model,
-        estimate,
-        measured,
-    )
     _calibrate_token_estimate(engine, request, measured, exact=True)
 
 
