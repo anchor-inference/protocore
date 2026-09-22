@@ -412,6 +412,34 @@ class ILLMProvider(Protocol):
 
 
 @runtime_checkable
+class IRequestTokenCounter(Protocol):
+    """Optional provider capability: the size of a request as the server renders it.
+
+    Not part of :class:`ILLMProvider`, so a provider that cannot count is left
+    exactly as it is. The runtime looks the method up on the provider's class and
+    asks it only when its own estimate is close to a limit
+    (:attr:`LoopConstants.exact_token_count_margin_ratio`), so an endpoint pays
+    for the round-trip only on the requests whose size decides something.
+
+    The count covers what the server would tokenize for this request: the
+    messages rendered through its chat template together with the tool
+    definitions and the generation prompt. It is the prompt's size, not the
+    prompt plus ``max_tokens``.
+
+    Return ``None`` when this endpoint cannot count the request (the capability
+    is switched off for it, or the server has no counting route); the runtime
+    then uses its estimate and says nothing. Raise when counting failed; the
+    runtime logs a warning and uses its estimate. Either way the request that is
+    eventually sent is the one that would have been sent without the count,
+    apart from an output cap fitted to the measured size.
+    """
+
+    async def count_request_tokens(self, request: LLMRequest) -> int | None:
+        """The prompt tokens ``request`` renders to, or ``None`` when unknown."""
+        ...
+
+
+@runtime_checkable
 class IProviderChain(Protocol):
     """The ordered providers one consumer may run on, plus a cursor over them.
 
@@ -467,6 +495,7 @@ __all__ = [
     "CacheBreakpoint",
     "ILLMProvider",
     "IProviderChain",
+    "IRequestTokenCounter",
     "LLMContextWindowExceeded",
     "LLMError",
     "LLMObservabilityContext",

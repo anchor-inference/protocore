@@ -504,6 +504,22 @@ crashes. The shared assistant loop is **not** a single immutable path:
   that sizes its input window independently of the requested output sets it
   false and gets that share of the window back. Consumers read the effective
   value; the emergency cliff is held strictly above it.
+- `runtime/request_budget.py` — fits every assembled request to the hard
+  window by clipping its output cap. The size it fits to is the calibrated
+  estimate, except near the edge: once the estimate reaches
+  `exact_token_count_margin_ratio` of the prompt size at which the cap starts
+  being clipped, a provider that implements the optional
+  `IRequestTokenCounter` capability is asked what the request renders to, and
+  that count is used instead. The same question is asked of the durable history
+  when it is within the margin of the compaction trigger, so the gate decides
+  on the provider's tokens. An exact count sets `token_estimate_calibration`
+  outright; a usage report after the call moves it half-way; a rejection for
+  length raises it to the floor the rejection proves (the prompt was at least
+  the window less the output cap the loop sent). Counts are kept per request
+  content (`exact_token_count_cache_max_entries`); a count that fails is logged
+  and the estimate is used; a provider without the capability sends exactly
+  the requests it sent before. Each count logs the estimate beside the
+  measurement, which is the drift between the two.
 - `runtime/context/compaction.py` — three passes over the transcript, in
   order, each one taking what the pass before it could not.
   **Tier 1** replaces an over-budget tool result with a placeholder and puts

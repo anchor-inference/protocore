@@ -6,6 +6,31 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **A provider can size the rendered request, and is asked near the edge.**
+  The optional `IRequestTokenCounter` capability
+  (`async count_request_tokens(request) -> int | None`) reports the prompt
+  tokens the server renders a request to. When the estimate is within
+  `exact_token_count_margin_ratio` (default 0.5) of the point where the output
+  cap starts being clipped, or of the compaction trigger, the loop asks for it
+  and fits the request — or runs the gate — on that number. Counts are kept per
+  request content (`exact_token_count_cache_max_entries`, default 32) and can be
+  switched off with `exact_token_count_enabled`. A provider without the
+  capability sends exactly the requests it sent before; a count that fails is
+  logged and the estimate is used.
+
+### Fixed
+
+- **The token estimate learns from a count and from a rejection.** An exact
+  count sets `token_estimate_calibration` to the measured ratio at once, instead
+  of waiting for a usage report after the call. A rejection for length, which
+  never carries usage, now raises the factor to the floor it proves — the prompt
+  was at least the window less the output cap that was sent — so the recovery
+  that follows no longer sizes history with the undercount that let the request
+  through. On dense text such as hexadecimal filler the estimate had run at well
+  under two thirds of the server's count.
+
 ## [2.0.0a18]
 
 ### Fixed

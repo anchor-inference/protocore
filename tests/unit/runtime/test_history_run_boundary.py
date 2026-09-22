@@ -598,6 +598,10 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/query_engine.py::QueryEngine.needs_compaction": _whole(
         "token accounting over the whole transcript"
     ),
+    "protocore/runtime/query.py::_calibrate_near_compaction_trigger": _whole(
+        "sizes the same whole transcript the compaction gate measures, so the "
+        "gate reads the provider's count of what it decides on"
+    ),
     "protocore/runtime/query_engine.py::QueryEngine.needs_emergency_compaction": _whole(
         "token accounting over the whole transcript"
     ),

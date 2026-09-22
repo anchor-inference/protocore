@@ -142,6 +142,38 @@ class LoopConstants(BaseModel):
             "sizes providers report. Off, the estimate stays at its configured factor."
         ),
     )
+    exact_token_count_enabled: bool = Field(
+        default=True,
+        description=(
+            "Whether the loop asks a provider that can count a rendered request "
+            "for that count when the estimate is close to a limit. Only providers "
+            "that implement the counting capability are asked; for every other "
+            "provider this setting changes nothing."
+        ),
+    )
+    exact_token_count_margin_ratio: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "How close to a limit the estimate has to be before the provider is "
+            "asked for an exact count, as a share of that limit: the count is "
+            "requested once the estimate reaches limit * (1 - ratio). The limits "
+            "are the prompt size at which the output cap starts being clipped and "
+            "the compaction trigger. The estimate can run several times short of "
+            "the real tokenizer on dense text such as hexadecimal or base64, so a "
+            "narrow margin lets exactly the prompts that need counting slip past. "
+            "0 asks only once the estimate itself is over the limit."
+        ),
+    )
+    exact_token_count_cache_max_entries: int = Field(
+        default=32,
+        gt=0,
+        description=(
+            "Exact counts a run keeps, keyed by the content of the request they "
+            "measured, so a request re-sized on a retry is not counted twice."
+        ),
+    )
     compaction_per_iteration_enabled: bool = Field(
         default=True,
         description=(

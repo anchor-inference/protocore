@@ -108,6 +108,7 @@ from protocore.runtime.loop_state import (
     assert_transition,
     is_terminal,
 )
+from protocore.runtime.request_budget import ExactTokenCountCache
 from protocore.runtime.usage import TokenUsage
 
 _logger = logging.getLogger(__name__)
@@ -944,6 +945,12 @@ class QueryEngine:
         # only until this assistant-message boundary so an upstream context
         # rejection can derive a retry ceiling from what was really sent.
         self._last_fitted_request_max_tokens: int | None = None
+        # The model and the heuristic's raw size of the request last handed to
+        # the provider. A rejection for length reads it to learn how far the
+        # estimate ran short; ``None`` while nothing has been sent this message.
+        self._last_dispatched_prompt: tuple[str, int] | None = None
+        # Exact counts a provider has already made of this run's requests.
+        self._exact_token_counts = ExactTokenCountCache()
         # One-shot ceiling for a rebuilt request after an upstream context
         # rejection. Derived from the rejected wire cap, never from the
         # pre-fit output budget, so direct correction or partial compaction
@@ -2172,6 +2179,7 @@ class QueryEngine:
         self._compaction_attempted_for_current_turn = False
         self._reactive_compaction_attempted_for_current_turn = False
         self._last_fitted_request_max_tokens = None
+        self._last_dispatched_prompt = None
         self._context_overflow_retry_max_tokens = None
         self._context_overflow_corrective_retry_count = 0
         self.compaction_backoff_left = 0

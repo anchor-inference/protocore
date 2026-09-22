@@ -199,8 +199,10 @@ from protocore.runtime.loop_state import LoopState
 from protocore.runtime.loop_strategies import select_strategy
 from protocore.runtime.prompt_caching import apply_system_and_3
 from protocore.runtime.request_budget import (
+    count_request_tokens_exactly,
     estimate_request_prompt_tokens_uncalibrated,
-    fit_request_to_context,
+    fit_request_to_context_measured,
+    near_limit,
 )
 from protocore.runtime.result_eviction import evict_history_for_llm, tool_name_for_result
 from protocore.runtime.run_work_budget import (
@@ -2215,6 +2217,7 @@ async def _drive_turn(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
     # than the routine gated pass, so the wire payload is aggressively shrunk
     # before the first stream. RC-gated kill-switch
     # (``compaction_emergency_proactive_enabled``, default on).
+    await _calibrate_near_compaction_trigger(engine)
     _emergency_turn_start = (
         engine.config.rc.compaction_emergency_proactive_enabled
         and engine.needs_emergency_compaction()
@@ -4309,6 +4312,8 @@ async def _stream_one_assistant_message(
         # The results of the batch just dispatched are in history and the
         # next stream is about to be built from all of it — the seam where
         # the transcript grows, and so the seam the compaction gate sits at.
+        if engine.config.rc.compaction_per_iteration_enabled:
+            await _calibrate_near_compaction_trigger(engine)
         _turn = _turn_at(engine, flags, TurnCoordinate.iteration_end)
         async for _policy_evt in policies.apply(_turn):
             yield _policy_evt
@@ -4678,7 +4683,16 @@ async def _drive_one_stream(
             call_category=_provider_call_category(engine),
         ),
     )
-    request = fit_request_to_context(request, rc)
+    # Cleared before the fit: a fit that refuses the request locally raises the
+    # same exception a provider does, and the rejection handler must not read
+    # a size the provider never saw as evidence about this request.
+    engine._last_dispatched_prompt = None
+    fitted = await fit_request_to_context_measured(
+        request, rc, engine.llm, cache=engine._exact_token_counts
+    )
+    request = fitted.request
+    if fitted.measured is not None:
+        _calibrate_token_estimate(engine, request, fitted.measured, exact=True)
 
     block_idx = engine.next_block_idx()
     # Track the KIND of the currently-open content block, not a bare
@@ -4730,6 +4744,7 @@ async def _drive_one_stream(
     # this call is rejected for context length, its retry ceiling must be
     # derived from this wire cap rather than from the larger pre-fit budget.
     engine._last_fitted_request_max_tokens = request.max_tokens
+    engine._last_dispatched_prompt = (request.model, fitted.raw_estimate)
     upstream = engine.llm.stream_with_tools(request)
 
     # Decide ONCE, up-front, whether this turn's visible assistant TEXT is the
@@ -5120,7 +5135,13 @@ async def _drive_one_stream(
         open_block_kind = None
 
 
-def _calibrate_token_estimate(engine: QueryEngine, request: LLMRequest, observed: int) -> None:
+def _calibrate_token_estimate(
+    engine: QueryEngine,
+    request: LLMRequest,
+    observed: int,
+    *,
+    exact: bool = False,
+) -> None:
     """Scale the token heuristic to the size the provider just reported for this request.
 
     The heuristic sizes everything the tiers decide on — which units are worth
@@ -5139,6 +5160,11 @@ def _calibrate_token_estimate(engine: QueryEngine, request: LLMRequest, observed
     two readings share entries instead of evicting each other — and the tool
     definitions are costed once per surface digest, which for a deployment
     whose registry is not changing is once.
+
+    ``exact`` marks a count the provider made of this very request before it
+    was sent, rather than a usage figure reported after it. Such a count is not
+    a noisy reading to be averaged in: the factor is set to it outright, so the
+    decisions taken before the next usage report are already in its tokens.
     """
     if request.model != engine.effective_model_name:
         return
@@ -5155,10 +5181,104 @@ def _calibrate_token_estimate(engine: QueryEngine, request: LLMRequest, observed
         return
     measured = min(max(observed / raw, 1.0), 4.0)
     current = rc.token_estimate_calibration
-    smoothed = round(current + (measured - current) * 0.5, 3)
+    smoothed = round(measured if exact else current + (measured - current) * 0.5, 3)
     if abs(smoothed - current) < 0.02:
         return
     engine.set_token_estimate_calibration(smoothed, model_name=request.model)
+
+
+def _calibrate_from_context_rejection(
+    engine: QueryEngine, exc: LLMContextWindowExceeded
+) -> None:
+    """Raise the estimate factor to what a provider's rejection proves.
+
+    A rejection for length is a measurement, if only a one-sided one. The
+    provider refused a request whose prompt the loop had sized at ``raw``
+    heuristic tokens and whose output cap it knows, so the prompt was at least
+    the window less that cap — whatever the provider's message does or does not
+    quote. Usage never arrives for a rejected request, so without this the
+    factor stays where it was and the recovery that follows sizes history with
+    the same undercount that let the request through.
+
+    Only ever raises the factor, and only to the proven floor: the rejection
+    says nothing about how far above it the prompt was. When the provider did
+    quote an exact prompt size, that size is used instead, as an exact count.
+    A rejection the loop raised itself, before anything was sent, carries no
+    provider evidence and changes nothing.
+    """
+    dispatched = engine._last_dispatched_prompt
+    if dispatched is None:
+        return
+    model_name, raw = dispatched
+    rc = engine.config.rc
+    if (
+        not rc.token_estimate_calibration_enabled
+        or raw <= 0
+        or model_name != engine.effective_model_name
+        or engine._token_estimate_calibration_model != model_name
+    ):
+        return
+    if exc.input_tokens is not None and exc.input_tokens > 0:
+        floor_tokens = exc.input_tokens
+    else:
+        window = exc.context_window or rc.model_context_window
+        output_cap = _context_overflow_rejected_wire_cap(engine, exc)
+        reserved = (
+            output_cap
+            if rc.provider_reserves_output_in_context_window and output_cap is not None
+            else 0
+        )
+        floor_tokens = window - reserved + 1
+    floor_factor = round(min(max(floor_tokens / raw, 1.0), 4.0), 3)
+    current = rc.token_estimate_calibration
+    if floor_factor <= current:
+        return
+    _logger.warning(
+        "DIAG request_budget.rejection_floor run=%s model=%s raw_estimate=%d "
+        "prompt_at_least=%d calibration=%.3f->%.3f",
+        engine.config.run_id,
+        model_name,
+        raw,
+        floor_tokens,
+        current,
+        floor_factor,
+    )
+    engine.set_token_estimate_calibration(floor_factor, model_name=model_name)
+
+
+async def _calibrate_near_compaction_trigger(engine: QueryEngine) -> None:
+    """Replace the gate's estimate with the provider's count when it is close.
+
+    The compaction gate decides on the calibrated estimate of the durable
+    history. Close to the trigger — within
+    :attr:`LoopConstants.exact_token_count_margin_ratio` of it — a provider that
+    can count a rendered request is asked for the history's real size, and the
+    factor is set from it, so the gate that runs next reads a number in the
+    provider's tokens. Far from the trigger, and on a provider without the
+    capability, nothing is sent and the gate is exactly what it was.
+    """
+    from protocore.runtime.context.budgets import derive_budgets
+
+    rc = engine.config.rc
+    if not rc.exact_token_count_enabled or not engine.history:
+        return
+    estimate = engine.context_manager.current_prompt_tokens(engine.history)
+    if not near_limit(estimate, derive_budgets(rc).compaction_trigger_tokens, rc):
+        return
+    request = LLMRequest(model=engine.effective_model_name, messages=list(engine.history))
+    measured = await count_request_tokens_exactly(
+        request, engine.llm, rc, cache=engine._exact_token_counts
+    )
+    if measured is None:
+        return
+    _logger.warning(
+        "DIAG request_budget.exact_count_gate run=%s model=%s estimate=%d measured=%d",
+        engine.config.run_id,
+        request.model,
+        estimate,
+        measured,
+    )
+    _calibrate_token_estimate(engine, request, measured, exact=True)
 
 
 def _context_overflow_rejected_wire_cap(
@@ -5203,6 +5323,7 @@ async def _handle_context_window_exceeded(
     compacts first. After compaction, every rejection may lower the cap again
     until the configured attempt budget or the one-token floor is reached.
     """
+    _calibrate_from_context_rejection(engine, exc)
     retry_max_tokens = _context_overflow_retry_cap(engine, exc)
     rejected_wire_cap = _context_overflow_rejected_wire_cap(engine, exc)
     measured_retry_fits = (
