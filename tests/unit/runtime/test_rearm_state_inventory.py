@@ -71,9 +71,8 @@ _RESET_ON_REARM: frozenset[str] = frozenset(
         # collide with the previous turn's.
         "_block_idx",
         # The size of the request last sent, read only by a rejection of that
-        # same request, and the counts made of this turn's requests.
+        # same request.
         "_last_dispatched_prompt",
-        "_exact_token_counts",
         "_exact_count_model",
         "_wire_round_seq",
         "_pending_tool_call_names",

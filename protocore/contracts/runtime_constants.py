@@ -179,7 +179,20 @@ class LoopConstants(BaseModel):
             "How long the loop waits for a provider's exact count before it "
             "sizes the request by its estimate instead. The count is asked before "
             "the stream opens, outside the stream's idle watchdog, so an endpoint "
-            "that does not answer would otherwise hold the turn."
+            "that does not answer would otherwise hold the turn. It is the "
+            "ceiling for any timeout the provider applies to its own count: a "
+            "provider bound set higher than this never gets to fire."
+        ),
+    )
+    exact_token_count_failure_backoff_seconds: float = Field(
+        default=300.0,
+        ge=0.0,
+        description=(
+            "How long a run stops asking for exact counts after one failed or "
+            "timed out. A counting route that hangs would otherwise cost "
+            "exact_token_count_timeout_seconds on every iteration near the "
+            "edge; while backing off, requests are sized by the estimate. "
+            "0 retries on the next request."
         ),
     )
     exact_token_count_cache_max_entries: int = Field(

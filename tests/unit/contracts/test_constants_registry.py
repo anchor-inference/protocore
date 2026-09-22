@@ -600,6 +600,9 @@ class TestLoopGroup:
         timeout = group.spec("exact_token_count_timeout_seconds")
         assert timeout.default == 5.0 and timeout.kind == "float"
         assert timeout.exclusive_minimum is True
+        backoff = group.spec("exact_token_count_failure_backoff_seconds")
+        assert backoff.default == 300.0 and backoff.kind == "float"
+        assert backoff.minimum == 0.0 and backoff.exclusive_minimum is False
 
     def test_context_overflow_retry_attempt_bound_is_dashboard_configurable(self) -> None:
         spec = build_loop_group().spec("context_overflow_retry_max_attempts")

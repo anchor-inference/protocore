@@ -737,6 +737,11 @@ class QueryEngine:
             "compact_checkpoint",
             "context_manager",
             "last_observed_prompt_tokens",
+            # What counting has learned: counts keyed by content, the last full
+            # request counted, and a back-off after a failed count. The next
+            # turn is the same conversation on the same endpoint, so none of it
+            # goes stale at a turn boundary, and the cache is bounded.
+            "_exact_token_counts",
             "_token_estimate_calibration_baseline",
             "_token_estimate_calibration_model",
             "last_heartbeat_ms",
@@ -949,7 +954,8 @@ class QueryEngine:
         # the provider. A rejection for length reads it to learn how far the
         # estimate ran short; ``None`` while nothing has been sent this message.
         self._last_dispatched_prompt: tuple[str, int] | None = None
-        # Exact counts a provider has already made of this run's requests.
+        # Exact counts a provider has already made of this run's requests, the
+        # last full request it counted, and any back-off after a failed count.
         self._exact_token_counts = ExactTokenCountCache()
         # The model an exact count last calibrated the estimate for, this turn.
         self._exact_count_model: str | None = None

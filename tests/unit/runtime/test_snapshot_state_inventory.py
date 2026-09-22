@@ -53,6 +53,12 @@ _PROCESS_LOCAL: dict[str, str] = {
         "provider_chain_model_name, and the engine is re-seated onto it."
     ),
     "compaction_llm": "the summarising provider is injected by the host.",
+    "_exact_token_counts": (
+        "a cache of what one endpoint answered and a monotonic back-off clock, "
+        "both meaningless in another process. What counting taught the run is "
+        "carried: it lives in token_estimate_calibration, which the snapshot "
+        "keeps; a resumed run counts again once near the edge."
+    ),
     "tools": (
         "the registry is built by the host from its own catalog. What the run "
         "did to that surface is carried separately — the broken tools, the "

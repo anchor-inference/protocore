@@ -539,3 +539,61 @@ def test_the_default_margin_covers_the_largest_undercount_calibration_can_expres
     ceiling = LoopConstants.model_fields["token_estimate_calibration"].metadata
     largest = max(getattr(m, "le", 0) or 0 for m in ceiling)
     assert rc.exact_token_count_margin_ratio >= 1 - 1 / largest
+
+
+def _conversation(*parts: str) -> LLMRequest:
+    return LLMRequest(model="m", messages=[_msg(part) for part in parts], max_tokens=1_000)
+
+
+@pytest.mark.asyncio
+async def test_after_a_count_small_additions_are_not_counted_again() -> None:
+    rc = _rc(model_context_window=32_768)
+    provider = _CountingProvider(count=6_000)
+    cache = ExactTokenCountCache()
+    parts = ["Прочитанный фрагмент книги. " * 900]
+    await fit_request_to_context_measured(_conversation(*parts), rc, provider, cache=cache)
+    assert len(provider.counted) == 1
+    for _ in range(5):
+        parts.append("Ещё абзац прозы из поиска. " * 20)
+        await fit_request_to_context_measured(_conversation(*parts), rc, provider, cache=cache)
+    assert len(provider.counted) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_large_dense_addition_is_counted() -> None:
+    rc = _rc(model_context_window=32_768)
+    provider = _CountingProvider(count=6_000)
+    cache = ExactTokenCountCache()
+    parts = ["Прочитанный фрагмент книги. " * 900]
+    await fit_request_to_context_measured(_conversation(*parts), rc, provider, cache=cache)
+    parts.append(secrets.token_hex(16_000))
+    provider.count = 30_000
+    fitted = await fit_request_to_context_measured(_conversation(*parts), rc, provider, cache=cache)
+    assert len(provider.counted) == 2
+    assert fitted.measured == 30_000
+
+
+@pytest.mark.asyncio
+async def test_a_failed_count_backs_off_for_the_configured_period() -> None:
+    rc = _rc(exact_token_count_timeout_seconds=0.01, exact_token_count_failure_backoff_seconds=3600)
+    provider = _SlowCounter()
+    cache = ExactTokenCountCache()
+    request = _near_edge_request(rc)
+    for _ in range(3):
+        fitted = await fit_request_to_context_measured(request, rc, provider, cache=cache)
+        assert fitted.measured is None
+    assert len(provider.counted) == 1
+
+    cache.backoff_until = 0.0
+    await fit_request_to_context_measured(request, rc, provider, cache=cache)
+    assert len(provider.counted) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_zero_backoff_retries_on_the_next_request() -> None:
+    rc = _rc(exact_token_count_failure_backoff_seconds=0)
+    provider = _CountingProvider(fail=RuntimeError("down"))
+    cache = ExactTokenCountCache()
+    for _ in range(2):
+        await fit_request_to_context_measured(_near_edge_request(rc), rc, provider, cache=cache)
+    assert len(provider.counted) == 2

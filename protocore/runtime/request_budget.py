@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
+import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -115,13 +117,34 @@ def near_limit(estimate: int, limit: int, rc: LoopConstants) -> bool:
     return estimate >= limit * (1.0 - rc.exact_token_count_margin_ratio)
 
 
-class ExactTokenCountCache:
-    """Exact counts one run has already paid for, keyed by request content."""
+@dataclass(frozen=True, slots=True)
+class CountAnchor:
+    """The last full request the provider counted, as the next fit reads it."""
 
-    __slots__ = ("_entries",)
+    model: str
+    #: What the provider said that request rendered to.
+    measured: int
+    #: The heuristic's raw size of the same request.
+    raw_estimate: int
+
+
+class ExactTokenCountCache:
+    """What one run has learned from counting: the counts, the last one, and failures.
+
+    Counts are keyed by request content. The anchor is the last full request
+    counted, which lets a later fit decide whether the content added since
+    could have carried the prompt over its limit. ``backoff_until`` is the
+    monotonic time before which counting is not attempted again after a count
+    failed or timed out: an endpoint that hangs would otherwise cost the full
+    timeout on every iteration.
+    """
+
+    __slots__ = ("_entries", "anchor", "backoff_until")
 
     def __init__(self) -> None:
         self._entries: OrderedDict[str, int] = OrderedDict()
+        self.anchor: CountAnchor | None = None
+        self.backoff_until: float = 0.0
 
     def get(self, key: str) -> int | None:
         count = self._entries.get(key)
@@ -170,6 +193,8 @@ async def count_request_tokens_exactly(
     counter = request_token_counter(provider)
     if counter is None:
         return None
+    if cache is not None and time.monotonic() < cache.backoff_until:
+        return None
     key: str | None
     try:
         key = request_content_key(request)
@@ -184,9 +209,15 @@ async def count_request_tokens_exactly(
             counter(request), timeout=rc.exact_token_count_timeout_seconds
         )
     except Exception as exc:
+        if cache is not None:
+            cache.backoff_until = (
+                time.monotonic() + rc.exact_token_count_failure_backoff_seconds
+            )
         _logger.warning(
-            "exact request token count failed for model=%s; using the estimate (err=%s)",
+            "exact request token count failed for model=%s; using the estimate, "
+            "and not counting again for %.0fs (err=%r)",
             request.model,
+            rc.exact_token_count_failure_backoff_seconds,
             exc,
         )
         return None
@@ -211,6 +242,45 @@ async def count_request_tokens_exactly(
             measured / estimate if estimate > 0 else 0.0,
         )
     return measured
+
+
+def worst_case_ratio(rc: LoopConstants) -> float:
+    """The largest undercount the counting margin is sized to catch.
+
+    A margin ``m`` catches an estimate that runs short by up to ``1 / (1 - m)``;
+    the incremental trigger assumes new content is that dense, so the two rules
+    protect against the same worst case.
+    """
+    margin = rc.exact_token_count_margin_ratio
+    return math.inf if margin >= 1.0 else 1.0 / (1.0 - margin)
+
+
+def _count_warranted(
+    request: LLMRequest,
+    raw: int,
+    estimate: int,
+    limit: int,
+    rc: LoopConstants,
+    cache: ExactTokenCountCache | None,
+) -> bool:
+    """Whether this fit should ask the provider.
+
+    Before the run has a count of a full request for this model, the margin rule
+    decides. After it, the question is narrower: the last count is known, and
+    only the content added since is unmeasured. If that content, sized at the
+    worst undercount the margin assumes, still could not carry the prompt over
+    the limit, the count would only confirm what the calibrated estimate already
+    says, and it is not made. Prose-heavy turns then count about once near the
+    edge instead of on every iteration, and a large block of dense content —
+    the case the count exists for — crosses the bound at once.
+    """
+    if not near_limit(estimate, limit, rc):
+        return False
+    anchor = cache.anchor if cache is not None else None
+    if anchor is None or anchor.model != request.model:
+        return True
+    added = max(0, raw - anchor.raw_estimate)
+    return anchor.measured + added * worst_case_ratio(rc) >= limit
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,10 +335,14 @@ async def fit_request_to_context_measured(
     clip_limit = (
         rc.model_context_window - rc.request_context_safety_tokens - request.max_tokens
     )
-    if near_limit(estimate, clip_limit, rc):
+    if _count_warranted(request, raw, estimate, clip_limit, rc, cache):
         measured = await count_request_tokens_exactly(
             request, provider, rc, cache=cache, estimate=estimate
         )
+        if measured is not None and cache is not None:
+            cache.anchor = CountAnchor(
+                model=request.model, measured=measured, raw_estimate=raw
+            )
     if measured is None:
         fitted = _fit_to_prompt_tokens(request, rc, estimate)
     else:
@@ -291,6 +365,7 @@ async def fit_request_to_context_measured(
 
 
 __all__ = [
+    "CountAnchor",
     "ExactTokenCountCache",
     "FittedRequest",
     "RequestTokenCount",
@@ -303,4 +378,5 @@ __all__ = [
     "near_limit",
     "request_content_key",
     "request_token_counter",
+    "worst_case_ratio",
 ]

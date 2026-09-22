@@ -514,7 +514,12 @@ crashes. The shared assistant loop is **not** a single immutable path:
   when it is within the margin of the compaction trigger, so the gate decides
   on the provider's tokens — until a fit has counted the turn's full request,
   after which the gate reads the factor that count set instead of paying a
-  second round-trip. The default margin, 0.75, is `1 - 1/4`: an undercount by
+  second round-trip. After the first count the fit asks again only when the
+  last count plus the content added since, sized at the worst undercount the
+  margin assumes (`1 / (1 - margin)`), could cross the limit, so prose-heavy
+  turns count about once near the edge while a large dense tool result is
+  counted at once. A count that fails or times out stops counting for
+  `exact_token_count_failure_backoff_seconds`. The default margin, 0.75, is `1 - 1/4`: an undercount by
   a factor `f` is only caught when the margin is at least `1 - 1/f`, the
   heuristic was measured running 1.76x short on JSON and 3.53x on hexadecimal
   text, and 4 is the largest factor calibration can express. An exact count
