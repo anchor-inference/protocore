@@ -5115,6 +5115,10 @@ async def _handle_context_window_exceeded(
 
     rejected_max_tokens = engine._last_fitted_request_max_tokens
     if rejected_max_tokens is not None:
+        if exc.requested_output_tokens is not None:
+            rejected_max_tokens = min(
+                rejected_max_tokens, exc.requested_output_tokens
+            )
         retry_max_tokens = int(
             rejected_max_tokens * engine.config.rc.context_overflow_retry_output_ratio
         )

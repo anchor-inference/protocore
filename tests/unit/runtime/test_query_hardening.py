@@ -391,7 +391,7 @@ async def test_context_window_retry_uses_provider_reported_prompt_size(
                 "request exceeded context",
                 context_window=65_536,
                 input_tokens=58_475,
-                requested_output_tokens=14_124,
+                requested_output_tokens=7_062,
             )
         ],
     )
@@ -405,7 +405,7 @@ async def test_context_window_retry_uses_provider_reported_prompt_size(
         pass
 
     assert engine.state is LoopState.COMPLETED
-    assert [request.max_tokens for request in llm.calls] == [16_384, 5_013]
+    assert [request.max_tokens for request in llm.calls] == [16_384, 3_531]
 
 
 @pytest.mark.asyncio
