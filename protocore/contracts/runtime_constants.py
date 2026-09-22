@@ -723,6 +723,47 @@ class LoopConstants(BaseModel):
             "Per-tenant overridable."
         ),
     )
+    soft_stop_notice_text_provider_error: str = Field(
+        default=(
+            "[internal control — not part of the reply] This run is closing "
+            "because the model endpoint failed: the requests it was sent were "
+            "refused or came back with nothing usable, and the retries are "
+            "spent. This is not a budget limit; earlier requests may have "
+            "consumed tokens and time. Do not claim otherwise, and do not "
+            "present this as a limit you hit. The operator has already been "
+            "shown the provider's own error, so your reply is not the only "
+            "trace of it. Write one short final message, as an ordinary "
+            "assistant message in plain prose, in the language of the "
+            "conversation: say plainly that the model provider failed and the "
+            "task could not be completed. Report only work that actually "
+            "happened in this run; if none happened, say exactly that rather "
+            "than summarising anything. Then call the terminal tool to end the "
+            "run. "
+            "[внутреннее управление — не часть ответа] Выполнение завершается "
+            "из-за сбоя эндпоинта модели: запросы к нему были отклонены или "
+            "вернули непригодный ответ, попытки повтора исчерпаны. Это не "
+            "предел бюджета, но предыдущие запросы могли расходовать токены и "
+            "время — не утверждайте обратное и не выдавайте это за достигнутое "
+            "ограничение. Пользователю уже показана собственная ошибка "
+            "провайдера, ваш ответ — не единственный её след. Напишите одно "
+            "короткое финальное сообщение обычным текстом, на языке диалога: "
+            "прямо скажите, что произошёл сбой провайдера и задачу завершить "
+            "не удалось. Упоминайте только ту работу, которая действительно "
+            "была сделана в этом выполнении; если её не было — так и "
+            "напишите, а не пересказывайте несделанное. Затем вызовите "
+            "терминальный инструмент, чтобы завершить выполнение."
+        ),
+        description=(
+            "The wind-down notice used when the cause is ``provider_error``. It "
+            "exists because the general notice says the run reached its BUDGET, "
+            "and a model told that after an upstream failure writes a closing "
+            "summary of work it never did: it believes it spent turns it was "
+            "never given. The cause is the one thing the notice has to get "
+            "right, so the cause that is not a budget carries its own text. "
+            "Empty string falls back to ``soft_stop_notice_text``. Per-tenant "
+            "overridable."
+        ),
+    )
     run_tool_call_ledger_max_entries: int = Field(
         default=500,
         ge=0,

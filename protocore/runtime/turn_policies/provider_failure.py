@@ -32,12 +32,12 @@ reader has already seen.
 """
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from protocore.contracts.llm import (
     LLMContextWindowExceeded,
+    LLMError,
     LLMProviderError,
     LLMRateLimitError,
     LLMStreamIdleError,
@@ -71,6 +71,17 @@ PreservedAnswerFinish = Callable[..., AsyncIterator[TurnEvent]]
 #: Whether such an answer exists.
 HasPreservedAnswer = Callable[[Any], bool]
 
+#: Whether this run has produced anything at all — a word of prose, a tool call
+#: or a tool result — that a final answer could be about.
+HasRunOutput = Callable[[Any], bool]
+
+#: Whether the run is still entitled to spend time on another attempt: not
+#: cancelled, and not out of wall clock.
+RetryPermitted = Callable[[Any], bool]
+
+#: Hold still for the backoff, returning early if the run is told to stop.
+BackoffWait = Callable[[Any, float], Awaitable[None]]
+
 #: Say on the wire that the run moved to another provider.
 FallbackAnnouncer = Callable[..., TurnEvent]
 
@@ -85,6 +96,9 @@ BackoffSeconds = Callable[[Any, int, BaseException], float]
 
 #: Write down that the turn crashed, naming the turn it crashed on.
 CrashLogger = Callable[[Any, BaseException], None]
+
+#: Write down that a stream attempt failed, whatever is done about it next.
+FailureLogger = Callable[[Any, BaseException], None]
 
 
 class ProviderFailurePolicy:
@@ -101,6 +115,7 @@ class ProviderFailurePolicy:
 
     __slots__ = (
         "_advance_chain",
+        "_await_backoff",
         "_backoff",
         "_commit_usage",
         "_context_overflow",
@@ -110,7 +125,10 @@ class ProviderFailurePolicy:
         "_has_terminal_tool_result",
         "_llm_terminal",
         "_log_crash",
+        "_log_failure",
+        "_may_retry",
         "_preserved_finish",
+        "_produced_output",
         "_retries",
         "_retry_event",
         "_wind_down",
@@ -125,6 +143,7 @@ class ProviderFailurePolicy:
         has_preserved_answer: HasPreservedAnswer,
         has_terminal_tool_result: HasPreservedAnswer,
         has_final_answer: HasPreservedAnswer,
+        produced_output: HasRunOutput,
         preserved_finish: PreservedAnswerFinish,
         wind_down: WindDownEntry,
         wind_down_budget: WindDownBudget,
@@ -133,14 +152,18 @@ class ProviderFailurePolicy:
         retry_event: RetryAnnouncer,
         commit_usage: UsageCommit,
         backoff: BackoffSeconds,
+        may_retry: RetryPermitted,
+        await_backoff: BackoffWait,
         retries: RunCounter,
         log_crash: CrashLogger,
+        log_failure: FailureLogger,
     ) -> None:
         self._advance_chain = advance_chain
         self._context_overflow = context_overflow
         self._has_preserved_answer = has_preserved_answer
         self._has_terminal_tool_result = has_terminal_tool_result
         self._has_final_answer = has_final_answer
+        self._produced_output = produced_output
         self._preserved_finish = preserved_finish
         self._wind_down = wind_down
         self._wind_down_budget = wind_down_budget
@@ -149,8 +172,11 @@ class ProviderFailurePolicy:
         self._retry_event = retry_event
         self._commit_usage = commit_usage
         self._backoff = backoff
+        self._may_retry = may_retry
+        self._await_backoff = await_backoff
         self._retries = retries
         self._log_crash = log_crash
+        self._log_failure = log_failure
 
     async def apply(self, turn: TurnContext) -> AsyncIterator[TurnEvent]:
         if turn.coordinate is TurnCoordinate.stream_settled:
@@ -171,6 +197,10 @@ class ProviderFailurePolicy:
         exc = turn.stream_error
         if exc is None:
             return
+        # Written before the recovery is chosen, so the log says what the run
+        # was recovering FROM even when the recovery then succeeds and leaves
+        # no other trace of the failure.
+        self._log_failure(turn.engine, exc)
 
         if isinstance(exc, LLMContextWindowExceeded):
             async for event in self._shrink_the_request(turn, exc):
@@ -178,8 +208,15 @@ class ProviderFailurePolicy:
             return
 
         if isinstance(exc, LLMStreamIdleError):
+            # A stream that went quiet is as often a queue as a hang, and it
+            # delivered nothing, so the same request is tried again — bounded —
+            # before the run winds down on it.
             async for event in self._recover(
-                turn, exc, kind="llm_stream_idle", wind_down_when_stuck=True
+                turn,
+                exc,
+                kind="llm_stream_idle",
+                retryable=_says_retryable(exc),
+                wind_down_when_stuck=True,
             ):
                 yield event
             return
@@ -194,13 +231,24 @@ class ProviderFailurePolicy:
                 if isinstance(exc, LLMRateLimitError)
                 else "llm_timeout"
             )
-            async for event in self._recover(turn, exc, kind=kind, retryable=True):
+            async for event in self._recover(
+                turn, exc, kind=kind, retryable=_says_retryable(exc)
+            ):
                 yield event
             return
 
         if isinstance(exc, LLMProviderError):
+            # The adapters' catch-all: a 5xx, a dropped connection, a refused
+            # request. The first two pass on a retry and the third costs one
+            # more call against a cached prompt, so the bounded retry comes
+            # before the wind-down here too — unless the adapter, which had the
+            # response in front of it, said the failure is permanent.
             async for event in self._recover(
-                turn, exc, kind="llm_provider_error", wind_down_when_stuck=True
+                turn,
+                exc,
+                kind="llm_provider_error",
+                retryable=_says_retryable(exc),
+                wind_down_when_stuck=True,
             ):
                 yield event
             return
@@ -284,9 +332,22 @@ class ProviderFailurePolicy:
             if turn.outcome.directive is not TurnDirective.proceed:
                 return
 
+        # A wind-down asks the model for the best answer its evidence supports,
+        # and a run whose every request the endpoint refused has no evidence: no
+        # prose, no tool call, nothing done. Asked to close anyway it invents the
+        # run — it reports on work it never started, and the failure reaches the
+        # operator as a polite summary of nothing instead of as an error. So the
+        # wind-down is for runs that got somewhere; a run that produced nothing
+        # fails on the provider's own error, which is the true thing to say about
+        # it. Once a tool result exists the partial IS an outcome, and closing on
+        # it is honest.
         wound = (
-            self._wind_down(engine, cause=_soft_stop.CAUSE_PROVIDER_ERROR)
-            if wind_down_when_stuck
+            self._wind_down(
+                engine,
+                cause=_soft_stop.CAUSE_PROVIDER_ERROR,
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            if wind_down_when_stuck and self._produced_output(engine)
             else []
         )
         if wound:
@@ -318,6 +379,11 @@ class ProviderFailurePolicy:
         engine = turn.engine
         if self._retries.read(engine) >= engine.rc.llm_transient_error_retry_max_attempts:
             return
+        if not self._may_retry(engine):
+            # Cancelled, or out of wall clock. The attempt budget may be
+            # untouched and it does not matter: nobody is waiting for the
+            # answer another attempt would produce.
+            return
         spent = self._commit_usage(
             engine,
             kind="inference",
@@ -331,9 +397,10 @@ class ProviderFailurePolicy:
         delay = self._backoff(engine.rc, attempt, exc)
         yield self._retry_event(engine, kind, attempt, delay, exc)
         # Persisted before the pause by the attempt that failed, so a crash
-        # during the backoff does not lose what the reader already saw.
-        if delay > 0:
-            await asyncio.sleep(delay)
+        # during the backoff does not lose what the reader already saw. The
+        # wait itself ends early on a cancel; the loop's own cancel checkpoint
+        # is what then routes the restarted turn to its cancelled terminal.
+        await self._await_backoff(engine, delay)
         turn.outcome.directive = TurnDirective.restart_turn
         turn.outcome.rebuild_context = True
         turn.outcome.reason = "transient_llm_error_retry"
@@ -374,6 +441,18 @@ class ProviderFailurePolicy:
         turn.flags.terminal_yielded = True
         turn.outcome.directive = TurnDirective.end_turn
         turn.outcome.reason = INTERNAL_ERROR_KIND
+
+
+def _says_retryable(exc: LLMError) -> bool:
+    """Whether the adapter that raised ``exc`` says another attempt is worth it.
+
+    Read off the exception rather than decided from its type here, because the
+    adapter is the only party that saw the response: it classifies the status
+    and the body and pins the verdict on what it raises. The class defaults in
+    :mod:`protocore.contracts.llm` are what an adapter that classified nothing
+    gets, so this policy never has to guess.
+    """
+    return exc.retryable
 
 
 __all__ = ["ProviderFailurePolicy"]

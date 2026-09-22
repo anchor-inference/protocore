@@ -629,6 +629,41 @@ is. `runtime/error_kinds.py::INTERNAL_ERROR_KIND` is read from both sides of
 this seam, which is why it is a module of its own — "the loop crashed" must not
 have a second spelling on the policy's side.
 
+**Provider failure: what the run says when the endpoint does not answer.**
+`provider_failure.py` ranks three recoveries — a sibling on the run's provider
+chain, the same endpoint after a bounded backoff, and the answer the run
+already has — and two rules keep the last of them honest.
+
+- **Retry is the adapter's verdict, read off the exception.** Every
+  `LLMError` carries `retryable`. The class defaults say the honest thing about
+  the type (`LLMRateLimitError`, `LLMTimeoutError`, `LLMStreamIdleError` and
+  `LLMProviderError` are retryable; `LLMContextWindowExceeded` is not and takes
+  no such keyword), and an adapter that classified the response overrides it per
+  raise — `LLMProviderError("no such model", retryable=False)` fails on the
+  first answer it got. The ladder is bounded by
+  `llm_transient_error_retry_max_attempts` (2) with
+  `llm_transient_error_retry_backoff_base_seconds` (1.0) doubling up to
+  `llm_transient_error_retry_backoff_max_seconds` (8.0), a server-stated
+  `Retry-After` taking precedence within that ceiling. The streak resets on any
+  clean stream, so the bound is per consecutive-failure streak rather than per
+  run. A run that was cancelled, or whose wall-clock budget leaves room only to
+  finalise, starts no further attempt; the backoff itself waits on the stop
+  event, so a cancel mid-pause is noticed at once. Each attempt is a WARNING
+  naming the run and the attempt number, and a `state_changed` event
+  (`reason="transient_llm_error_retry"`) the host can surface.
+- **A run that produced nothing is not asked to write a report.** The wind-down
+  asks the model for the best answer its evidence supports; a run with no prose,
+  no tool call and no tool result has none, and asked to close anyway it invents
+  the run — the operator reads a polite summary of work that never happened and
+  no sign of the failure. So the wind-down is entered only once
+  `query.py::_run_produced_output` is true, and otherwise the run goes terminal
+  FAILED on the provider's own error. After a tool result exists the partial IS
+  an outcome and the wind-down is the right close. Its notice is then per cause
+  (`soft_stop_notice_text_provider_error`), because the general one says the run
+  reached its budget and a model reads that literally; and its `state_changed`
+  events carry `soft_stop_detail` — the upstream's own message — so a host can
+  show the operator why the run ended rather than reconstruct it from a log.
+
 ### The run snapshot: schema version and upcasters
 
 **What & why.** A snapshot is written by one process and read by another, and

@@ -6,6 +6,31 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A provider failure with nothing behind it no longer ends as an invented
+  answer.** A run whose requests the endpoint refused before it wrote a word,
+  called a tool or read a result is no longer wound down and asked to deliver
+  a final answer — it goes terminal FAILED carrying the provider's own error.
+  Once a tool result exists the partial outcome is real, and the wind-down
+  still runs; its notice now names a provider failure instead of a budget
+  (`soft_stop_notice_text_provider_error`), and its `state_changed` events
+  carry the upstream's message as `soft_stop_detail`.
+
+### Changed
+
+- **Transient provider failures are retried on the verdict the adapter gives,
+  not on the exception type alone.** `LLMError` now carries `retryable`, which
+  an adapter sets per raise — `LLMProviderError("no such model",
+  retryable=False)` is terminal at once, while a 5xx, a reset connection and a
+  silent stream take the bounded ladder that 429s and timeouts already took
+  (`llm_transient_error_retry_max_attempts`, backoff doubling from
+  `llm_transient_error_retry_backoff_base_seconds`). A context-window overflow
+  is never retried this way and takes no such keyword. A cancelled run, or one
+  whose wall-clock budget leaves room only to finalise, starts no further
+  attempt, and a cancel during a backoff ends the pause immediately. Every
+  attempt logs a WARNING naming the run and the attempt number.
+
 ## [2.0.0a16]
 
 ### Fixed

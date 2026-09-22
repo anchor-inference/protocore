@@ -1398,9 +1398,15 @@ async def test_provider_error_without_fallback_is_terminal(
 
     Wind-down off: with it on the failure buys one narrowed turn to still
     deliver an answer, which is a different behaviour with its own coverage.
-    This pins the terminal a deployment gets with the wind-down disabled.
+    This pins the terminal a deployment gets with the wind-down disabled. The
+    in-place retries are off too, so the one call this counts is the one the
+    chain had rather than the ladder that precedes the terminal.
     """
-    rc = LoopConstants(model_context_window=4096, soft_stop_enabled=False)
+    rc = LoopConstants(
+        model_context_window=4096,
+        soft_stop_enabled=False,
+        llm_transient_error_retry_max_attempts=0,
+    )
     engine = engine_factory(rc=rc)
     failing_llm = _ScriptedFailureLLM(
         exceptions=[LLMProviderError("provider down")],
@@ -1421,9 +1427,14 @@ async def test_last_rung_failure_is_terminal(
 ) -> None:
     """The final rung ALSO fails → terminal FAILED. No third attempt.
 
-    Wind-down off so the call count measures the chain, not the wind-down.
+    Wind-down off, and the in-place retries too, so the call count measures
+    the chain and nothing else.
     """
-    rc = LoopConstants(model_context_window=4096, soft_stop_enabled=False)
+    rc = LoopConstants(
+        model_context_window=4096,
+        soft_stop_enabled=False,
+        llm_transient_error_retry_max_attempts=0,
+    )
     engine = engine_factory(rc=rc)
     failing_llm = _ScriptedFailureLLM(
         exceptions=[
@@ -1502,6 +1513,7 @@ async def test_provider_error_backstop_persists_partial_text_to_history(
     rc = LoopConstants(
         model_context_window=4096,
         terminal_tool_nudge_enabled=True,
+        llm_transient_error_retry_max_attempts=0,
     )
     engine = engine_factory(rc=rc, expected_terminal_tool="answer")
     llm = _PartialTextThenFailLLM(
@@ -2052,9 +2064,14 @@ async def test_death_spiral_guard_set_on_provider_error(
     """Terminal :class:`LLMProviderError` MUST set ``engine.skip_terminal_hooks``.
 
     Wind-down off so the failure IS terminal: with it on the run gets a narrowed
-    turn to still answer, and a run that answers never reaches the guard.
+    turn to still answer, and a run that answers never reaches the guard. The
+    in-place retries are off so the first failure is also the last one.
     """
-    rc = LoopConstants(model_context_window=4096, soft_stop_enabled=False)
+    rc = LoopConstants(
+        model_context_window=4096,
+        soft_stop_enabled=False,
+        llm_transient_error_retry_max_attempts=0,
+    )
     engine = engine_factory(rc=rc)
     engine.llm = _ScriptedFailureLLM(  # type: ignore[assignment]
         exceptions=[LLMProviderError("burst error")],
@@ -2153,6 +2170,7 @@ async def test_death_spiral_guard_disabled_via_rc(
         model_context_window=4096,
         skip_terminal_hooks_on_llm_error=False,
         soft_stop_enabled=False,
+        llm_transient_error_retry_max_attempts=0,
     )
     engine = engine_factory(rc=rc)
     engine.llm = _ScriptedFailureLLM(  # type: ignore[assignment]

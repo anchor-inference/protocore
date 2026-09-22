@@ -28,6 +28,7 @@ Lifecycle (one invocation = one turn):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import inspect
 import json
@@ -275,7 +276,9 @@ if TYPE_CHECKING:
 _logger = get_logger(__name__)
 
 
-def _enter_soft_stop(engine: QueryEngine, *, cause: str) -> list[TurnEvent]:
+def _enter_soft_stop(
+    engine: QueryEngine, *, cause: str, detail: str = ""
+) -> list[TurnEvent]:
     """Begin the run wind-down for ``cause``. The ONE entry point.
 
     Returns the events the caller must forward, or an empty list when the
@@ -297,7 +300,7 @@ def _enter_soft_stop(engine: QueryEngine, *, cause: str) -> list[TurnEvent]:
         return []
     if _soft_stop.is_armed(engine):
         return []
-    events = _soft_stop.enter(engine, cause_name=cause)
+    events = _soft_stop.enter(engine, cause_name=cause, detail=detail)
     if events:
         # The terminal-only guard shares this latch with the voluntary-finish
         # contract repair: it is what makes a blocked non-terminal dispatch
@@ -508,7 +511,25 @@ def _policy_transient_retry_event(
     backoff_seconds: float,
     exc: BaseException,
 ) -> TurnEvent:
-    """Say that the same endpoint will be tried again, and after how long."""
+    """Say that the same endpoint will be tried again, and after how long.
+
+    Said twice, because the two readers are different. The event is for the
+    host, which surfaces a run that is waiting rather than one that is stuck;
+    the warning is for whoever reads the logs afterwards and needs the run id
+    and which attempt this was, since a retry that then succeeds leaves no
+    other trace of the failure it recovered from.
+    """
+    _logger.warning(
+        "DIAG query.transient_llm_error_retry run=%s tenant=%s error_class=%s "
+        "attempt=%d/%d backoff_seconds=%.3f message=%s",
+        engine.config.run_id,
+        engine.config.tenant_id,
+        kind,
+        attempt,
+        engine.config.rc.llm_transient_error_retry_max_attempts,
+        backoff_seconds,
+        exc,
+    )
     return TurnEvent(
         type=EventType.STATE_CHANGED,
         run_id=engine.config.run_id,
@@ -521,6 +542,24 @@ def _policy_transient_retry_event(
             "backoff_seconds": backoff_seconds,
             "primary_error": str(exc),
         },
+    )
+
+
+def _policy_log_stream_failure(engine: QueryEngine, exc: BaseException) -> None:
+    """Name the run a stream attempt failed on, before the recovery is chosen.
+
+    Every failed attempt is logged here, including the ones a retry or a
+    sibling provider then rescues: without it a run that recovered records
+    nothing about what it recovered from, and a provider degrading under load
+    looks from the logs like a provider that is fine.
+    """
+    _logger.warning(
+        "DIAG query.stream_failed run=%s tenant=%s turn=%s exception=%s message=%s",
+        engine.config.run_id,
+        engine.config.tenant_id,
+        engine.turn_id(),
+        type(exc).__name__,
+        exc,
     )
 
 
@@ -6703,6 +6742,46 @@ def _dispatch_outcome_is_terminal(
 # ---------------------------------------------------------------------------
 
 
+def _run_produced_output(engine: QueryEngine) -> bool:
+    """Whether the current run has anything a final answer could be about.
+
+    True once the model has written a word of prose or called a tool, or once a
+    tool result has come back. Thinking alone is not output: a run that spent a
+    round reasoning and then lost the endpoint has nothing to tell the user
+    about, and the reasoning is not shown to them anyway.
+
+    The run's own turns are the ones after the last message the CALLER put in —
+    the operator's prompt, or the tool result a parked run was resumed with.
+    That boundary is used rather than :func:`_this_run_messages` because the
+    seed tag that helper reads is set by the executor and not by every host: a
+    host that hands the engine a session's earlier turns verbatim would have
+    the predicate answer for a previous run. Anything after the last caller
+    message belongs to the round now driving, whoever assembled the history.
+
+    Asked by the provider-failure policy before it winds a run down. A
+    wind-down is a request for the best answer the evidence supports; put to a
+    run with no evidence it produces an invented one, which is worse than the
+    error it replaced. Pure / total — never raises.
+    """
+    start = 0
+    for index, message in enumerate(engine.history):
+        if message.role is MessageRole.user and not message.metadata.get(
+            SYNTHETIC_RECOVERY_METADATA_KEY
+        ):
+            start = index + 1
+    for message in engine.history[start:]:
+        if message.role is MessageRole.tool:
+            return True
+        if message.role is not MessageRole.assistant:
+            continue
+        for block in message.content_blocks:
+            if isinstance(block, ToolUseBlock):
+                return True
+            if isinstance(block, TextBlock) and block.text.strip():
+                return True
+    return False
+
+
 def _this_run_messages(engine: QueryEngine) -> list[Message]:
     """Messages that belong to THIS run, in history order.
 
@@ -7492,6 +7571,44 @@ async def _complete_run_on_preserved_answer(
         },
     )
     engine.transition_to(LoopState.COMPLETED)
+
+
+def _transient_retry_permitted(engine: QueryEngine) -> bool:
+    """Whether another attempt at the same endpoint is still allowed to start.
+
+    A retry costs wall-clock time the run may not have. Two things withdraw
+    that permission: a stop the caller asked for, and a wall-clock budget
+    already at its finalisation threshold — sleeping through a backoff and
+    re-opening a stream past either is work nobody is waiting for. The bound on
+    the NUMBER of attempts is the policy's own; this is about whether the run
+    is still running at all. Pure / total — never raises.
+    """
+    return not engine.stop_requested and not _terminal_deadline_reached(engine)
+
+
+async def _await_transient_retry_backoff(
+    engine: QueryEngine, seconds: float
+) -> None:
+    """Wait out a retry backoff, cut short by a stop.
+
+    The pause is the one place a failing run holds still for whole seconds, so
+    it waits on the stop event rather than on the clock: a cancel that lands
+    mid-backoff ends the wait immediately and the loop's next cancel checkpoint
+    routes the run to its cancelled terminal, instead of the cancel being
+    noticed a backoff later. It is also clamped to whatever remains of the
+    run's wall-clock budget, so the wait cannot itself be what spends it.
+    """
+    if seconds <= 0.0:
+        return
+    budget = engine.config.rc.agent_max_seconds
+    started = getattr(engine, "_run_started_monotonic", 0.0)
+    if budget > 0.0 and started != 0.0:
+        left = budget - (time.monotonic() - started)
+        seconds = min(seconds, left)
+        if seconds <= 0.0:
+            return
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(engine._stop_requested.wait(), timeout=seconds)
 
 
 def _transient_retry_backoff_seconds(
@@ -12069,6 +12186,7 @@ _CORE_TURN_POLICIES: Final[TurnPolicyRegistry] = TurnPolicyRegistry(
             has_preserved_answer=_preserve_completed_answer_on_stream_error,
             has_terminal_tool_result=_history_has_terminal_tool_result,
             has_final_answer=run_has_final_answer,
+            produced_output=_run_produced_output,
             preserved_finish=_complete_run_on_preserved_answer,
             wind_down=_enter_soft_stop,
             wind_down_budget=_soft_stop_turn_budget,
@@ -12077,12 +12195,15 @@ _CORE_TURN_POLICIES: Final[TurnPolicyRegistry] = TurnPolicyRegistry(
             retry_event=_policy_transient_retry_event,
             commit_usage=_policy_commit_usage,
             backoff=_transient_retry_backoff_seconds,
+            may_retry=_transient_retry_permitted,
+            await_backoff=_await_transient_retry_backoff,
             retries=RunCounter(
                 read=_transient_retries_spent,
                 charge=_charge_transient_retry,
                 reset=_reset_transient_retries,
             ),
             log_crash=_policy_log_stream_crash,
+            log_failure=_policy_log_stream_failure,
         ),
         TruncatedToolCallRecoveryPolicy(
             recoveries=RunCounter(

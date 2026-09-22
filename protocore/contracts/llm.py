@@ -16,7 +16,34 @@ from protocore.contracts.types import Message, StopReason, ToolDefinition
 
 
 class LLMError(Exception):
-    """Base for all LLM provider errors."""
+    """Base for all LLM provider errors.
+
+    Carries the one thing the runtime has to know about a failure it did not
+    produce: whether trying the SAME request again could plausibly work.
+
+    The class default is the honest reading of the type — a rate limit, a
+    timeout and a silent stream are transient by definition, a context
+    overflow never is — and the adapter overrides it per raise when it knows
+    better. That order matters: only the adapter has the response in front of
+    it, and :class:`LLMProviderError` is the adapters' catch-all, so a 503 and
+    a provider's policy refusal arrive as the same type. An adapter that
+    classified the response says so by passing ``retryable``; one that did not
+    gets the class default and a bounded number of attempts, which costs one
+    more call against a cached prompt and is the cheaper of the two mistakes.
+
+    The runtime never retries a context overflow through this flag whatever an
+    adapter sets, because :class:`LLMContextWindowExceeded` is answered by
+    shrinking the request before the flag is ever read.
+    """
+
+    #: Whether re-issuing the same request is worth an attempt. The class
+    #: default; a raise may override it.
+    retryable: bool = False
+
+    def __init__(self, *args: object, retryable: bool | None = None) -> None:
+        super().__init__(*args)
+        if retryable is not None:
+            self.retryable = retryable
 
 
 class LLMRateLimitError(LLMError):
@@ -35,6 +62,9 @@ class LLMRateLimitError(LLMError):
     the request.
     """
 
+    retryable: bool = True
+    """A quota that refilled is the ordinary case; the same request is retried."""
+
 
 class LLMTimeoutError(LLMError):
     """Provider request timed out (connect/read/write/pool) or the stream stalled.
@@ -44,6 +74,9 @@ class LLMTimeoutError(LLMError):
     :class:`LLMStreamIdleError`, which is the core idle-watchdog's own
     no-delta timeout and drives terminal FAILED via the provider-error path.
     """
+
+    retryable: bool = True
+    """A request that ran out of time is retried; nothing was delivered."""
 
 
 class LLMContextWindowExceeded(LLMError):
@@ -55,6 +88,12 @@ class LLMContextWindowExceeded(LLMError):
     runtime force-compacts once, then retries with strictly decreasing output
     caps until one succeeds or the configured attempt bound is exhausted.
     """
+
+    retryable: bool = False
+    """Never. The request is the problem, so re-sending it unchanged fails
+    identically; the runtime shrinks it instead, on a path taken before the
+    flag is read. An adapter cannot opt a context overflow into the transient
+    ladder — :meth:`__init__` does not accept the keyword."""
 
     def __init__(
         self,
@@ -85,6 +124,13 @@ class LLMProviderError(LLMError):
     existing recovery and otherwise goes terminal FAILED.
     """
 
+    retryable: bool = True
+    """A 5xx, a reset connection and a refused body are what this type mostly
+    carries, and the first two pass on a retry often enough to be worth the
+    bounded ladder. An adapter that knows the response is permanent — a bad
+    API key, a model name that does not exist — raises it with
+    ``retryable=False`` and the run fails on the first answer it got."""
+
 
 class LLMStreamIdleError(LLMError):
     """LLM stream produced no deltas within the idle-timeout window.
@@ -100,6 +146,10 @@ class LLMStreamIdleError(LLMError):
     the run down, and drive terminal FAILED, via the same path as
     :class:`LLMProviderError`.
     """
+
+    retryable: bool = True
+    """A stream that went quiet is as often a queue as a hang, and nothing was
+    delivered, so the same request is tried again before the run gives up."""
 
 
 class MaxOutputTokensExhausted(LLMError):
