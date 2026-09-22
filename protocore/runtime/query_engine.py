@@ -2124,6 +2124,8 @@ class QueryEngine:
         * ``_last_fitted_request_max_tokens`` and
           ``_context_overflow_retry_max_tokens`` — the rejected wire cap and
           its derived retry ceiling belong only to that same model call.
+        * ``_context_overflow_corrective_retry_attempted`` — the compacted
+          request gets at most one provider-measured corrective retry.
         * ``_max_output_recovery_count`` — only consecutive
           truncations within one message exhaust the budget.
 

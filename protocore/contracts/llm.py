@@ -51,7 +51,8 @@ class LLMContextWindowExceeded(LLMError):
 
     Triggers reactive-413 recovery in :mod:`protocore.runtime.query`.
     First occurrence within a message → :meth:`ContextManager.force_compaction`
-    + re-stream once. Second occurrence → terminal FAILED.
+    + re-stream once. A measured overflow of that rebuilt request may receive
+    one strictly smaller corrective retry; any later overflow → terminal FAILED.
     """
 
     def __init__(
