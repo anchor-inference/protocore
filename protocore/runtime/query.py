@@ -4412,6 +4412,9 @@ async def _drive_one_stream(
     max_output_tokens = _apply_terminal_synthesis_output_reserve(
         engine, max_output_tokens, output_cap_before_band
     )
+    max_output_tokens = _apply_context_overflow_retry_output_cap(
+        engine, max_output_tokens
+    )
     full_messages = _prepend_system_sections(
         context.system_prompt_sections,
         context.messages,
@@ -6818,6 +6821,25 @@ def _apply_terminal_synthesis_output_reserve(
         return max_output_tokens
     floor = min(reserve, output_cap)
     return max(max_output_tokens, floor)
+
+
+def _apply_context_overflow_retry_output_cap(
+    engine: QueryEngine, max_output_tokens: int
+) -> int:
+    """Reduce output headroom on the one retry after context compaction.
+
+    Reactive context recovery rebuilds the prompt after force-compacting it,
+    but a provider may still count framing that the local estimator cannot
+    see. The per-message recovery latch distinguishes that retry from an
+    ordinary request and already bounds it to one attempt. Applying the cap
+    after terminal synthesis reservation ensures no later floor restores the
+    rejected output allowance; the hard request fit still runs afterwards.
+    """
+
+    if not engine._compaction_attempted_for_current_turn:
+        return max_output_tokens
+    ratio = engine.config.rc.context_overflow_retry_output_ratio
+    return max(1, int(max_output_tokens * ratio))
 
 
 def _history_has_file_write_result(engine: QueryEngine) -> bool:

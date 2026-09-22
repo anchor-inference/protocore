@@ -4,6 +4,15 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A context-overflow retry now reduces its output allowance.** Reactive
+  compaction still rebuilds the prompt once, and the rebuilt request uses half
+  the normal output cap by default so provider-only framing cannot cause an
+  unchanged request to hit the same context limit twice.
+
 ## [2.0.0a11]
 
 ### Fixed

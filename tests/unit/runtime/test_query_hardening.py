@@ -284,8 +284,33 @@ async def test_context_window_exceeded_triggers_force_compaction(
 
     # Engine ends COMPLETED — second LLM call succeeded.
     assert engine.state is LoopState.COMPLETED
-    assert failing_llm.calls, "expected the LLM to be called at least twice"
-    assert len(failing_llm.calls) >= 2
+    assert len(failing_llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_context_window_retry_halves_the_rejected_output_cap(
+    engine_factory, in_memory_runtime
+) -> None:
+    rc = LoopConstants(
+        model_context_window=65_536,
+        llm_output_max_tokens_ratio=0.125,
+        compaction_keep_recent_turns=1,
+    )
+    engine = engine_factory(rc=rc)
+    llm = _ScriptedFailureLLM(
+        exceptions=[LLMContextWindowExceeded("request exceeded context")],
+    )
+    engine.llm = llm  # type: ignore[assignment]
+    engine.context_manager._compaction_llm = llm  # type: ignore[attr-defined]
+    engine.compaction_llm = llm  # type: ignore[assignment]
+
+    async for _ in engine.run(
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
+    ):
+        pass
+
+    assert engine.state is LoopState.COMPLETED
+    assert [request.max_tokens for request in llm.calls] == [8_192, 4_096]
 
 
 @pytest.mark.asyncio
@@ -374,7 +399,11 @@ async def test_context_window_exceeded_second_failure_is_terminal(
     The recovery budget is one attempt; a second PTL in the same
     message drives terminal FAILED.
     """
-    rc = LoopConstants(model_context_window=4096, compaction_keep_recent_turns=1)
+    rc = LoopConstants(
+        model_context_window=65_536,
+        llm_output_max_tokens_ratio=0.125,
+        compaction_keep_recent_turns=1,
+    )
     engine = engine_factory(rc=rc)
     failing_llm = _ScriptedFailureLLM(
         exceptions=[
@@ -397,6 +426,7 @@ async def test_context_window_exceeded_second_failure_is_terminal(
     error_evts = [e for e in events if e.type is EventType.ERROR]
     assert error_evts
     assert error_evts[-1].payload["kind"] == "llm_context_window_exceeded"
+    assert [request.max_tokens for request in failing_llm.calls] == [8_192, 4_096]
 
 
 # ----------------------------------------------------------------------
@@ -529,6 +559,23 @@ def test_reset_recovery_state_resets_compaction_attempted(
     engine.reset_recovery_state()
 
     assert engine._compaction_attempted_for_current_turn is False
+
+
+def test_context_window_retry_cap_only_applies_inside_the_recovery_boundary(
+    engine_factory,
+) -> None:
+    from protocore.runtime.query import _apply_context_overflow_retry_output_cap
+
+    engine = engine_factory(
+        rc=LoopConstants(context_overflow_retry_output_ratio=0.5)
+    )
+    engine._compaction_attempted_for_current_turn = True
+
+    assert _apply_context_overflow_retry_output_cap(engine, 8_192) == 4_096
+
+    engine.reset_recovery_state()
+
+    assert _apply_context_overflow_retry_output_cap(engine, 8_192) == 8_192
 
 
 def test_new_engine_has_recovery_flags_reset(engine_factory) -> None:

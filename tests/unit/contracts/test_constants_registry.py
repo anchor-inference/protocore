@@ -540,6 +540,14 @@ class TestLoopGroup:
         assert spec.exclusive_minimum is True
         assert spec.maximum == 1.0
 
+    def test_context_overflow_retry_ratio_has_open_bounds(self) -> None:
+        spec = build_loop_group().spec("context_overflow_retry_output_ratio")
+        assert spec.default == 0.5
+        assert spec.minimum == 0.0
+        assert spec.exclusive_minimum is True
+        assert spec.maximum == 1.0
+        assert spec.exclusive_maximum is True
+
     def test_a_constant_without_a_bound_has_none(self) -> None:
         spec = build_loop_group().spec("continue_prompt_text")
         assert spec.minimum is None and spec.maximum is None
@@ -689,6 +697,17 @@ class TestOneValueAgainstItsOwnDescriptor:
     def test_a_value_over_its_ceiling_is_refused(self) -> None:
         with pytest.raises(ConstantValueError, match=r"must be <= 1\.0"):
             build_loop_group().spec("compaction_trigger_ratio").validate_value(2.0)
+
+    @pytest.mark.parametrize("value", [0.0, 1.0])
+    def test_context_overflow_retry_ratio_refuses_closed_boundaries(
+        self, value: float
+    ) -> None:
+        with pytest.raises(ValueError):
+            LoopConstants(context_overflow_retry_output_ratio=value)
+        with pytest.raises(ConstantValueError):
+            build_loop_group().spec(
+                "context_overflow_retry_output_ratio"
+            ).validate_value(value)
 
     def test_a_value_outside_the_enumeration_is_refused(self) -> None:
         with pytest.raises(ConstantValueError, match="is not one of"):

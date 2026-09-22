@@ -845,6 +845,16 @@ class LoopConstants(BaseModel):
             "the window reserved for output)."
         ),
     )
+    context_overflow_retry_output_ratio: float = Field(
+        default=0.5,
+        gt=0.0,
+        lt=1.0,
+        description=(
+            "Fraction of the normal assistant output cap used for the single "
+            "retry after a provider rejects a request for exceeding its context "
+            "window. The retry also compacts history before rebuilding the request."
+        ),
+    )
     pinned_tool_max_count: int = Field(
         default=15,
         gt=0,
