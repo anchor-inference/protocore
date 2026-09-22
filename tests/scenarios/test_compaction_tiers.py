@@ -68,6 +68,7 @@ def _tiered_rc(**overrides: Any) -> Any:
     """Constants that put all three tiers within reach of a short scenario."""
     values: dict[str, Any] = {
         "model_context_window": 2_048,
+        "request_context_safety_tokens": 0,
         "compaction_trigger_ratio": 0.4,
         "compaction_emergency_ratio": 0.6,
         "compaction_keep_recent_turns": 2,

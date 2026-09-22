@@ -796,7 +796,7 @@ class LoopConstants(BaseModel):
         ),
     )
     compaction_summary_string_max_chars: int = Field(
-        default=1024,
+        default=2048,
         gt=0,
         description=(
             "JSON-schema ``maxLength`` cap on the summary string field. "
@@ -2721,7 +2721,7 @@ class LoopConstants(BaseModel):
         description="Compact when context tokens exceed the window minus this reserve.",
     )
     request_context_safety_tokens: int = Field(
-        default=512,
+        default=1024,
         ge=0,
         description=(
             "Tokens kept unused when fitting a complete provider request to the model "

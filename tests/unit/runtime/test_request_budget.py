@@ -69,12 +69,12 @@ def test_default_margin_keeps_provider_framing_space_unused() -> None:
             context_window=65_536,
             safety_tokens=LoopConstants().request_context_safety_tokens,
         )
-        == 7_680
+        == 7_168
     )
 
 
 def test_default_margin_absorbs_additive_provider_framing_drift() -> None:
-    estimated_prompt_tokens = 57_280
+    estimated_prompt_tokens = 56_832
     provider_prompt_lower_bound = 57_345
     fitted = fit_max_tokens(
         prompt_tokens=estimated_prompt_tokens,
@@ -83,7 +83,7 @@ def test_default_margin_absorbs_additive_provider_framing_drift() -> None:
         safety_tokens=LoopConstants().request_context_safety_tokens,
     )
 
-    assert fitted == 7_744
+    assert fitted == 7_680
     assert provider_prompt_lower_bound + fitted <= 65_536
 
 
@@ -97,7 +97,7 @@ def test_request_fitting_wires_default_margin_into_the_hard_ceiling(
     )
     monkeypatch.setattr(
         "protocore.runtime.request_budget.estimate_request_prompt_tokens",
-        lambda request, constants: 57_280,
+        lambda request, constants: 56_832,
     )
 
     fitted = fit_request_to_context(
@@ -105,7 +105,7 @@ def test_request_fitting_wires_default_margin_into_the_hard_ceiling(
         LoopConstants(model_context_window=65_536),
     )
 
-    assert fitted.max_tokens == 7_744
+    assert fitted.max_tokens == 7_680
     assert 57_345 + fitted.max_tokens <= 65_536
 
 

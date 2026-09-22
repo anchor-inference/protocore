@@ -106,6 +106,7 @@ async def test_provider_count_from_an_old_request_does_not_trigger_compaction(
     run = scenario(
         rc=default_rc(
             model_context_window=1_000,
+            request_context_safety_tokens=0,
             compaction_trigger_ratio=0.5,
             compaction_keep_recent_turns=1,
         ),
@@ -139,6 +140,7 @@ async def test_a_prompt_over_the_cliff_is_compacted_unconditionally(
     run = scenario(
         rc=default_rc(
             model_context_window=1_000,
+            request_context_safety_tokens=0,
             compaction_trigger_ratio=0.5,
             compaction_emergency_ratio=0.8,
             compaction_keep_recent_turns=1,
@@ -169,6 +171,7 @@ async def test_the_cliff_switch_leaves_the_ordinary_gate_running(
     run = scenario(
         rc=default_rc(
             model_context_window=1_000,
+            request_context_safety_tokens=0,
             compaction_trigger_ratio=0.5,
             compaction_emergency_ratio=0.8,
             compaction_emergency_proactive_enabled=False,

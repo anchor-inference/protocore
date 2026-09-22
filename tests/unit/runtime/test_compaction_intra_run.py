@@ -1006,6 +1006,7 @@ async def _drive_long_tool_chain(
     # Small window so big tool outputs cross the trigger within the run.
     rc = LoopConstants(
         model_context_window=window,
+        request_context_safety_tokens=0,
         compaction_per_iteration_enabled=per_iteration_enabled,
         # Keep the test deterministic: only Tier-1 (no summariser LLM).
         compaction_keep_recent_turns=2,
