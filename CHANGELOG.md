@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0a20]
+
 ### Changed
 
 - **`LLMRequest.temperature` is unset unless the caller states one.** The
