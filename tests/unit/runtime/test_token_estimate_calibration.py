@@ -229,6 +229,8 @@ class _GateEngine:
         self.history: list[Message] = []
         self.state = LoopState.RUNNING
         self.compaction_backoff_left = 0
+        self.compaction_backoff_prompt_tokens = 0
+        self.prompt_tokens = 59_900
         self.needs = True
 
     def needs_emergency_compaction(self) -> bool:
@@ -248,7 +250,9 @@ async def test_empty_routine_pass_backs_the_gate_off() -> None:
         calls.append(reason)
         yield TurnEvent(type=EventType.COMPACTION_COMPLETED, run_id="r", payload={"tokens_before": 60_000, "tokens_after": 59_900})
 
-    policy = PerIterationCompactionPolicy(compact=compact, protect_index=lambda h: None)
+    policy = PerIterationCompactionPolicy(
+        compact=compact, protect_index=lambda h: None, prompt_tokens=lambda e: e.prompt_tokens
+    )
 
     async def run() -> list[TurnEvent]:
         turn = type("Turn", (), {"engine": engine, "outcome": type("O", (), {"directive": None, "reason": None})()})()
@@ -258,3 +262,38 @@ async def test_empty_routine_pass_backs_the_gate_off() -> None:
     assert engine.compaction_backoff_left == 2
     assert await run() == [] and await run() == [] and calls == ["proactive_per_iteration"]  # two skipped iterations
     assert len(await run()) == 1 and len(calls) == 2  # then it is consulted again
+
+
+@pytest.mark.asyncio
+async def test_prompt_growth_ends_the_no_gain_backoff_early() -> None:
+    """A new large result makes the old gain reading worthless; the gate runs again."""
+    rc = LoopConstants(
+        compaction_no_gain_backoff_iterations=6,
+        compaction_min_gain_ratio=0.03,
+        compaction_no_gain_backoff_growth_ratio=0.1,
+    )
+    engine = _GateEngine(rc)
+    calls: list[str] = []
+
+    async def compact(eng: Any, *, force: bool, reason: str, protect_tail_from_index: int | None) -> AsyncIterator[TurnEvent]:
+        calls.append(reason)
+        yield TurnEvent(type=EventType.COMPACTION_COMPLETED, run_id="r", payload={"tokens_before": 60_000, "tokens_after": 59_900})
+
+    policy = PerIterationCompactionPolicy(
+        compact=compact, protect_index=lambda h: None, prompt_tokens=lambda e: e.prompt_tokens
+    )
+
+    async def run() -> list[TurnEvent]:
+        turn = type("Turn", (), {"engine": engine, "outcome": type("O", (), {"directive": None, "reason": None})()})()
+        return [e async for e in policy.apply(turn)]  # type: ignore[arg-type]
+
+    await run()
+    assert engine.compaction_backoff_left == 6
+    assert engine.compaction_backoff_prompt_tokens == 59_900
+
+    engine.prompt_tokens = 60_500  # grew, but by less than the ratio
+    assert await run() == [] and len(calls) == 1
+    assert engine.compaction_backoff_left == 5
+
+    engine.prompt_tokens = 66_000  # a large result arrived
+    assert len(await run()) == 1 and len(calls) == 2

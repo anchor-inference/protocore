@@ -45,8 +45,8 @@ All notable changes to this project are recorded here. The format follows
   now reports a zero `Tier3Result` instead of `None`.
 - **Proactive compaction running out of budget no longer fails the run.**
   Nothing has been rejected at that point. The proactive summariser tiers are
-  suspended (one `compaction_exhausted_proactive_suspended` state change, no
-  `ERROR` event) and the request goes out; Tier 1, which needs no LLM, keeps
+  suspended (a `compaction_exhausted_proactive_suspended` state change each
+  time, no `ERROR` event) and the request goes out; Tier 1, which needs no LLM, keeps
   running. The suspension ends after `compaction_proactive_suspension_iterations`
   gate visits (default 6) or once the prompt has grown by
   `compaction_proactive_suspension_growth_ratio` (default 0.1) of its size when
@@ -58,7 +58,11 @@ All notable changes to this project are recorded here. The format follows
 - **`compaction_no_gain_backoff_iterations` takes effect.** The per-message
   recovery reset zeroed the backoff before the per-iteration gate could read
   it, so a low-gain routine pass ran on every iteration. The count now
-  survives the reset.
+  survives the reset. It ends early once the prompt has grown by
+  `compaction_no_gain_backoff_growth_ratio` (default 0.1) of its size when it
+  was set, so a new large tool result is not left alone, and on any context
+  refusal. `PerIterationCompactionPolicy` takes a `prompt_tokens` callable for
+  that measurement, and `ITurnState` gains `compaction_backoff_prompt_tokens`.
 - **`RequestTokenCounterConformance` and `LifecycleRegistryConformance` are
   importable from `protocore.conformance`.** Both were in `SUITES` but only
   reachable through `protocore.conformance.suites`. The package's own tests now

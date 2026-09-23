@@ -630,6 +630,12 @@ class TestLoopGroup:
         assert spec.minimum == 1.0
         assert spec.kind == "int"
 
+    def test_backoff_growth_bound_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("compaction_no_gain_backoff_growth_ratio")
+        assert spec.default == 0.1
+        assert spec.minimum == 0.0 and spec.exclusive_minimum is True
+        assert spec.kind == "float"
+
     def test_proactive_suspension_bounds_are_dashboard_configurable(self) -> None:
         group = build_loop_group()
         visits = group.spec("compaction_proactive_suspension_iterations")

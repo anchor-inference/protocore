@@ -480,6 +480,9 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/context/manager.py::ContextManager.has_proactive_work": _whole(
         "asks every tier whether a proactive pass over the transcript would change it"
     ),
+    "protocore/runtime/query.py::_current_prompt_tokens": _whole(
+        "measures the whole prompt, which is what the backoff's growth bound compares"
+    ),
     "protocore/runtime/query.py::_suspend_proactive_compaction": _whole(
         "records the size of the whole prompt, which is what the growth bound measures"
     ),

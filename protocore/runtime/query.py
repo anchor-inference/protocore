@@ -2467,6 +2467,11 @@ def _lift_proactive_suspension(engine: QueryEngine) -> None:
     engine._idle_compaction_probe = None
 
 
+def _current_prompt_tokens(engine: QueryEngine) -> int:
+    """The calibrated size of the run's prompt as it stands."""
+    return engine.context_manager.current_prompt_tokens(engine.history)
+
+
 def _proactive_llm_tiers_allowed(engine: QueryEngine) -> bool:
     """Whether this gate visit may use the summariser tiers; counts the visit down."""
     if engine._proactive_suspension_gates_left <= 0:
@@ -5506,8 +5511,10 @@ async def _handle_context_window_exceeded(
     # A request has now been refused — by the provider, or by the local fit
     # before it was sent: the evidence a suspended proactive gate was waiting
     # for. Whatever this pass achieves, the history the gate sees next is
-    # judged afresh.
+    # judged afresh — and a no-gain backoff, whose reading predates the
+    # refusal, no longer holds either.
     _lift_proactive_suspension(engine)
+    engine.compaction_backoff_left = 0
     from_state = engine.state
     engine.transition_to(LoopState.COMPACTING)
     yield _emit_state_change(engine, from_state, LoopState.COMPACTING, reason="reactive_413")
@@ -12407,6 +12414,7 @@ _CORE_TURN_POLICIES: Final[TurnPolicyRegistry] = TurnPolicyRegistry(
         PerIterationCompactionPolicy(
             compact=_run_compaction,
             protect_index=current_tool_batch_protect_index,
+            prompt_tokens=_current_prompt_tokens,
         ),
         TerminalNudgePolicy(
             required=_terminal_tool_nudge_required,

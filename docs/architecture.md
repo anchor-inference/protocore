@@ -635,9 +635,10 @@ crashes. The shared assistant loop is **not** a single immutable path:
   snapshot. The engine remembers that probe with the history and the constants
   it saw, and does not ask again until either changes. Past the budget, a
   proactive pass does not end the run: nothing has been rejected yet, so the
-  proactive summariser tiers are suspended (one
-  `compaction_exhausted_proactive_suspended` state change) and the request goes
-  out. Tier 1 needs no LLM and keeps running through the suspension. The
+  proactive summariser tiers are suspended (a
+  `compaction_exhausted_proactive_suspended` state change each time a
+  proactive pass exhausts the budget; `retry_count` is not reset, so after the
+  suspension one failed pass suspends again) and the request goes out. Tier 1 needs no LLM and keeps running through the suspension. The
   suspension ends after `compaction_proactive_suspension_iterations` gate
   visits, or once the prompt has grown by
   `compaction_proactive_suspension_growth_ratio` of its size when it began,
@@ -651,7 +652,10 @@ crashes. The shared assistant loop is **not** a single immutable path:
   The routine per-iteration gate also stands down for
   `compaction_no_gain_backoff_iterations` iterations after a pass that freed
   less than `compaction_min_gain_ratio`; the count survives the per-message
-  recovery reset, which used to clear it before it could skip anything.
+  recovery reset, which used to clear it before it could skip anything. The
+  backoff ends early once the prompt has grown by
+  `compaction_no_gain_backoff_growth_ratio` of its size when it was set, and on
+  any context refusal.
 
 - `runtime/stale_result_trim.py` — the prompt-shrinking pass that costs no LLM
   call. RC-gated by `tool_result_stale_trim_enabled` (**off by default**), it

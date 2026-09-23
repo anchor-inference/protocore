@@ -122,6 +122,15 @@ class LoopConstants(BaseModel):
             "freed less than compaction_min_gain_ratio. 0 disables the backoff."
         ),
     )
+    compaction_no_gain_backoff_growth_ratio: float = Field(
+        default=0.1,
+        gt=0.0,
+        description=(
+            "The no-gain backoff ends early once the prompt has grown by this "
+            "fraction of its size when the backoff was set: the new content may "
+            "be exactly what the pass can shed. A context refusal ends it too."
+        ),
+    )
     compaction_proactive_suspension_iterations: int = Field(
         default=6,
         ge=1,

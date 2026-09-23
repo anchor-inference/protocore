@@ -97,6 +97,7 @@ _RESET_ON_REARM: frozenset[str] = frozenset(
         "_context_overflow_retry_max_tokens",
         "_context_overflow_corrective_retry_count",
         "compaction_backoff_left",
+        "compaction_backoff_prompt_tokens",
         "_max_output_recovery_count",
         "_terminal_backstop_turn_active",
         "_tool_call_truncated_recovery_count",

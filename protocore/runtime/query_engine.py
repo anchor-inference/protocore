@@ -986,6 +986,8 @@ class QueryEngine:
         self._context_overflow_corrective_retry_count: int = 0
         # Iterations the per-iteration compaction gate still skips after a pass that freed nothing.
         self.compaction_backoff_left: int = 0
+        # The prompt's size when that backoff was set, so growth can end it.
+        self.compaction_backoff_prompt_tokens: int = 0
         # Max-output-tokens recovery: count of "Resume directly" retries
         # already issued in the current message stream.
         self._max_output_recovery_count: int = 0

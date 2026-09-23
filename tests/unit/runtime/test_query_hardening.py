@@ -4028,6 +4028,8 @@ async def test_a_provider_rejection_lifts_the_proactive_suspension(
     engine._proactive_suspension_gates_left = 3
     engine._proactive_suspension_prompt_tokens = 10**9
 
+    engine.compaction_backoff_left = 3
+
     events = [
         event
         async for event in engine.run(
@@ -4041,6 +4043,7 @@ async def test_a_provider_rejection_lifts_the_proactive_suspension(
         for event in events
         if event.type is EventType.COMPACTION_STARTED
     ]
+    assert engine.compaction_backoff_left == 0
     assert engine.proactive_compaction_suspended is False
 
 

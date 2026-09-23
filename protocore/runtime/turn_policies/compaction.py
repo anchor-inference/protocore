@@ -20,6 +20,7 @@ reactive path.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
+from typing import Any
 
 from protocore.contracts.turn_policy import TurnContext, TurnCoordinate
 from protocore.contracts.types import Message
@@ -31,6 +32,9 @@ Compactor = Callable[..., AsyncIterator[TurnEvent]]
 #: Where the in-flight tool batch starts, so compaction leaves it alone.
 BatchProtectIndex = Callable[[list[Message]], int | None]
 
+#: The calibrated size of the run's prompt as it stands.
+PromptTokens = Callable[[Any], int]
+
 
 class PerIterationCompactionPolicy:
     """Compact between a dispatched batch and the stream that will read it."""
@@ -38,16 +42,18 @@ class PerIterationCompactionPolicy:
     name = "per_iteration_compaction"
     coordinates = frozenset({TurnCoordinate.iteration_end})
 
-    __slots__ = ("_compact", "_protect_index")
+    __slots__ = ("_compact", "_prompt_tokens", "_protect_index")
 
     def __init__(
         self,
         *,
         compact: Compactor,
         protect_index: BatchProtectIndex,
+        prompt_tokens: PromptTokens,
     ) -> None:
         self._compact = compact
         self._protect_index = protect_index
+        self._prompt_tokens = prompt_tokens
 
     async def apply(self, turn: TurnContext) -> AsyncIterator[TurnEvent]:
         engine = turn.engine
@@ -59,10 +65,20 @@ class PerIterationCompactionPolicy:
             and engine.needs_emergency_compaction()
         )
         if not emergency and engine.compaction_backoff_left > 0:
-            # The last routine pass changed nothing the next one could improve on;
-            # paying for it every iteration is the crawl the backoff exists to stop.
-            engine.compaction_backoff_left -= 1
-            return
+            grown_past = engine.compaction_backoff_prompt_tokens * (
+                1.0 + rc.compaction_no_gain_backoff_growth_ratio
+            )
+            if self._prompt_tokens(engine) >= grown_past:
+                # The gain reading the backoff rests on describes a history
+                # that is no longer there: new content arrived, and it may be
+                # exactly what the pass can shed.
+                engine.compaction_backoff_left = 0
+            else:
+                # The last routine pass changed nothing the next one could
+                # improve on; paying for it every iteration is the crawl the
+                # backoff exists to stop.
+                engine.compaction_backoff_left -= 1
+                return
         if not emergency and not engine.needs_compaction():
             return
         before = after = 0
@@ -82,6 +98,7 @@ class PerIterationCompactionPolicy:
             yield event
         if not emergency and before > 0 and (before - after) < rc.compaction_min_gain_ratio * before:
             engine.compaction_backoff_left = rc.compaction_no_gain_backoff_iterations
+            engine.compaction_backoff_prompt_tokens = after
 
 
-__all__ = ["BatchProtectIndex", "Compactor", "PerIterationCompactionPolicy"]
+__all__ = ["BatchProtectIndex", "Compactor", "PerIterationCompactionPolicy", "PromptTokens"]
