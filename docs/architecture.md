@@ -632,14 +632,26 @@ crashes. The shared assistant loop is **not** a single immutable path:
   it would change anything under the proactive profile, without changing it;
   when none would — a history of seeded turns is the usual case — the gate
   opens no transaction at all: no `COMPACTING`, no events, hooks, usage row or
-  snapshot. The engine remembers that probe with the history it saw and does
-  not ask again until the history changes. Past the budget, a proactive pass
-  does not end the run: nothing has been rejected yet, so proactive compaction
-  is suspended (one `compaction_exhausted_proactive_suspended` state change)
-  and the request goes out. The next provider rejection lifts the suspension
-  and runs the reactive pass. A reactive pass past its budget hands the turn to
-  the output-cap ladder while a smaller cap is left, and fails the run only
-  when none is.
+  snapshot. The engine remembers that probe with the history and the constants
+  it saw, and does not ask again until either changes. Past the budget, a
+  proactive pass does not end the run: nothing has been rejected yet, so the
+  proactive summariser tiers are suspended (one
+  `compaction_exhausted_proactive_suspended` state change) and the request goes
+  out. Tier 1 needs no LLM and keeps running through the suspension. The
+  suspension ends after `compaction_proactive_suspension_iterations` gate
+  visits, or once the prompt has grown by
+  `compaction_proactive_suspension_growth_ratio` of its size when it began,
+  whichever comes first. A context refusal lifts it at once — the provider's,
+  or the local fit's refusal by estimate or exact count, both of which run the
+  reactive pass — and so do `rearm()` and a resume from a snapshot, which does
+  not carry it. A reactive pass past its budget hands the turn to the
+  output-cap ladder while a smaller cap is left, and fails the run only when
+  none is.
+
+  The routine per-iteration gate also stands down for
+  `compaction_no_gain_backoff_iterations` iterations after a pass that freed
+  less than `compaction_min_gain_ratio`; the count survives the per-message
+  recovery reset, which used to clear it before it could skip anything.
 
 - `runtime/stale_result_trim.py` — the prompt-shrinking pass that costs no LLM
   call. RC-gated by `tool_result_stale_trim_enabled` (**off by default**), it

@@ -363,6 +363,7 @@ class ContextManager:
         *,
         force: bool,
         protect_tail_from_index: int | None = None,
+        llm_tiers: bool = True,
     ) -> bool:
         """Whether a proactive pass would find anything its profile may touch.
 
@@ -374,7 +375,8 @@ class ContextManager:
         window, seeded history untouched), so a ``False`` here is exactly a
         pass that would have changed nothing and called nothing. ``force``
         selects :meth:`force_compaction`'s rules, under which units the
-        failure census has written off are still eligible.
+        failure census has written off are still eligible. ``llm_tiers=False``
+        asks about Tier 1 alone, as a pass run with the same flag would.
         """
         budgets = derive_budgets(self._rc)
         if tier1_has_work(
@@ -384,7 +386,7 @@ class ContextManager:
             protect_tail_from_index=protect_tail_from_index,
         ):
             return True
-        if self._compaction_llm is None:
+        if self._compaction_llm is None or not llm_tiers:
             return False
         if tier2_has_work(
             history,
@@ -408,8 +410,12 @@ class ContextManager:
         observability: LLMObservabilityContext | None = None,
         protect_tail_from_index: int | None = None,
         record_request: RequestRecorder | None = None,
+        llm_tiers: bool = True,
     ) -> CompactionAttempt:
         """Run Tier 1 truncation; fall through to Tier 2 if needed.
+
+        ``llm_tiers=False`` runs Tier 1 alone — the proactive gates do that
+        while their summariser tiers are suspended.
 
         Charges :attr:`CompactionState.retry_count` once per failed pass and
         nothing for a pass that found nothing to compact (see
@@ -462,7 +468,11 @@ class ContextManager:
             * self._rc.compaction_routine_min_clear_ratio
         )
         tier_error: Exception | None = None
-        if tier1.tokens_freed < min_clear_target and self._compaction_llm is not None:
+        if (
+            llm_tiers
+            and tier1.tokens_freed < min_clear_target
+            and self._compaction_llm is not None
+        ):
             try:
                 tier2 = await run_tier2_summarisation(
                     history=history,
@@ -485,14 +495,15 @@ class ContextManager:
                 tier2 = Tier2Result(turns_summarised=0, tokens_freed=0)
             attempt.tier2 = tier2
 
-        attempt.tier3 = await self._fold(
-            history,
-            compaction_state,
-            model_name,
-            observability,
-            protect_tail_from_index,
-            record_request,
-        )
+        if llm_tiers:
+            attempt.tier3 = await self._fold(
+                history,
+                compaction_state,
+                model_name,
+                observability,
+                protect_tail_from_index,
+                record_request,
+            )
 
         tokens_after = self._token_estimator.estimate_history(history, self._rc)
         attempt.tokens_after = tokens_after
@@ -517,6 +528,7 @@ class ContextManager:
         protect_tail_from_index: int | None = None,
         record_request: RequestRecorder | None = None,
         reactive: bool = False,
+        llm_tiers: bool = True,
     ) -> CompactionAttempt:
         """Run BOTH Tier 1 + Tier 2 unconditionally for emergency recovery.
 
@@ -586,8 +598,9 @@ class ContextManager:
         attempt.tier1 = tier1
         compaction_state.blob_refs_created.extend(tier1.blob_refs_created)
 
-        # Tier 2 ALWAYS runs in force mode (provider already signalled PTL).
-        if self._compaction_llm is not None:
+        # Tier 2 always runs in force mode, unless the caller has suspended
+        # the summariser tiers (``llm_tiers=False``, proactive only).
+        if self._compaction_llm is not None and llm_tiers:
             # Free aggressively but bounded — enough to bring the post-Tier-1
             # history back under the trigger threshold so the request can
             # re-stream, without summarising every eligible turn serially.
@@ -619,16 +632,17 @@ class ContextManager:
                 tier2 = Tier2Result(turns_summarised=0, tokens_freed=0)
             attempt.tier2 = tier2
 
-        attempt.tier3 = await self._fold(
-            history,
-            compaction_state,
-            model_name,
-            observability,
-            protect_tail_from_index,
-            record_request,
-            keep_recent_turns=force_keep_recent_turns,
-            compact_seeded_history=compact_seeded_history,
-        )
+        if llm_tiers:
+            attempt.tier3 = await self._fold(
+                history,
+                compaction_state,
+                model_name,
+                observability,
+                protect_tail_from_index,
+                record_request,
+                keep_recent_turns=force_keep_recent_turns,
+                compact_seeded_history=compact_seeded_history,
+            )
 
         tokens_after = self._token_estimator.estimate_history(history, self._rc)
         attempt.tokens_after = tokens_after

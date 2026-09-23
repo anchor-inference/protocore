@@ -3934,12 +3934,18 @@ def test_an_idle_probe_is_not_repeated_until_the_history_changes(
     monkeypatch.setattr(engine.context_manager, "has_proactive_work", _count_probe)
 
     for _ in range(3):
-        assert _proactive_pass_is_idle(engine, force=True, protect_tail_from_index=None)
+        assert _proactive_pass_is_idle(engine, force=True, protect_tail_from_index=None, llm_tiers=True)
     assert asked == [True]
 
     # Another profile is another question.
-    assert _proactive_pass_is_idle(engine, force=False, protect_tail_from_index=None)
+    assert _proactive_pass_is_idle(engine, force=False, protect_tail_from_index=None, llm_tiers=True)
     assert asked == [True, False]
+
+    # New constants are another question too: a recalibrated estimate can move
+    # a unit across the summariser floor without the history changing.
+    engine.set_token_estimate_calibration(2.0, model_name="m")
+    assert _proactive_pass_is_idle(engine, force=False, protect_tail_from_index=None, llm_tiers=True)
+    assert asked == [True, False, False]
 
     # A changed history is asked about again — here it now holds a large
     # current-run turn the proactive profile may summarise.
@@ -3947,8 +3953,8 @@ def test_an_idle_probe_is_not_repeated_until_the_history_changes(
         Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="current " * 2_000)])
     )
     engine.history.append(Message(role=MessageRole.user, content_blocks=[TextBlock(text="go on")]))
-    assert not _proactive_pass_is_idle(engine, force=True, protect_tail_from_index=None)
-    assert asked == [True, False, True]
+    assert not _proactive_pass_is_idle(engine, force=True, protect_tail_from_index=None, llm_tiers=True)
+    assert asked == [True, False, False, True]
     assert engine._idle_compaction_probe is None
 
 
@@ -3989,7 +3995,7 @@ async def test_proactive_exhaustion_suspends_proactive_compaction_instead_of_fai
         if event.type is EventType.STATE_CHANGED
     ]
     assert reasons.count("compaction_exhausted_proactive_suspended") == 1
-    assert engine._proactive_compaction_suspended is True
+    assert engine.proactive_compaction_suspended is True
 
     # Suspended: the next gate is not opened, and makes no summariser call.
     calls_before = summariser.summary_calls
@@ -4019,7 +4025,8 @@ async def test_a_provider_rejection_lifts_the_proactive_suspension(
             )
         ],
     )
-    engine._proactive_compaction_suspended = True
+    engine._proactive_suspension_gates_left = 3
+    engine._proactive_suspension_prompt_tokens = 10**9
 
     events = [
         event
@@ -4034,7 +4041,7 @@ async def test_a_provider_rejection_lifts_the_proactive_suspension(
         for event in events
         if event.type is EventType.COMPACTION_STARTED
     ]
-    assert engine._proactive_compaction_suspended is False
+    assert engine.proactive_compaction_suspended is False
 
 
 @pytest.mark.asyncio
@@ -4050,11 +4057,145 @@ async def test_rearm_starts_both_retry_budgets_over(engine_factory) -> None:
     engine.compaction_state.retry_count = 2
     engine.compaction_state.reactive_retry_count = 2
     engine.compaction_state.summarised_turn_ids.add("kept")
-    engine._proactive_compaction_suspended = True
+    engine._proactive_suspension_gates_left = 3
+    engine._proactive_suspension_prompt_tokens = 10**9
 
     engine.rearm()
 
     assert engine.compaction_state.retry_count == 0
     assert engine.compaction_state.reactive_retry_count == 0
     assert engine.compaction_state.summarised_turn_ids == {"kept"}
-    assert engine._proactive_compaction_suspended is False
+    assert engine.proactive_compaction_suspended is False
+
+
+def test_a_suspension_expires_after_the_configured_gate_visits(engine_factory) -> None:
+    from protocore.runtime.query import (
+        _proactive_llm_tiers_allowed,
+        _suspend_proactive_compaction,
+    )
+
+    engine = engine_factory(
+        rc=LoopConstants(
+            model_context_window=65_536, compaction_proactive_suspension_iterations=2
+        )
+    )
+    engine.history.extend(_seeded_prior_turns())
+    _suspend_proactive_compaction(engine)
+
+    assert [_proactive_llm_tiers_allowed(engine) for _ in range(3)] == [False, False, True]
+    assert engine.proactive_compaction_suspended is False
+
+
+def test_a_suspension_expires_once_the_prompt_has_grown(engine_factory) -> None:
+    from protocore.runtime.query import (
+        _proactive_llm_tiers_allowed,
+        _suspend_proactive_compaction,
+    )
+
+    engine = engine_factory(
+        rc=LoopConstants(
+            model_context_window=65_536,
+            compaction_proactive_suspension_iterations=100,
+            compaction_proactive_suspension_growth_ratio=0.25,
+        )
+    )
+    engine.history.extend(_seeded_prior_turns())
+    _suspend_proactive_compaction(engine)
+    assert _proactive_llm_tiers_allowed(engine) is False
+
+    engine.history.append(
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="more " * 2_000)])
+    )
+
+    assert _proactive_llm_tiers_allowed(engine) is True
+    assert engine.proactive_compaction_suspended is False
+
+
+@pytest.mark.asyncio
+async def test_tier1_keeps_running_while_the_summariser_tiers_are_suspended(
+    engine_factory,
+) -> None:
+    from protocore.runtime.query import _run_compaction, _suspend_proactive_compaction
+
+    engine = engine_factory(
+        rc=LoopConstants(model_context_window=65_536, compaction_keep_recent_turns=1)
+    )
+    summariser = _DeadSummariser()
+    engine.context_manager._compaction_llm = summariser  # type: ignore[attr-defined]
+    engine.compaction_llm = summariser  # type: ignore[assignment]
+    engine.history.extend(
+        [
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text="task")]),
+            Message(
+                role=MessageRole.assistant,
+                content_blocks=[
+                    ToolUseBlock(tool_call_id="c1", name="Read", arguments_json="{}")
+                ],
+            ),
+            Message(
+                role=MessageRole.tool,
+                content_blocks=[ToolResultBlock(tool_call_id="c1", content="r" * 60_000)],
+            ),
+            Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="prior " * 800)]),
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text="go on")]),
+        ]
+    )
+    _suspend_proactive_compaction(engine)
+    engine.transition_to(LoopState.RUNNING)
+
+    events = [event async for event in _run_compaction(engine, force=True)]
+
+    assert [e.type for e in events].count(EventType.COMPACTION_COMPLETED) == 1
+    completed = next(e for e in events if e.type is EventType.COMPACTION_COMPLETED)
+    assert completed.payload["tier1_freed"] > 0
+    assert summariser.summary_calls == 0
+    assert engine.proactive_compaction_suspended is True
+
+
+@pytest.mark.asyncio
+async def test_the_no_gain_backoff_skips_iterations_in_a_real_run(
+    engine_factory, in_memory_runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backoff survives the per-message reset, so the gate really stands down."""
+    from protocore.runtime.context.compaction import CompactionAttempt
+
+    rc = LoopConstants(
+        model_context_window=65_536,
+        compaction_no_gain_backoff_iterations=2,
+        compaction_min_gain_ratio=0.03,
+    )
+    engine = engine_factory(rc=rc)
+    llm = in_memory_runtime["llm"]
+    for i in range(5):
+        llm.queue_tool_call_response(
+            tool_call_id=f"call-{i}", tool_name="Read", tool_input={"v": str(i)}
+        )
+    llm.queue_response(text="done")
+    in_memory_runtime["tools"].register(MockTool(tool_name="Read"))
+    monkeypatch.setattr(engine, "needs_compaction", lambda: True)
+    monkeypatch.setattr(engine, "needs_emergency_compaction", lambda: False)
+    engine.context_manager.has_proactive_work = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: True
+    )
+
+    async def _no_gain(**_kwargs: Any) -> CompactionAttempt:
+        return CompactionAttempt(tokens_before=1_000, tokens_after=1_000)
+
+    engine.context_manager.run_compaction = _no_gain  # type: ignore[method-assign]
+
+    events = [
+        event
+        async for event in engine.run(
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text="go")])
+        )
+    ]
+
+    assert engine.state is LoopState.COMPLETED
+    per_iteration = [
+        event
+        for event in events
+        if event.type is EventType.COMPACTION_STARTED
+        and event.payload.get("reason") == "proactive_per_iteration"
+    ]
+    # Five tool iterations: a pass, two skipped, a pass, one skipped.
+    assert len(per_iteration) == 2

@@ -12,9 +12,10 @@ only keeps the trailing few messages would summarise the fifth-from-last of a
 wide parallel batch in the same iteration that produced it.
 
 A pass here is proactive: nothing has been rejected yet. A pass with nothing
-to do is not opened, and one that exhausts the retry budget suspends proactive
-compaction instead of ending the run — the request goes out, and a real
-rejection is recovered by the reactive path.
+to do is not opened, and one that exhausts the retry budget suspends the
+summariser tiers for a bounded stretch instead of ending the run — the request
+goes out, Tier 1 keeps running, and a real rejection is recovered by the
+reactive path.
 """
 from __future__ import annotations
 

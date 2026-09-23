@@ -630,6 +630,17 @@ class TestLoopGroup:
         assert spec.minimum == 1.0
         assert spec.kind == "int"
 
+    def test_proactive_suspension_bounds_are_dashboard_configurable(self) -> None:
+        group = build_loop_group()
+        visits = group.spec("compaction_proactive_suspension_iterations")
+        assert visits.default == 6
+        assert visits.minimum == 1.0
+        assert visits.kind == "int"
+        growth = group.spec("compaction_proactive_suspension_growth_ratio")
+        assert growth.default == 0.1
+        assert growth.minimum == 0.0 and growth.exclusive_minimum is True
+        assert growth.kind == "float"
+
     def test_summary_chars_per_word_is_dashboard_configurable(self) -> None:
         spec = build_loop_group().spec("compaction_summary_chars_per_word")
         assert spec.default == 6

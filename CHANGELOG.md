@@ -36,19 +36,29 @@ All notable changes to this project are recorded here. The format follows
   first. When no tier would change anything under the proactive profile — a
   history of turns seeded from earlier runs is the usual case — there is no
   `COMPACTING` state, no compaction events, hooks, usage row or snapshot. The
-  engine then skips the gate without asking again until the history changes.
+  engine then skips the gate without asking again until the history or the
+  constants change.
   Before, such a pass ran on every iteration once the estimate crossed the
   gate. `Tier2Result.units_attempted` and `Tier3Result.spans_attempted` report
   the calls a pass made. `tier1_has_work`, `tier2_has_work` and
   `tier3_has_work` answer the same question for each tier. A fold that raises
   now reports a zero `Tier3Result` instead of `None`.
 - **Proactive compaction running out of budget no longer fails the run.**
-  Nothing has been rejected at that point. Proactive compaction is suspended
-  (one `compaction_exhausted_proactive_suspended` state change, no `ERROR`
-  event), the request goes out, and the next provider rejection lifts the
-  suspension and runs the reactive pass. `PerIterationCompactionPolicy` no
-  longer takes `pair_orphans` or `message_stop`, since it no longer ends the
-  turn.
+  Nothing has been rejected at that point. The proactive summariser tiers are
+  suspended (one `compaction_exhausted_proactive_suspended` state change, no
+  `ERROR` event) and the request goes out; Tier 1, which needs no LLM, keeps
+  running. The suspension ends after `compaction_proactive_suspension_iterations`
+  gate visits (default 6) or once the prompt has grown by
+  `compaction_proactive_suspension_growth_ratio` (default 0.1) of its size when
+  it began. A context refusal — the provider's, or the local fit's — lifts it
+  at once and runs the reactive pass, as do `rearm()` and a snapshot resume.
+  `ContextManager.run_compaction` and `force_compaction` take `llm_tiers` to run
+  Tier 1 alone. `PerIterationCompactionPolicy` no longer takes `pair_orphans`
+  or `message_stop`, since it no longer ends the turn.
+- **`compaction_no_gain_backoff_iterations` takes effect.** The per-message
+  recovery reset zeroed the backoff before the per-iteration gate could read
+  it, so a low-gain routine pass ran on every iteration. The count now
+  survives the reset.
 - **`RequestTokenCounterConformance` and `LifecycleRegistryConformance` are
   importable from `protocore.conformance`.** Both were in `SUITES` but only
   reachable through `protocore.conformance.suites`. The package's own tests now

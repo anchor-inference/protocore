@@ -189,9 +189,11 @@ Finalization gate (host-owned)
   charged once to a retry budget (`compaction_failed_max_retries`; the
   reactive pass after a provider rejection has its own), and a proactive pass
   with nothing eligible is not opened at all. Past the budget
-  `CompactionExhaustedError` suspends proactive compaction until the provider
-  rejects a request; after a rejection it hands the turn to the output-cap
-  ladder, and only when no smaller cap is left does the loop go to `FAILED`. Operator
+  `CompactionExhaustedError` on a proactive pass suspends the proactive
+  summariser tiers for a bounded stretch (Tier 1 keeps running; a context
+  refusal, `rearm()` or a snapshot resume ends it sooner); on a reactive pass it
+  hands the turn to the output-cap ladder, and only when no smaller cap is left
+  does the loop go to `FAILED`. Operator
   `/compact` is a separate `CompactCheckpoint` path
   (`runtime/compact_checkpoint.py`, `compaction_manual_enabled` default
   `False`). Cross-run fold lives in `runtime/context/session_memory.py`

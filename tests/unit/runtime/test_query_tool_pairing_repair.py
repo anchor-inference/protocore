@@ -1323,7 +1323,7 @@ async def test_routine_compaction_exhaustion_leaves_a_pairing_valid_history(
         evt.payload.get("reason") for evt in events if evt.type is EventType.STATE_CHANGED
     ]
     assert "compaction_exhausted_proactive_suspended" in reasons
-    assert engine._proactive_compaction_suspended is True
+    assert engine.proactive_compaction_suspended is True
     assert engine.is_terminal
     assert "compact_call" in _tool_result_ids(list(engine.history))
 

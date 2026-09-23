@@ -122,6 +122,25 @@ class LoopConstants(BaseModel):
             "freed less than compaction_min_gain_ratio. 0 disables the backoff."
         ),
     )
+    compaction_proactive_suspension_iterations: int = Field(
+        default=6,
+        ge=1,
+        description=(
+            "After a proactive compaction pass exhausts compaction_failed_max_retries, "
+            "the proactive gates skip their summariser tiers for this many gate "
+            "visits; the no-LLM truncation tier keeps running. A provider or local "
+            "context refusal lifts the suspension at once."
+        ),
+    )
+    compaction_proactive_suspension_growth_ratio: float = Field(
+        default=0.1,
+        gt=0.0,
+        description=(
+            "A suspension of proactive compaction also ends once the prompt has "
+            "grown by this fraction of its size when the suspension began: the "
+            "history the summariser failed on is no longer the one in front of it."
+        ),
+    )
     token_estimate_calibration: float = Field(
         default=1.0,
         ge=1.0,

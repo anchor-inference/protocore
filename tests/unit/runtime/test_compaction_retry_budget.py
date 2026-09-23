@@ -266,10 +266,13 @@ async def test_a_routine_pass_with_nothing_eligible_spends_nothing() -> None:
 def _probe_shapes() -> dict[str, list[Message]]:
     """Histories on either side of the proactive profile's eligibility line."""
     from protocore.contracts.types import (
+        COMPACTION_REFERENCE_METADATA_KEY,
+        COMPACTION_SUMMARY_METADATA_KEY,
         SYNTHETIC_RECOVERY_METADATA_KEY,
         ToolResultBlock,
         ToolUseBlock,
     )
+    from protocore.runtime.context.compaction import _wrap_compaction_summary
 
     task = Message(role=MessageRole.user, content_blocks=[TextBlock(text="task")])
     tail = [
@@ -308,6 +311,52 @@ def _probe_shapes() -> dict[str, list[Message]]:
             ),
             *tail,
         ],
+        # Only the fold has work: a run of old summaries, nothing Tier 1 or
+        # Tier 2 may touch.
+        "old summaries only": [
+            task,
+            *(
+                Message(
+                    role=MessageRole.user,
+                    content_blocks=[
+                        TextBlock(
+                            text=_wrap_compaction_summary(f"k{i}", f"step {i} " * 150)
+                        )
+                    ],
+                    metadata={COMPACTION_SUMMARY_METADATA_KEY: True},
+                )
+                for i in range(12)
+            ),
+            *tail,
+        ],
+        "over-budget reference block": [
+            Message(
+                role=MessageRole.user,
+                content_blocks=[TextBlock(text="environment " * 20_000)],
+                metadata={COMPACTION_REFERENCE_METADATA_KEY: True},
+            ),
+            task,
+            Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="ok")]),
+            *tail,
+        ],
+        # The large result belongs to the batch just produced; with the tail
+        # protected there is nothing to do, without it there is.
+        "large result in the protected tail": [
+            task,
+            Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="ok")]),
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text="go on")]),
+            Message(
+                role=MessageRole.assistant,
+                content_blocks=[
+                    ToolUseBlock(tool_call_id="c9", name="read", arguments_json="{}")
+                ],
+            ),
+            Message(
+                role=MessageRole.tool,
+                content_blocks=[ToolResultBlock(tool_call_id="c9", content="r" * 60_000)],
+            ),
+            *tail,
+        ],
         "aged recovery nudge": [
             task,
             Message(
@@ -321,28 +370,72 @@ def _probe_shapes() -> dict[str, list[Message]]:
     }
 
 
+@pytest.mark.parametrize("llm_tiers", [True, False])
+@pytest.mark.parametrize("protect_tail", [False, True])
 @pytest.mark.parametrize("force", [True, False])
 @pytest.mark.parametrize("shape", list(_probe_shapes()))
 @pytest.mark.asyncio
-async def test_the_probe_agrees_with_the_pass_it_stands_in_for(shape: str, force: bool) -> None:
+async def test_the_probe_agrees_with_the_pass_it_stands_in_for(
+    shape: str, force: bool, protect_tail: bool, llm_tiers: bool
+) -> None:
     """``has_proactive_work`` is False exactly when the pass would change and call nothing."""
+    from protocore.runtime.context.compaction import current_tool_batch_protect_index
+
     rc = LoopConstants(model_context_window=65_536, compaction_keep_recent_turns=1)
     llm = _FlakySummariser()
     manager = _manager(llm, rc)
     history = _probe_shapes()[shape]
     state = CompactionState()
+    protect = current_tool_batch_protect_index(history) if protect_tail else None
 
-    predicted = manager.has_proactive_work(history, state, force=force)
+    predicted = manager.has_proactive_work(
+        history, state, force=force, protect_tail_from_index=protect, llm_tiers=llm_tiers
+    )
     before = [message.model_dump_json() for message in history]
     if force:
-        await _force(manager, history, state, reactive=False)
+        await manager.force_compaction(
+            history=history,
+            compaction_state=state,
+            tenant_id="tenant",
+            model_name="model",
+            protect_tail_from_index=protect,
+            llm_tiers=llm_tiers,
+        )
     else:
         await manager.run_compaction(
-            history=history, compaction_state=state, tenant_id="tenant", model_name="model"
+            history=history,
+            compaction_state=state,
+            tenant_id="tenant",
+            model_name="model",
+            protect_tail_from_index=protect,
+            llm_tiers=llm_tiers,
         )
     changed = [message.model_dump_json() for message in history] != before
 
     assert predicted == (changed or llm.structured_calls > 0), shape
+
+
+def test_the_probe_shapes_cover_both_answers_for_every_tier() -> None:
+    """Each shape is there to exercise one side of one tier's line."""
+    manager = _manager(
+        _FlakySummariser(),
+        LoopConstants(model_context_window=65_536, compaction_keep_recent_turns=1),
+    )
+    shapes = _probe_shapes()
+
+    def works(name: str, **kwargs: Any) -> bool:
+        return manager.has_proactive_work(shapes[name], CompactionState(), force=True, **kwargs)
+
+    assert not works("seeded only")
+    assert works("old summaries only")
+    assert not works("old summaries only", llm_tiers=False)
+    assert works("over-budget reference block", llm_tiers=False)
+    assert works("large result in the protected tail", llm_tiers=False)
+    assert not works(
+        "large result in the protected tail",
+        llm_tiers=False,
+        protect_tail_from_index=3,
+    )
 
 
 def test_a_written_off_unit_is_work_only_for_the_forced_pass() -> None:

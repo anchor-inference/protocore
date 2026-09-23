@@ -2445,37 +2445,78 @@ async def _drive_turn(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
 # ----------------------------------------------------------------------
 
 
+def _suspend_proactive_compaction(engine: QueryEngine) -> None:
+    """Stand the proactive summariser tiers down after the budget ran out.
+
+    Bounded two ways, whichever comes first: a number of gate visits, and
+    growth of the prompt past a fraction of its size now. A context refusal —
+    by the provider or by the local fit — lifts it sooner, through
+    :func:`_lift_proactive_suspension`.
+    """
+    rc = engine.context_manager._rc
+    engine._proactive_suspension_gates_left = rc.compaction_proactive_suspension_iterations
+    engine._proactive_suspension_prompt_tokens = (
+        engine.context_manager.current_prompt_tokens(engine.history)
+    )
+    engine._idle_compaction_probe = None
+
+
+def _lift_proactive_suspension(engine: QueryEngine) -> None:
+    engine._proactive_suspension_gates_left = 0
+    engine._proactive_suspension_prompt_tokens = 0
+    engine._idle_compaction_probe = None
+
+
+def _proactive_llm_tiers_allowed(engine: QueryEngine) -> bool:
+    """Whether this gate visit may use the summariser tiers; counts the visit down."""
+    if engine._proactive_suspension_gates_left <= 0:
+        return True
+    rc = engine.context_manager._rc
+    grown_past = engine._proactive_suspension_prompt_tokens * (
+        1.0 + rc.compaction_proactive_suspension_growth_ratio
+    )
+    if engine.context_manager.current_prompt_tokens(engine.history) >= grown_past:
+        _lift_proactive_suspension(engine)
+        return True
+    engine._proactive_suspension_gates_left -= 1
+    if engine._proactive_suspension_gates_left == 0:
+        # The last suspended visit: the next one runs every tier again.
+        engine._idle_compaction_probe = None
+    return False
+
+
 def _proactive_pass_is_idle(
     engine: QueryEngine,
     *,
     force: bool,
     protect_tail_from_index: int | None,
+    llm_tiers: bool,
 ) -> bool:
     """Whether a proactive pass should not be opened at all.
 
-    Three reasons, cheapest first:
+    Two reasons, cheapest first:
 
-    * proactive compaction is suspended — an earlier pass exhausted the retry
-      budget and the provider has not rejected a request since;
     * the last probe found nothing to do, and the history is the same list of
-      the same (immutable) messages under the same profile, so the answer is
-      the same;
+      the same (immutable) messages, judged under the same constants and the
+      same profile, so the answer is the same;
     * the tiers, asked without running, find nothing this profile may touch.
+
+    ``llm_tiers=False`` (a suspension is in force) asks about Tier 1 alone.
 
     A pass with nothing to do would otherwise flip the run into
     ``COMPACTING``, fire hooks, write a usage row and a snapshot on every
     iteration while the estimate stays over the gate — and change nothing.
     """
-    if engine._proactive_compaction_suspended:
-        return True
     history = engine.history
-    profile = (force, protect_tail_from_index)
+    rc = engine.context_manager._rc
+    profile = (force, protect_tail_from_index, llm_tiers)
     probe = engine._idle_compaction_probe
     if (
         probe is not None
         and probe[0] == profile
-        and len(probe[1]) == len(history)
-        and all(seen is current for seen, current in zip(probe[1], history, strict=True))
+        and probe[1] is rc
+        and len(probe[2]) == len(history)
+        and all(seen is current for seen, current in zip(probe[2], history, strict=True))
     ):
         return True
     if engine.context_manager.has_proactive_work(
@@ -2483,14 +2524,16 @@ def _proactive_pass_is_idle(
         engine.compaction_state,
         force=force,
         protect_tail_from_index=protect_tail_from_index,
+        llm_tiers=llm_tiers,
     ):
         engine._idle_compaction_probe = None
         return False
-    engine._idle_compaction_probe = (profile, tuple(history))
+    engine._idle_compaction_probe = (profile, rc, tuple(history))
     _logger.warning(
-        "DIAG compaction.nothing_eligible run=%s force=%s messages=%d",
+        "DIAG compaction.nothing_eligible run=%s force=%s llm_tiers=%s messages=%d",
         engine.config.run_id,
         force,
+        llm_tiers,
         len(history),
     )
     return True
@@ -2527,14 +2570,19 @@ async def _run_compaction(
       all (:func:`_proactive_pass_is_idle`): no ``COMPACTING`` flip, no events,
       hooks, usage row or snapshot.
     * A pass that exhausts the retry budget does not end the run. The request
-      still goes out, proactive compaction stops until the provider rejects a
-      request, and the reactive path — the only one that may compact seeded
-      history — handles that rejection.
+      still goes out and the summariser tiers stand down for a bounded stretch
+      (:func:`_suspend_proactive_compaction`) while Tier 1, which needs no
+      LLM, keeps running; a context refusal hands over to the reactive path —
+      the only one that may compact seeded history.
     """
     from protocore.runtime.context.budgets import derive_budgets
 
+    llm_tiers = _proactive_llm_tiers_allowed(engine)
     if _proactive_pass_is_idle(
-        engine, force=force, protect_tail_from_index=protect_tail_from_index
+        engine,
+        force=force,
+        protect_tail_from_index=protect_tail_from_index,
+        llm_tiers=llm_tiers,
     ):
         return
 
@@ -2620,6 +2668,7 @@ async def _run_compaction(
             ),
             protect_tail_from_index=protect_tail_from_index,
             record_request=_record_summariser_request,
+            llm_tiers=llm_tiers,
         )
     except CompactionExhaustedError as exc:
         # The transaction opened at ``pre_compact`` and cannot close on
@@ -2633,10 +2682,10 @@ async def _run_compaction(
             yield rollback_evt
         # Nothing has been rejected yet: the estimate that opened this pass is
         # not proof the request does not fit, and the profile that failed is
-        # not the one that may compact seeded history. Stop compacting
-        # proactively and let the request go out; a real rejection reaches the
-        # reactive path, which lifts the suspension.
-        engine._proactive_compaction_suspended = True
+        # not the one that may compact seeded history. Stand the summariser
+        # tiers down for a bounded stretch and let the request go out; a
+        # context refusal reaches the reactive path, which lifts it sooner.
+        _suspend_proactive_compaction(engine)
         _logger.warning(
             "DIAG compaction.proactive_suspended run=%s reason=%s err=%s",
             engine.config.run_id,
@@ -5454,11 +5503,11 @@ async def _handle_context_window_exceeded(
 
     engine._compaction_attempted_for_current_turn = True
     engine._reactive_compaction_attempted_for_current_turn = True
-    # The provider has now refused a request: the evidence a suspended
-    # proactive gate was waiting for. Whatever this pass achieves, the history
-    # the gate sees next is judged afresh.
-    engine._proactive_compaction_suspended = False
-    engine._idle_compaction_probe = None
+    # A request has now been refused — by the provider, or by the local fit
+    # before it was sent: the evidence a suspended proactive gate was waiting
+    # for. Whatever this pass achieves, the history the gate sees next is
+    # judged afresh.
+    _lift_proactive_suspension(engine)
     from_state = engine.state
     engine.transition_to(LoopState.COMPACTING)
     yield _emit_state_change(engine, from_state, LoopState.COMPACTING, reason="reactive_413")

@@ -946,16 +946,21 @@ class QueryEngine:
         # request that follows it. The next recovery reset consumes this latch
         # and marks that message's one compaction allowance as already spent.
         self._proactive_compaction_attempted_for_next_message: bool = False
-        # Set when a proactive pass exhausted the retry budget. Proactive
-        # compaction then stops until the provider rejects a request, which is
-        # what the reactive path needs to run and what lifts this.
-        self._proactive_compaction_suspended: bool = False
+        # Set when a proactive pass exhausted the retry budget: the LLM tiers
+        # of proactive compaction stand down for this many more gate visits
+        # (Tier 1, which needs no LLM, keeps running). A rejection lifts it at
+        # once, and so does history growing past
+        # ``compaction_proactive_suspension_growth_ratio`` of the prompt it was
+        # suspended at, recorded beside it.
+        self._proactive_suspension_gates_left: int = 0
+        self._proactive_suspension_prompt_tokens: int = 0
         # The last proactive probe that found nothing to do: its profile
-        # (forced, protected tail) and the history it saw. Messages are
-        # immutable, so the same list of the same objects is the same answer,
-        # and the gate is skipped without asking the tiers again.
+        # (forced, protected tail, LLM tiers included), the constants it was
+        # judged under and the history it saw. Messages and constants are
+        # immutable, so the same objects are the same answer, and the gate is
+        # skipped without asking the tiers again.
         self._idle_compaction_probe: (
-            tuple[tuple[bool, int | None], tuple[Message, ...]] | None
+            tuple[tuple[bool, int | None, bool], LoopConstants, tuple[Message, ...]] | None
         ) = None
         # Actual max_tokens on the most recent fitted assistant request. Kept
         # only until this assistant-message boundary so an upstream context
@@ -2205,11 +2210,18 @@ class QueryEngine:
         self._last_dispatched_prompt = None
         self._context_overflow_retry_max_tokens = None
         self._context_overflow_corrective_retry_count = 0
-        self.compaction_backoff_left = 0
+        # ``compaction_backoff_left`` is deliberately NOT reset: it counts
+        # iterations, and an iteration is an assistant message, so a reset here
+        # cleared it before the gate could ever skip one.
         if self._terminal_backstop_turn_active:
             self._terminal_backstop_turn_active = False
         else:
             self._max_output_recovery_count = 0
+
+    @property
+    def proactive_compaction_suspended(self) -> bool:
+        """Whether proactive compaction's LLM tiers are standing down after exhaustion."""
+        return self._proactive_suspension_gates_left > 0
 
     def remember_tool_name(self, tool_call_id: str, tool_name: str) -> None:
         self._pending_tool_call_names[tool_call_id] = tool_name
