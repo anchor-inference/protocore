@@ -5,7 +5,8 @@ call, the deep loop's prompted-JSON plan fallback, and the Tier-2 compaction
 summariser. Each used to construct its own request, so they disagreed on how
 the model was resolved (live override vs. frozen config), on how a forced tool
 was spelled (``forced_tool_choice`` vs. a wire-shaped ``tool_choice``) and on
-whether a temperature was stated at all.
+whether a temperature was stated at all. The builder states one only when the
+caller has one; otherwise the request leaves it to the host.
 
 These tests pin the assembled request on all four paths — the shape each one
 had before the builder existed, so the consolidation is provably observable-
@@ -17,6 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from protocore.contracts.llm import LLMRequest, LLMStreamEvent
+from protocore.contracts.observability import request_digest
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     Message,
@@ -31,7 +33,11 @@ from protocore.runtime.context.compaction import (
 from protocore.runtime.events import EventType
 from protocore.runtime.loop_state import LoopState
 from protocore.runtime.loop_strategies import PLAN_TOOL_NAME, DeepStrategy
-from protocore.runtime.query import _drive_one_stream, _StreamAttemptResult
+from protocore.runtime.query import (
+    _drive_one_stream,
+    _StreamAttemptResult,
+    build_llm_request,
+)
 from protocore.runtime.query_engine import QueryEngine, QueryEngineConfig
 from protocore.tests_support.adapters import (
     InMemoryBlobStore,
@@ -134,7 +140,7 @@ async def test_action_stream_request_shape() -> None:
 
     request = llm.calls[0]
     assert request.model == MODEL
-    assert request.temperature == LLMRequest.model_fields["temperature"].default
+    assert request.temperature is None
     assert set(request.extra) == {
         "cache_breakpoints",
         "enable_thinking",
@@ -277,7 +283,7 @@ async def test_plan_request_shape() -> None:
 
     request = llm.calls[0]
     assert request.model == MODEL
-    assert request.temperature == LLMRequest.model_fields["temperature"].default
+    assert request.temperature is None
     assert [t.name for t in request.tools] == [PLAN_TOOL_NAME]
     assert request.extra["enable_thinking"] is True
     assert request.extra["reasoning_effort"] == "low"
@@ -315,7 +321,7 @@ async def test_plan_fallback_request_shape() -> None:
 
     request = captured["fallback"]
     assert request.model == MODEL
-    assert request.temperature == LLMRequest.model_fields["temperature"].default
+    assert request.temperature is None
     assert list(request.tools) == []
     assert request.extra == {"response_format": {"type": "json_object"}}
     obs = request.observability
@@ -584,3 +590,36 @@ async def test_live_model_override_reaches_the_compaction_summariser() -> None:
     [evt async for evt in _run_compaction(engine)]
 
     assert seen["model_name"] == OVERRIDE_MODEL
+
+
+# ---------------------------------------------------------------------------
+# Temperature policy — unset unless the caller states one
+# ---------------------------------------------------------------------------
+
+
+def test_the_request_contract_leaves_the_temperature_unset() -> None:
+    request = LLMRequest(model=MODEL, messages=[])
+
+    assert request.temperature is None
+
+
+def test_builder_leaves_the_temperature_to_the_host_when_the_caller_has_none() -> None:
+    request = build_llm_request(model=MODEL, messages=[], max_tokens=16)
+
+    assert request.temperature is None
+
+
+def test_builder_keeps_an_explicit_temperature_including_zero() -> None:
+    assert build_llm_request(
+        model=MODEL, messages=[], max_tokens=16, temperature=0.2
+    ).temperature == 0.2
+    assert build_llm_request(
+        model=MODEL, messages=[], max_tokens=16, temperature=0.0
+    ).temperature == 0.0
+
+
+def test_an_unset_and_a_stated_temperature_are_different_requests() -> None:
+    unset = build_llm_request(model=MODEL, messages=[], max_tokens=16)
+    stated = build_llm_request(model=MODEL, messages=[], max_tokens=16, temperature=0.7)
+
+    assert request_digest(unset) != request_digest(stated)

@@ -487,7 +487,9 @@ crashes. The shared assistant loop is **not** a single immutable path:
   three things those four used to settle separately — the model in force (the
   live override when one is set), the forced tool (one slot,
   `extra["forced_tool_choice"]`, carrying the tool NAME for an adapter to
-  render onto its own wire) and the temperature (stated on every request).
+  render onto its own wire) and the temperature (the caller's value, or
+  `None` so the host decides — a per-model setting or the server's own
+  generation config; the summarisers state theirs).
 - `runtime/context/budgets.py` — `derive_budgets` turns one RC snapshot into
   every per-layer token budget, deterministically, with no cache. The
   compaction trigger it returns is the LOWER of two bounds: the configured
