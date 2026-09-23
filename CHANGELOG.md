@@ -17,7 +17,9 @@ All notable changes to this project are recorded here. The format follows
   as such. Paths that need a value — the compaction summariser, with
   `compaction_summary_temperature` — still state it. A host adapter should omit
   the wire field when it is `None` (or apply its own per-model setting); an
-  adapter that serialises it as-is now sends `null`.
+  adapter that serialises it as-is now sends `null`. The temperature is part of
+  `request_digest`, so a request recorded before this change does not
+  replay-match the same request rebuilt after it.
 
 - **The wind-down notice asks for the answer, not the work log.** The default
   `soft_stop_notice_text` told the model to report what it did and what it
