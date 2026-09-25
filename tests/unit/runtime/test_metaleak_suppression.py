@@ -29,6 +29,7 @@ from protocore.contracts.llm import LLMStreamEvent
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import Tool
 from protocore.contracts.types import (
+    TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY,
     TERMINAL_TOOL_METADATA_KEY,
     Message,
     MessageRole,
@@ -266,6 +267,7 @@ async def test_blocker_prose_no_write_still_triggers_write(
                     tool_call_id="",
                     content="index.html was declared but does not exist",
                     is_error=True,
+                    metadata={TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY: True},
                 )
             return await super().invoke(context, arguments)
 

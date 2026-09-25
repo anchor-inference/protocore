@@ -132,6 +132,7 @@ from protocore.contracts.types import (
     SYNTHETIC_RECOVERY_TERMINAL_REPAIR,
     SYNTHETIC_RECOVERY_TERMINAL_TOOL_NUDGE,
     SYNTHETIC_RECOVERY_THINKING_CONTINUE,
+    TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY,
     TERMINAL_TOOL_METADATA_KEY,
     TOOL_RESULT_CONSECUTIVE_CAP_ELIGIBLE_METADATA_KEY,
     ContentBlock,
@@ -4721,6 +4722,8 @@ async def _drive_one_stream(
             # suppressed and every call it returns dropped, like any other
             # forced turn's.
             _forced_terminal.spend_all(engine)
+            # Nothing on this request may run, whatever mode it was chosen in.
+            _forced_terminal.set_request_mode(engine, _forced_terminal.MODE_TERMINAL)
             _logger.warning(
                 "DIAG forced_terminal.not_advertised run=%s tool=%s",
                 engine.config.run_id,
@@ -4931,6 +4934,11 @@ async def _drive_one_stream(
     # are NEVER affected — only the user-facing text leak. See
     # :func:`_suppress_terminal_only_meta_text`.
     suppress_meta_text = _suppress_terminal_only_meta_text(engine)
+    # Calls a forced terminal turn does not admit are dropped once the turn
+    # settles; their frames are withheld from the live stream too, or a reader
+    # would render a tool call under the answer that never runs and never gets
+    # a result.
+    withheld_call_ids: set[str] = set()
 
     # ── Leading-narration split, for a run that delegated ──
     # ``head_buffer`` holds the start of this message's FIRST text block off the
@@ -5187,6 +5195,33 @@ async def _drive_one_stream(
                 block_idx=block_idx,
             ):
                 yield evt
+            continue
+
+        if delta.kind is ProviderDeltaKind.tool_use_start and (
+            delta.tool_call_id
+            and delta.tool_name
+            and _forced_terminal.request_mode(engine) is not None
+            and not _forced_terminal_admits(engine, delta.tool_name)
+        ):
+            engine.remember_tool_name(delta.tool_call_id, delta.tool_name)
+            withheld_call_ids.add(delta.tool_call_id)
+            continue
+
+        if (
+            delta.kind
+            in (ProviderDeltaKind.tool_use_input, ProviderDeltaKind.tool_use_stop)
+            and delta.tool_call_id in withheld_call_ids
+        ):
+            if delta.kind is ProviderDeltaKind.tool_use_stop and delta.tool_call_id:
+                # Recorded on the attempt so the settle step drops it by the
+                # same rule, with the same log line; never sent to the reader.
+                result.tool_calls.append(
+                    ToolCall(
+                        id=delta.tool_call_id,
+                        name=engine.tool_name_for(delta.tool_call_id),
+                        arguments=delta.tool_input_final or {},
+                    )
+                )
             continue
 
         if delta.kind is ProviderDeltaKind.tool_use_start:
@@ -8980,9 +9015,17 @@ def _terminal_answer_delivered(engine: QueryEngine) -> bool:
 
 
 def _terminal_tool_registered(engine: QueryEngine) -> bool:
-    """True iff the run's terminal tool is a tool this run can call at all."""
+    """True iff the run's terminal tool is a tool this run can still call.
+
+    Registered, and not stopped by the consecutive-error circuit breaker: a
+    tool the breaker took off the surface for the rest of the run is one no
+    forced request can reach, and the breaker's corrective asks the model for
+    something the forcing would then have to step aside for.
+    """
     terminal_tool = _resolved_terminal_tool_name(engine)
     if terminal_tool is None:
+        return False
+    if terminal_tool in engine._circuit_broken_tools:
         return False
     getter = getattr(getattr(engine, "tools", None), "get", None)
     return getter is not None and getter(terminal_tool) is not None
@@ -9058,16 +9101,63 @@ def _forced_terminal_working_again(engine: QueryEngine) -> bool:
     )
 
 
-def _forced_terminal_call_refused(engine: QueryEngine) -> bool:
-    """True iff the terminal tool itself refused the last call to it."""
-    terminal_tool = _resolved_terminal_tool_name(engine) or ""
-    return any(
+def _is_needs_work_refusal(
+    block: ToolResultBlock, terminal_tool: str, call_names: Mapping[str, str]
+) -> bool:
+    return (
         block.is_error
-        and _is_terminal_tool_name(
-            _tool_name_for_call_id(engine, block.tool_call_id), terminal_tool
-        )
-        for block in _trailing_tool_results(engine)
+        and block.metadata.get(TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY) is True
+        and _is_terminal_tool_name(call_names.get(block.tool_call_id), terminal_tool)
     )
+
+
+def _forced_terminal_work_requested(engine: QueryEngine) -> bool:
+    """True iff the terminal tool refused its last call for missing work.
+
+    Only a refusal marked with :data:`TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY`
+    counts, and only the run's FIRST such refusal. An argument or validation
+    error is fixed by calling the terminal tool again, which forcing it by name
+    lets the model do; and each turn of work ends in prose the reader sees, so
+    a tool that keeps refusing for missing work gets one turn of it and is then
+    forced by name like any other refusal.
+    """
+    terminal_tool = _resolved_terminal_tool_name(engine) or ""
+    run_messages = _this_run_messages(engine)
+    call_names = tool_names_by_call_id(run_messages)
+    if not any(
+        _is_needs_work_refusal(block, terminal_tool, call_names)
+        for block in _trailing_tool_results(engine)
+    ):
+        return False
+    refusals = sum(
+        1
+        for message in run_messages
+        for block in message.content_blocks
+        if isinstance(block, ToolResultBlock)
+        and _is_needs_work_refusal(block, terminal_tool, call_names)
+    )
+    return refusals == 1
+
+
+def _forced_terminal_write_first_before_sealing(engine: QueryEngine) -> bool:
+    """True iff the write-first telling takes priority over sealing the answer.
+
+    Only when the host switched it on and the telling would actually say
+    something: write-first is enabled, one of the write tools is a tool this
+    run has, and the run has written nothing with any of them yet.
+    """
+    rc = engine.config.rc
+    if not (
+        rc.terminal_tool_nudge_write_first_before_forcing
+        and rc.terminal_tool_nudge_write_first_enabled
+    ):
+        return False
+    getter = getattr(getattr(engine, "tools", None), "get", None)
+    if getter is None or not any(
+        getter(name) is not None for name in rc.terminal_tool_nudge_file_write_tool_names
+    ):
+        return False
+    return not _history_has_file_write_result(engine)
 
 
 def _forced_terminal_slot_taken(engine: QueryEngine) -> bool:
@@ -12717,7 +12807,8 @@ _CORE_TURN_POLICIES: Final[TurnPolicyRegistry] = TurnPolicyRegistry(
                 release=_release_forced_terminal_call,
                 question_pending=_forced_terminal_question_pending,
                 working_again=_forced_terminal_working_again,
-                call_refused=_forced_terminal_call_refused,
+                work_requested=_forced_terminal_work_requested,
+                write_first_before_sealing=_forced_terminal_write_first_before_sealing,
                 slot_taken=_forced_terminal_slot_taken,
                 charge=_forced_terminal.charge_attempt,
                 set_mode=_forced_terminal.set_request_mode,

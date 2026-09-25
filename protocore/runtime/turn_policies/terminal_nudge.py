@@ -61,7 +61,7 @@ class ForcedTerminalCall:
 
     #: The run's answer is written after its latest work.
     answer_delivered: RunPredicate
-    #: The terminal tool is a tool this run can call at all.
+    #: The terminal tool is a tool this run can still call.
     tool_registered: RunPredicate
     #: Start forcing; True when the forcing was not already on.
     arm: Callable[[Any], bool]
@@ -73,8 +73,12 @@ class ForcedTerminalCall:
     question_pending: RunPredicate
     #: The last forced turn called a tool other than the terminal one.
     working_again: RunPredicate
-    #: The terminal tool refused the last call to it.
-    call_refused: RunPredicate
+    #: The terminal tool refused its last call because work is missing
+    #: (the refusal carries the needs-work marker), for the first time.
+    work_requested: RunPredicate
+    #: The host wants the one-time write-first telling before a seal, and the
+    #: run has written no file with a write tool it has.
+    write_first_before_sealing: RunPredicate
     #: A run-level precondition owns the next request's forced slot.
     slot_taken: RunPredicate
     #: Spend one attempt.
@@ -138,6 +142,14 @@ class TerminalNudgePolicy:
             async for event in forced.complete(engine, REASON_EXHAUSTED):
                 yield event
             return
+        if not forced.tool_registered(engine):
+            # The terminal tool can no longer be called at all; the answer
+            # stands, and nothing is gained by asking for more of it.
+            turn.outcome.directive = TurnDirective.end_turn
+            turn.outcome.reason = REASON_UNAVAILABLE
+            async for event in forced.complete(engine, REASON_UNAVAILABLE):
+                yield event
+            return
         if forced.question_pending(engine):
             # A gate refused the call and says why, or someone asked the model
             # something. A forced call can answer neither, so this request goes
@@ -148,14 +160,17 @@ class TerminalNudgePolicy:
             return
         if forced.working_again(engine):
             # The model answered a required call with work rather than the
-            # terminal call. That request was already charged; the work is the
-            # model's to finish, and its next answer arms the forcing again.
+            # terminal call. Not charged here: the request that produced the
+            # work was a charged any-tool request — the only forced mode that
+            # admits another tool — or a precondition's turn, which its own
+            # budget bounds. The work is the model's to finish, and its next
+            # answer arms the forcing again.
             forced.release(engine)
             return
         if forced.slot_taken(engine):
             forced.set_mode(engine, None)
             return
-        mode = MODE_ANY_TOOL if forced.call_refused(engine) else MODE_TERMINAL
+        mode = MODE_ANY_TOOL if forced.work_requested(engine) else MODE_TERMINAL
         forced.charge(engine)
         forced.set_mode(engine, mode)
 
@@ -164,7 +179,19 @@ class TerminalNudgePolicy:
         if not self._required(engine):
             return
         forced = self._forced
-        if forced.armed(engine) or forced.answer_delivered(engine):
+        seal = forced.armed(engine) or forced.answer_delivered(engine)
+        if (
+            seal
+            and not forced.armed(engine)
+            and not turn.flags.terminal_nudge_used
+            and forced.write_first_before_sealing(engine)
+        ):
+            # The host asked for the write-first telling to come before the
+            # seal: the prose may only announce a file the run never wrote, and
+            # the telling is what gets it written. Once, like any telling; the
+            # answer the model ends on after it is sealed by force.
+            seal = False
+        if seal:
             if not forced.tool_registered(engine):
                 # The run can never make the call it owes, so there is nothing
                 # to force and nothing to wait for: the answer stands.

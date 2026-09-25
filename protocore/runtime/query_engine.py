@@ -1626,6 +1626,10 @@ class QueryEngine:
                 self._terminal_call_forced_attempts,
                 self._terminal_call_forced_mode,
             ) = carried_forcing
+            # The latch that goes with a forcing (the final-turn output floor,
+            # the narration suppressor) goes with it across the continuation.
+            if self._terminal_call_forced:
+                self._terminal_only_active = True
         # Stamp the run-start clock ONCE for the wall-clock budget. A resumed run
         # keeps the start it was rehydrated with
         # (``resume_from_snapshot`` set ``_run_started_monotonic`` from the

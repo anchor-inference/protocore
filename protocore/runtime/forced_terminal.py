@@ -16,9 +16,14 @@ to write. Each forced request has a MODE, chosen before it opens:
 * :data:`MODE_TERMINAL` names the terminal tool in the provider's native
   ``tool_choice``. Only the terminal call is admitted from such a turn; any
   other call a provider returns is dropped before it is recorded or run.
-* :data:`MODE_ANY_TOOL` requires a tool call and admits any. It follows a
-  terminal call the tool itself refused, so a model told "the declared file is
-  missing" can write it instead of being made to repeat the refused call.
+* :data:`MODE_ANY_TOOL` requires a tool call and admits any. It follows the
+  run's first terminal call the tool refused with
+  :data:`~protocore.contracts.types.TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY`
+  set, so a model told "the declared file is missing" can write it instead of
+  being made to repeat the refused call. Every other refusal — an argument or
+  validation error — is answered in :data:`MODE_TERMINAL`: the fix is a better
+  call, and a free choice of tools after a finished answer is how new research
+  (and a second answer) starts.
 
 Requiring *a* tool call is deliberately not how a delivered answer is sealed.
 Measured with a thinking-capable model, thinking off, after a finished answer:
@@ -37,8 +42,10 @@ same happens when something asks the model a question — a corrective turn from
 a gate that refused the call, or a message from the user — because a forced
 call cannot answer a question.
 
-The forcing is bounded by ``terminal_tool_forced_max_attempts``, and every
-forced request and every lifting spends from it. When it is spent the run
+The forcing is bounded by ``terminal_tool_forced_max_attempts``: every forced
+request spends from it, and so does every lifting for a question. Lifting
+because a required call was answered with work does not spend again — the
+request that produced the work was already charged. When it is spent the run
 completes on the answer it has delivered. That completion is a hard stop: it
 does not pass the finish seams a voluntary answer passes.
 

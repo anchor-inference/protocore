@@ -190,6 +190,23 @@ class LLMRequest(BaseModel):
     #: the host (a per-model setting, or the server's own generation config)
     #: decides. A number is the caller's explicit choice and wins over both.
     temperature: float | None = None
+    #: Provider-neutral control keys; an adapter reads the ones it knows and
+    #: never sends them to the wire verbatim. Two of them constrain the tool
+    #: choice, and a request carries at most one:
+    #:
+    #: * ``forced_tool_choice`` — a tool NAME the reply must call; render it as
+    #:   the provider's native single-tool choice (OpenAI-compatible:
+    #:   ``{"type": "function", "function": {"name": ...}}``).
+    #: * ``tool_choice_required`` — ``True`` when the reply must call SOME
+    #:   advertised tool and may not answer in prose; render it as the native
+    #:   "any tool" choice (OpenAI-compatible: ``tool_choice="required"``).
+    #:
+    #: An adapter without support for either ignores it — the runtime drops
+    #: what a constrained turn returns beyond what it admits, so the request is
+    #: merely less efficient. A provider that rejects the constraint outright
+    #: should surface that as a non-retryable error, not a transient one.
+    #: ``enable_thinking`` travels with ``reasoning_effort``; an explicit
+    #: ``False`` must reach the wire as thinking off, not as "provider default".
     extra: dict[str, Any] = Field(default_factory=dict)
     observability: LLMObservabilityContext | None = None
 

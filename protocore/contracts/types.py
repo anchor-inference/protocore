@@ -139,6 +139,19 @@ class StopReason(StrEnum):
 TERMINAL_TOOL_METADATA_KEY = "protocore.terminal_tool"
 """ToolResult metadata flag that marks a successful tool as loop-terminal."""
 
+TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY = "protocore.terminal_refusal_needs_work"
+"""ToolResult metadata flag (bool) on an ERROR result of the run's terminal tool.
+
+``True`` says the call was refused because work the answer depends on is
+missing — a declared file that does not exist, a check that has not run — and
+not because of the call itself. It is what lets a run whose terminal call is
+being forced after its answer take one turn of real work: the next request
+requires a tool call of any kind instead of naming the terminal tool. Any other
+terminal-tool error, such as an argument or validation error, is answered by
+forcing the terminal tool again by name. Set only by the terminal tool (or the
+host check behind it); absent means ``False``.
+"""
+
 TOOL_RESULT_COUNT_AS_ERROR_METADATA_KEY = "protocore.count_as_tool_error"
 """ToolResult metadata flag (bool) gating the per-run ``tool_errors_count``.
 
@@ -1546,6 +1559,7 @@ class SubagentTask(BaseModel):
 
 
 __all__ = [
+    "TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY",
     "TERMINAL_TOOL_METADATA_KEY",
     "TERMINAL_TOOL_STATUS_COMPLETED",
     "TERMINAL_TOOL_STATUS_METADATA_KEY",

@@ -1893,12 +1893,15 @@ class LoopConstants(BaseModel):
         default=False,
         description=(
             "When True AND ``QueryEngineConfig.expected_terminal_tool`` is "
-            "non-empty AND no successful terminal tool result is in "
-            "history, the query loop injects one additional user message "
-            "reminding the model to call the configured terminal tool. "
-            "This is a contract-repair guard, not scorer automation: the "
-            "model still chooses the tool arguments. The message body comes "
-            "from the ``terminal_tool_nudge`` prompt template."
+            "non-empty, a run that ends a turn without a successful terminal "
+            "tool result is made to call it. A turn that ended with a "
+            "substantive answer is followed by forced requests (see "
+            "``terminal_tool_forced_max_attempts``) that append nothing to "
+            "the transcript. A turn that ended with no answer gets one "
+            "additional user message from the ``terminal_tool_nudge`` prompt "
+            "template asking for the answer and the call, and the answer it "
+            "then writes is forced. The model still chooses the tool "
+            "arguments."
         ),
     )
     preserve_completed_answer_on_stream_error: bool = Field(
@@ -1956,15 +1959,14 @@ class LoopConstants(BaseModel):
             "successful file-write tool result "
             "(``terminal_tool_nudge_file_write_tool_names``) is in history, "
             "the nudge text is prefixed with the "
-            "``terminal_tool_nudge_write_first`` prompt template so the model is steered "
-            "to call the ACTUAL deliverable write tool (Write/AppendFile) "
-            "FIRST, not just the terminal tool. This closes the "
-            "narrate-then-surrender failure where a model says 'Now let me "
-            "write this file' and fires 0 tools. Bounded by the single-shot "
-            "nudge latch (never loops). Default True is universal — a strong "
-            "model that already wrote the file never sees the prefix (the "
-            "history check finds its write result). Set False to restore the "
-            "plain terminal nudge."
+            "``terminal_tool_nudge_write_first`` prompt template so the model "
+            "is steered to call the actual deliverable write tool first, not "
+            "just the terminal tool. The nudge fires only for a turn that "
+            "ended with no answer; a turn that ended with prose is sealed by "
+            "a forced terminal call instead, so prose that merely announces a "
+            "file ('Now let me write this file') is not steered by this "
+            "prefix unless ``terminal_tool_nudge_write_first_before_forcing`` "
+            "is on. Bounded by the single-shot nudge latch (never loops)."
         ),
     )
     terminal_tool_nudge_file_write_tool_names: tuple[str, ...] = Field(
@@ -1995,6 +1997,21 @@ class LoopConstants(BaseModel):
             "time the forcing steps aside for a gate's corrective or a user "
             "message. Once it is spent the run completes on the answer it "
             "delivered. 0 completes on the delivered answer without forcing."
+        ),
+    )
+    terminal_tool_nudge_write_first_before_forcing: bool = Field(
+        default=False,
+        description=(
+            "Let the write-first nudge come before a forced terminal call. When "
+            "True, a turn that ends with prose while the run has written "
+            "nothing with any of ``terminal_tool_nudge_file_write_tool_names`` "
+            "(and has at least one of those tools) first gets the one-time "
+            "nudge with the ``terminal_tool_nudge_write_first`` prefix, as if "
+            "no answer had been given; the answer the model ends on after it "
+            "is then sealed by force. For hosts whose models tend to announce "
+            "a file and stop. The cost is the nudge's: the request after it is "
+            "free, so a model that had in fact answered may answer again. "
+            "Default False: the prose is sealed at once."
         ),
     )
     terminal_tool_forced_thinking_enabled: bool = Field(

@@ -22,6 +22,7 @@ from protocore.contracts.turn_policy import TurnCoordinate, TurnDirective, TurnF
 from protocore.contracts.types import (
     SYNTHETIC_RECOVERY_METADATA_KEY,
     SYNTHETIC_RECOVERY_PROSE_GATE_REPAIR,
+    TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY,
     TERMINAL_TOOL_METADATA_KEY,
     TERMINAL_TOOL_STATUS_COMPLETED,
     TERMINAL_TOOL_STATUS_METADATA_KEY,
@@ -300,7 +301,7 @@ async def test_text_on_a_forced_turn_is_never_a_second_answer(
 
 
 @pytest.mark.asyncio
-async def test_a_failed_terminal_call_is_forced_again_then_bounded(
+async def test_an_argument_error_is_forced_again_by_name(
     engine_factory, in_memory_runtime
 ) -> None:
     rc = _rc(terminal_tool_forced_max_attempts=2)
@@ -322,12 +323,12 @@ async def test_a_failed_terminal_call_is_forced_again_then_bounded(
     events = await _run(engine)
 
     assert len(llm.calls) == 3
-    assert llm.calls[1].extra.get("forced_tool_choice") == "Finalize"
-    # After the tool refused the call, the model may act on what it said —
-    # with a tool, never with prose.
-    assert "forced_tool_choice" not in llm.calls[2].extra
-    assert llm.calls[2].extra.get("tool_choice_required") is True
-    assert llm.calls[2].extra.get("enable_thinking") is False
+    # An error that is not marked as missing work is the call's own fault, so
+    # the model is made to call the tool again — by name, never with a free
+    # choice of tools that could start new research under the answer.
+    for request in llm.calls[1:]:
+        assert request.extra.get("forced_tool_choice") == "Finalize"
+        assert "tool_choice_required" not in request.extra
     assert forced_terminal.REASON_EXHAUSTED in _reasons(events)
     # A failed terminal call is not work: the answer before it still counts,
     # so the prose gate never asks for another one.
@@ -518,12 +519,12 @@ async def test_forcing_survives_a_snapshot_round_trip(
 
 
 @pytest.mark.asyncio
-async def test_a_blocked_terminal_tool_spends_the_forcing_at_once(
+async def test_a_blocked_terminal_tool_completes_on_the_answer(
     engine_factory, in_memory_runtime
 ) -> None:
-    """A surface that blocks the terminal tool outright cannot carry the forced
-    call. The bound is spent on the spot, the stray turn's text stays hidden,
-    and the run completes on its answer."""
+    """A terminal tool the circuit breaker has stopped cannot carry a forced
+    call, so no forced request is sent at all: the run completes on its
+    answer."""
     rc = _rc()
     engine, finalize = _engine(engine_factory, in_memory_runtime, rc=rc)
     engine._circuit_broken_tools.add("Finalize")
@@ -534,9 +535,8 @@ async def test_a_blocked_terminal_tool_spends_the_forcing_at_once(
 
     events = await _run(engine)
 
-    assert len(llm.calls) == 2
-    assert "forced_tool_choice" not in llm.calls[1].extra
-    assert forced_terminal.REASON_EXHAUSTED in _reasons(events)
+    assert len(llm.calls) == 1
+    assert forced_terminal.REASON_UNAVAILABLE in _reasons(events)
     assert _answers(engine) == [ANSWER]
     assert finalize.calls == []
     assert engine.state is LoopState.COMPLETED
@@ -638,7 +638,10 @@ async def test_a_refused_call_lets_the_model_do_the_missing_work(
             if not written:
                 self.calls.append(dict(arguments))
                 return ToolResult(
-                    tool_call_id="", content="report.md does not exist", is_error=True
+                    tool_call_id="",
+                    content="report.md does not exist",
+                    is_error=True,
+                    metadata={TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY: True},
                 )
             return await super().invoke(context, arguments)
 
@@ -759,6 +762,9 @@ async def test_a_provider_ignoring_the_forced_choice_cannot_run_other_tools(
     )
     assert search.calls == []
     assert "earlier question" not in _streamed_text(events)
+    # Not even announced on the live stream: a reader never sees a call that
+    # will not run.
+    assert not any(e.payload.get("tool_call_id") in {"r1", "r2"} for e in events)
     assert not any(
         isinstance(block, ToolUseBlock) and block.name == "Research"
         for message in engine.history
@@ -887,7 +893,8 @@ async def test_a_precondition_turn_does_not_spend_the_forcing(
             release=lambda _engine: calls.append("release"),
             question_pending=lambda _engine: False,
             working_again=lambda _engine: False,
-            call_refused=lambda _engine: False,
+            work_requested=lambda _engine: False,
+            write_first_before_sealing=lambda _engine: False,
             slot_taken=lambda _engine: True,
             charge=_record_charge(calls),
             set_mode=lambda _engine, mode: calls.append(f"mode={mode}"),
@@ -946,7 +953,14 @@ async def test_a_run_resumed_mid_forcing_stays_forced(
     registry = InMemoryToolRegistry()
     finalize = _FinalizeTool(tool_name="Finalize", description="End the run")
     registry.register(finalize)
-    resumed_llm = InMemoryLLMProvider()
+    latch_seen: list[bool] = []
+
+    class _LatchWatchingLLM(InMemoryLLMProvider):
+        def stream_with_tools(self, request: LLMRequest):  # type: ignore[no-untyped-def]
+            latch_seen.append(resumed._terminal_only_active)
+            return super().stream_with_tools(request)
+
+    resumed_llm = _LatchWatchingLLM()
     resumed_llm.queue_tool_call_response(
         tool_call_id="f2", tool_name="Finalize", tool_input={"declared_deliverables": []}
     )
@@ -971,6 +985,137 @@ async def test_a_run_resumed_mid_forcing_stays_forced(
     )
     assert request.extra.get("enable_thinking") is False
     assert forced_terminal.attempts_spent(resumed) >= 2
+    # The terminal-only latch that goes with a forcing came back with it.
+    assert latch_seen == [True]
     assert len(finalize.calls) == 1
     assert _answers(resumed) == [ANSWER]
     assert resumed.state is LoopState.COMPLETED
+
+
+class _WorkingModel(InMemoryLLMProvider):
+    """A model that answers every free request with a new answer and every
+    required one with more work — the shape that turns each work turn into
+    another visible answer."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.answers_written = 0
+
+    async def stream_with_tools(self, request: LLMRequest):  # type: ignore[no-untyped-def]
+        self._calls.append(request)
+        forced = request.extra.get("forced_tool_choice")
+        if forced or request.extra.get("tool_choice_required"):
+            name = forced or "Research"
+            args: dict[str, Any] = {"query": "more"} if name == "Research" else {}
+            call_id = f"c{len(self._calls)}"
+            events = [
+                LLMStreamEvent(name="message_start", payload={}),
+                LLMStreamEvent(name="tool_use_start", payload={"tool_call_id": call_id, "tool_name": name}),
+                LLMStreamEvent(name="tool_use_stop", payload={"tool_call_id": call_id, "final_input": args}),
+                LLMStreamEvent(name="message_stop", payload={"stop_reason": StopReason.tool_use.value}),
+            ]
+        else:
+            self.answers_written += 1
+            events = _text_stream(f"Answer number {self.answers_written}, written out in full.")
+        for event in events:
+            yield event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("needs_work", [False, True])
+@pytest.mark.parametrize("breaker_cap", [3, 50])
+async def test_a_tool_that_keeps_refusing_is_bounded_in_answers(
+    engine_factory, in_memory_runtime, needs_work: bool, breaker_cap: int
+) -> None:
+    """A terminal tool that refuses every call. Refusals for the call itself
+    never open a work turn, so the reader sees one answer. Refusals for missing
+    work open exactly one, so the reader sees at most the answer and its one
+    correction — whatever the budget."""
+    rc = _rc(terminal_tool_forced_max_attempts=10, max_consecutive_tool_errors=breaker_cap)
+    engine = engine_factory(rc=rc, expected_terminal_tool="Finalize")
+    engine.llm = _WorkingModel()  # type: ignore[assignment]
+    refusing = MockTool(
+        tool_name="Finalize",
+        description="End the run",
+        response_content="refused",
+        response_is_error=True,
+        response_metadata={TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY: True} if needs_work else {},
+    )
+    research = MockTool(tool_name="Research", description="Research more")
+    in_memory_runtime["tools"].register(refusing)
+    in_memory_runtime["tools"].register(research)
+
+    events = await _run(engine)
+
+    assert engine.state is LoopState.COMPLETED
+    # Ended by the budget or by the breaker taking the tool away, never by
+    # the model writing its way out.
+    assert {forced_terminal.REASON_EXHAUSTED, forced_terminal.REASON_UNAVAILABLE} & set(
+        _reasons(events)
+    )
+    visible = [a for a in _answers(engine) if a.startswith("Answer number")]
+    assert len(visible) == (2 if needs_work else 1)
+    assert len(research.calls) == (1 if needs_work else 0)
+    assert len(engine.llm.calls) <= 2 + 2 * rc.terminal_tool_forced_max_attempts  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_the_write_first_nudge_can_come_before_the_seal(
+    engine_factory, in_memory_runtime
+) -> None:
+    """With the host switch on, prose that may only announce a file gets the
+    write-first telling instead of a seal; the file is written, and the answer
+    the model ends on is then sealed by force."""
+    rc = _rc(
+        terminal_tool_nudge_write_first_before_forcing=True,
+        terminal_tool_nudge_write_first_enabled=True,
+    )
+    engine, finalize = _engine(engine_factory, in_memory_runtime, rc=rc)
+    write = MockTool(tool_name="Write", description="Write a file")
+    in_memory_runtime["tools"].register(write)
+    llm: InMemoryLLMProvider = in_memory_runtime["llm"]
+    llm._scripted_streams.append(_text_stream("Now let me write the report to report.md."))
+    llm.queue_tool_call_response(
+        tool_call_id="w1", tool_name="Write", tool_input={"path": "report.md", "content": "c"}
+    )
+    llm._scripted_streams.append(_text_stream(ANSWER))
+    llm.queue_tool_call_response(
+        tool_call_id="f1", tool_name="Finalize", tool_input={"declared_deliverables": []}
+    )
+
+    events = await _run(engine)
+
+    reasons = _reasons(events)
+    assert reasons.index("terminal_tool_nudge") < reasons.index(forced_terminal.REASON_FORCED)
+    assert "forced_tool_choice" not in llm.calls[1].extra
+    assert write.calls == [{"path": "report.md", "content": "c"}]
+    assert llm.calls[3].extra.get("forced_tool_choice") == "Finalize"
+    assert _answers(engine)[-1] == ANSWER
+    assert len(finalize.calls) == 1
+    assert engine.state is LoopState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_the_write_first_switch_is_inert_once_a_file_is_written(
+    engine_factory, in_memory_runtime
+) -> None:
+    rc = _rc(
+        terminal_tool_nudge_write_first_before_forcing=True,
+        terminal_tool_nudge_write_first_enabled=True,
+    )
+    engine, finalize = _engine(engine_factory, in_memory_runtime, rc=rc)
+    in_memory_runtime["tools"].register(MockTool(tool_name="Write", description="Write a file"))
+    llm: InMemoryLLMProvider = in_memory_runtime["llm"]
+    llm.queue_tool_call_response(
+        tool_call_id="w1", tool_name="Write", tool_input={"path": "report.md", "content": "c"}
+    )
+    llm._scripted_streams.append(_text_stream(ANSWER))
+    llm.queue_tool_call_response(
+        tool_call_id="f1", tool_name="Finalize", tool_input={"declared_deliverables": []}
+    )
+
+    events = await _run(engine)
+
+    assert "terminal_tool_nudge" not in _reasons(events)
+    assert llm.calls[2].extra.get("forced_tool_choice") == "Finalize"
+    assert len(finalize.calls) == 1

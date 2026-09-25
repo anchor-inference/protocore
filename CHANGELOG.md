@@ -6,67 +6,83 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY`** (`protocore.contracts.types`).
+  A terminal tool, or the host check behind it, sets this on an error result
+  when the call was refused because work is missing, for example a declared
+  file that does not exist. See the forcing below for what it changes.
+- **`LLMRequest.extra["tool_choice_required"]`**: `True` asks for some tool
+  call and no prose. The `LLMRequest.extra` contract now documents it next to
+  `forced_tool_choice`.
+
 ### Changed
 
-- **A delivered answer's terminal call is forced, not requested.** When a run
-  with `expected_terminal_tool` and `terminal_tool_nudge_enabled` ends a turn
-  with a substantive visible answer and no terminal-tool result, the following
-  requests are forced and append nothing to the transcript. Each one names the
-  terminal tool in `extra["forced_tool_choice"]`, except the one after a
-  terminal call the tool itself refused: that one carries the new
-  `extra["tool_choice_required"] = True` (any tool, no prose), so the model can
-  act on the refusal. The free-form `terminal_tool_nudge` text is no longer sent
-  on this path.
+- **A delivered answer's terminal call is forced, not requested.** This
+  applies to a run with `expected_terminal_tool` and
+  `terminal_tool_nudge_enabled` that ends a turn with a substantive visible
+  answer and no terminal-tool result.
+  - Every request after that names the terminal tool in
+    `extra["forced_tool_choice"]` and appends nothing to the transcript. The
+    free-form `terminal_tool_nudge` text is no longer sent on this path.
+  - A terminal-tool error is answered by forcing the tool again by name. The
+    one exception is the run's first refusal marked with
+    `TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY`: the request after it carries
+    `extra["tool_choice_required"] = True` instead, so the model can do the
+    missing work.
+  - A forced turn's text is kept off the live stream and out of history. Calls
+    that the forced mode does not admit are withheld from the live stream and
+    dropped before they are recorded or run, so a provider that ignores the
+    forced choice cannot start new work under the answer.
+  - A reasoning-only or finish-less forced round is retried instead of
+    receiving `continue_prompt_text`, the reasoning length-cut note or the
+    output-cap resume prompt. Before this, a thinking model answered the nudge
+    with reasoning only, was told "Please continue.", and started a second
+    answer, often to an earlier question in the session.
 
-  A forced turn's text is kept off the stream and out of history. Calls the
-  forced mode does not admit are dropped before they are recorded or run, so a
-  provider that ignores the forced choice cannot start new work under the
-  answer. A reasoning-only or finish-less forced round is retried instead of
-  receiving `continue_prompt_text`, the reasoning length-cut note or the
-  output-cap resume prompt. Before this, a thinking model answered the nudge
-  with reasoning only, was told "Please continue.", and started a second
-  answer, often to an earlier question in the session.
-
-  The forcing steps aside, and the model's text is shown again, when the model
-  has to act rather than seal:
+  **When the forcing steps aside.** The model's text is shown again when it has
+  to act rather than seal:
   - a gate refuses the call with a corrective (the prose gate, a host
     pre-dispatch check);
-  - the user or a background task adds a message;
-  - a required call is answered with other work.
+  - a background result, or a user message placed at a tool boundary, arrives;
+  - the marked refusal's required call is answered with other work.
 
   The answer the model ends on is then forced again. A gate's corrective closes
   the answer window, so the refused prose no longer counts as the answer.
 
-  Forced requests and each step-aside share `terminal_tool_forced_max_attempts`
-  (default 3). When it is spent, the run completes on the answer it delivered
-  (`state_changed` reason `terminal_tool_forced_exhausted`). That completion is
-  a hard stop: it does not pass the answer floor, the voluntary artifact seal or
-  follow-up placement.
+  **Budget.** Forced requests and step-asides share
+  `terminal_tool_forced_max_attempts` (default 3). The run completes on the
+  answer it delivered when the budget is spent (`state_changed` reason
+  `terminal_tool_forced_exhausted`), or at once when the terminal tool is not
+  registered or the consecutive-error circuit breaker has stopped it
+  (`terminal_tool_unavailable`). That completion is a hard stop: it does not
+  pass the answer floor, the voluntary artifact seal or follow-up placement.
 
-  Forced requests go out with thinking off unless
+  **Thinking.** Forced requests go out with thinking off unless
   `terminal_tool_forced_thinking_enabled` is set. Measured on a self-hosted
   thinking model behind vLLM:
-  - with thinking on, a named `tool_choice` spent a 2,048-token budget
-    reasoning in most attempts and returned no call;
-  - with thinking off, it returned exactly the call every time;
-  - with thinking off, `tool_choice="required"` after a refused call returned a
-    tool call in 10 of 10 samples, the requested write in 8 of them.
+  - a named `tool_choice` with thinking on spent a 2,048-token budget reasoning
+    in most attempts and returned no call;
+  - with thinking off it returned exactly the call every time;
+  - `tool_choice="required"` after a refused call returned a tool call in 10 of
+    10 samples, the requested write in 8 of them.
 
-  Other changes:
+  **Other effects.**
   - The terminal tool is pinned to the surface while its call is owed.
-  - A run whose terminal tool is not registered completes on its answer
-    (`terminal_tool_unavailable`).
   - A continuation run (`run(None)`, including `resume`) keeps a forcing that
-    was in progress.
+    was in progress, with its terminal-only latch.
   - A turn that ends with no answer yet still gets the one-time
-    `terminal_tool_nudge` text; the answer it then writes is forced. Prose that
-    only announces work ("now let me write the report") counts as an answer and
-    is sealed. Catching that is left to a host check on the declared
-    deliverables, whose refusal lets the model do the work.
+    `terminal_tool_nudge` text; the answer it then writes is forced.
+  - Prose that only announces work ("now let me write the report") counts as an
+    answer and is sealed. A host check on the declared deliverables can refuse
+    it with the needs-work marker. A host whose models tend to announce and
+    stop can instead set the new `terminal_tool_nudge_write_first_before_forcing`,
+    which sends the one-time write-first nudge before sealing while the run has
+    written no file.
 
-  A host adapter must render `forced_tool_choice` as its native single-tool
-  choice and `tool_choice_required` as `tool_choice="required"`, and must send
-  thinking off explicitly when the request carries `enable_thinking=False`.
+  **Host adapters** must render `forced_tool_choice` as the native single-tool
+  choice and `tool_choice_required` as `tool_choice="required"`. When a request
+  carries `enable_thinking=False`, they must send thinking off explicitly.
 
 ### Fixed
 

@@ -318,7 +318,7 @@ protocore (чистое ядро, ноль импортов вверх)
 | Failure classification | `contracts/resilience.py::IResilienceClassifier`, `runtime/error_kinds.py` | нет — классификатор приходит как `QueryEngineConfig.resilience_classifier`; если он не привязан, ни одна формулировка не распознаётся | Yes | Yes |
 | Run wind-down (soft stop) | `runtime/soft_stop.py` | `soft_stop_enabled` = `True`, `soft_stop_max_turns` = `3` | Yes | Yes |
 | Attempt ledger + adaptive safety band | `contracts/attempt_ledger.py`, полоса на стороне хоста | band wired via per-call output budget | Yes | Yes |
-| Finalization gate + contract | на стороне хоста | `terminal_tool_nudge_enabled` (`False`), `terminal_tool_forced_max_attempts`, `terminal_tool_forced_thinking_enabled`, `finalize_prose_gate_enabled` | Yes | Yes |
+| Finalization gate + contract | на стороне хоста | `terminal_tool_nudge_enabled` (`False`), `terminal_tool_forced_max_attempts`, `terminal_tool_forced_thinking_enabled`, `terminal_tool_nudge_write_first_before_forcing`, `finalize_prose_gate_enabled` | Yes | Yes |
 | Terminal-answer validation + references/grounding | на стороне хоста (ядро несёт собранные прогоном свидетельства, `contracts/evidence.py`) | host knobs (validation and reference normalisation are both driven from the host's own model) | Yes | Yes |
 | IMemory subsystem | `contracts/memory.py`, `tools/memory.py` | `memory_enabled` = `False`; auto-recall is a host knob | Host-wired (tools held by core contract) | Yes |
 | Token counting | `runtime/token_counting.py` (+ опциональный оценщик `protocore-native`) | `chars_per_token_*` ratios in RC; `PROTOCORE_DISABLE_NATIVE` принудительно оставляет чисто-питоновый путь | Yes | Yes |
@@ -475,7 +475,10 @@ protocore (чистое ядро, ноль импортов вверх)
   фиксирует три вещи, которые эти четыре пути раньше решали порознь: модель в
   силе (живое переопределение, когда оно задано), принудительный инструмент
   (один слот, `extra["forced_tool_choice"]`, несущий ИМЯ инструмента, чтобы
-  адаптер отрисовал его в собственный формат провода) и температуру (значение
+  адаптер отрисовал его в собственный формат провода; либо вместо него
+  `extra["tool_choice_required"] = True` — «какой-нибудь инструмент, без
+  прозы», отрисовывается как `tool_choice="required"`; адаптер без поддержки
+  игнорирует оба — см. `LLMRequest.extra`) и температуру (значение
   вызывающего или `None`, и тогда решает хост — настройка модели или
   собственный generation config сервера; суммаризаторы задают свою явно).
 - `runtime/context/budgets.py` — `derive_budgets` превращает один снимок RC во
