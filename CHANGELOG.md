@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0a21] - 2026-09-25
+
 ### Added
 
 - **`TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY`** (`protocore.contracts.types`).
