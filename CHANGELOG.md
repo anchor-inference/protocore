@@ -80,6 +80,12 @@ All notable changes to this project are recorded here. The format follows
     which sends the one-time write-first nudge before sealing while the run has
     written no file.
 
+  **Policy constructors.** A host that assembles its own turn-policy set
+  must pass the new arguments. `TerminalNudgePolicy` now requires
+  `forced=ForcedTerminalCall(...)`, and `EmptyModelTurnPolicy` requires
+  `forcing_terminal_call=`. A host that uses the core's policy set is
+  unaffected.
+
   **Host adapters** must render `forced_tool_choice` as the native single-tool
   choice and `tool_choice_required` as `tool_choice="required"`. When a request
   carries `enable_thinking=False`, they must send thinking off explicitly.

@@ -11,11 +11,13 @@ from a forced turn reaches the reader. A request that comes back without the
 call is retried on a bounded budget, and when the budget is spent the run
 completes on the answer it already delivered.
 
-The forcing steps aside — and spends from the same budget to do it — when the
-model has to act rather than seal: a gate refused the call and asked for a
-better answer, the user said something, or a required call was answered with
-work. What the model writes then is visible, and the answer it ends on is
-forced again.
+The forcing steps aside when the model has to act rather than seal: a gate
+refused the call and asked for a better answer, a message arrived for the
+model, or the any-tool request that follows a missing-work refusal was answered
+with work. Stepping aside for a question spends from the same budget; stepping
+aside for work does not spend again, because the request that produced the
+work was already charged. What the model writes then is visible, and the answer
+it ends on is forced again.
 
 A run that has written nothing is different: the terminal call cannot be forced
 on it, because the answer it still owes is prose and a forced tool call cannot
@@ -123,10 +125,12 @@ class TerminalNudgePolicy:
     async def _before_the_request(self, turn: TurnContext) -> AsyncIterator[TurnEvent]:
         """Choose the forced request's mode, lift the forcing, or end the run.
 
-        Every lifting and every forced request spends from one budget, and the
-        budget is read before anything else — so neither a gate that keeps
-        refusing the call nor a model that keeps resuming work can cycle
-        through here for free.
+        Every forced request and every lifting for a question spends from one
+        budget, and the budget is read before anything else. A lifting for
+        work spends nothing itself, but it can only follow a charged any-tool
+        request (or a precondition turn its own budget bounds) — so neither a
+        gate that keeps refusing the call nor a model that keeps resuming work
+        can cycle through here for free.
         """
         engine = turn.engine
         forced = self._forced

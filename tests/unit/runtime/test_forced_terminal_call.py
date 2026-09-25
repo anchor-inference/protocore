@@ -31,6 +31,7 @@ from protocore.contracts.types import (
     StopReason,
     TextBlock,
     ToolResult,
+    ToolResultBlock,
     ToolUseBlock,
 )
 from protocore.runtime import forced_terminal
@@ -1119,3 +1120,47 @@ async def test_the_write_first_switch_is_inert_once_a_file_is_written(
     assert "terminal_tool_nudge" not in _reasons(events)
     assert llm.calls[2].extra.get("forced_tool_choice") == "Finalize"
     assert len(finalize.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_call_on_a_forced_turn_never_reaches_the_loop_guard(
+    engine_factory, in_memory_runtime
+) -> None:
+    """A provider ignores the forced choice and repeats a call the run already
+    made. The call is dropped before the repeat guard sees it, so no result is
+    filed for a call the transcript does not hold, the answer is not demoted,
+    and the run seals on it."""
+    rc = _rc(loop_guard_enabled=True, loop_guard_identical_tool_limit=1)
+    engine, finalize = _engine(engine_factory, in_memory_runtime, rc=rc)
+    search = MockTool(tool_name="CatalogSearch", description="Search the catalogue")
+    in_memory_runtime["tools"].register(search)
+    llm: InMemoryLLMProvider = in_memory_runtime["llm"]
+    llm.queue_tool_call_response(tool_call_id="s1", tool_name="CatalogSearch", tool_input={"q": "x"})
+    llm._scripted_streams.append(_text_stream(ANSWER))
+    llm.queue_tool_call_response(tool_call_id="s2", tool_name="CatalogSearch", tool_input={"q": "x"})
+    llm.queue_tool_call_response(
+        tool_call_id="f1", tool_name="Finalize", tool_input={"declared_deliverables": []}
+    )
+
+    events = await _run(engine)
+
+    uses = [
+        block.tool_call_id
+        for message in engine.history
+        for block in message.content_blocks
+        if isinstance(block, ToolUseBlock)
+    ]
+    results = [
+        block.tool_call_id
+        for message in engine.history
+        for block in message.content_blocks
+        if isinstance(block, ToolResultBlock)
+    ]
+    assert uses == ["s1", "f1"]
+    assert results == ["s1", "f1"]
+    assert not any(e.payload.get("tool_call_id") == "s2" for e in events)
+    assert len(search.calls) == 1
+    assert len(llm.calls) == 4
+    assert _answers(engine) == [ANSWER]
+    assert len(finalize.calls) == 1
+    assert engine.state is LoopState.COMPLETED

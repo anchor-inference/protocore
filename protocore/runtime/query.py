@@ -3450,6 +3450,12 @@ async def _stream_one_assistant_message(
                 # that grew apart. The partial the reader already saw is put
                 # in the transcript first, so whatever recovery is chosen
                 # carries it forward.
+                if _forced_terminal.request_mode(engine) is not None:
+                    stream_result.tool_calls = (
+                        _drop_calls_a_forced_turn_does_not_admit(
+                            engine, stream_result.tool_calls
+                        )
+                    )
                 _persist_partial_attempt_to_history(engine, stream_result)
                 _turn = _turn_at(engine, flags, TurnCoordinate.stream_failed,
                     stream_error=exc,
@@ -3479,6 +3485,16 @@ async def _stream_one_assistant_message(
                 # as what it is.
                 raise
 
+
+            # A forced terminal turn carries only what its mode admits, whatever
+            # the provider did with the constraint. Dropped here — before the
+            # truncation recovery, the repeat guard and the transcript see the
+            # round — they are never run, never answered and never read as
+            # work.
+            if _forced_terminal.request_mode(engine) is not None:
+                stream_result.tool_calls = _drop_calls_a_forced_turn_does_not_admit(
+                    engine, stream_result.tool_calls
+                )
 
             # ── The output budget ran out before the round finished ────
             # Mid-sentence or mid-way through a tool call's arguments: either
@@ -3568,17 +3584,6 @@ async def _stream_one_assistant_message(
 
         if flags.terminal_yielded:
             return
-
-        # A forced terminal turn carries only what its mode admits, whatever
-        # the provider did with the constraint. Dropped here, before the
-        # turn's calls are recorded, they are never run and never read as work.
-        if _forced_terminal.request_mode(engine) is not None:
-            pending_tool_calls = _drop_calls_a_forced_turn_does_not_admit(
-                engine, pending_tool_calls
-            )
-            history_tool_calls = _drop_calls_a_forced_turn_does_not_admit(
-                engine, history_tool_calls
-            )
 
         # An exhaustion exit inside the inner stream loop armed the forced
         # terminal backstop. Restart the OUTER loop so the next assistant
@@ -9025,7 +9030,10 @@ def _terminal_tool_registered(engine: QueryEngine) -> bool:
     terminal_tool = _resolved_terminal_tool_name(engine)
     if terminal_tool is None:
         return False
-    if terminal_tool in engine._circuit_broken_tools:
+    if any(
+        _is_terminal_tool_name(name, terminal_tool)
+        for name in engine._circuit_broken_tools
+    ):
         return False
     getter = getattr(getattr(engine, "tools", None), "get", None)
     return getter is not None and getter(terminal_tool) is not None

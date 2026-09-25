@@ -1990,13 +1990,16 @@ class LoopConstants(BaseModel):
             "no terminal tool result while ``terminal_tool_nudge_enabled`` is "
             "on, every further request is constrained to a tool call and "
             "nothing is appended to the transcript: each names the terminal "
-            "tool in the provider's native ``tool_choice``, except that one "
-            "following a terminal call the tool itself refused requires any "
-            "tool call, so the model can act on the refusal. Each forced "
-            "request spends one; so does each "
-            "time the forcing steps aside for a gate's corrective or a user "
-            "message. Once it is spent the run completes on the answer it "
-            "delivered. 0 completes on the delivered answer without forcing."
+            "tool in the provider's native ``tool_choice``, except that the one "
+            "following the run's first terminal-tool refusal marked with "
+            "``TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY`` requires any tool "
+            "call, so the model can do the missing work; other refusals are "
+            "forced again by name. Each forced request spends one; so does "
+            "each time the forcing steps aside for a gate's corrective or a "
+            "message for the model (stepping aside because the model resumed "
+            "work does not spend again). Once it is spent the run completes "
+            "on the answer it delivered. 0 completes on the delivered answer "
+            "without forcing."
         ),
     )
     terminal_tool_nudge_write_first_before_forcing: bool = Field(
