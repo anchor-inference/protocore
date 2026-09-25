@@ -425,8 +425,13 @@ async def test_terminal_nudge_recovers_plain_text_final(
         for evt in events
         if evt.type is EventType.STATE_CHANGED
     ]
-    assert "terminal_tool_nudge" in reasons
-    assert len(in_memory_runtime["llm"].calls) == 2
+    # The plain-text answer is followed by a request that forces the terminal
+    # tool rather than one that asks for it in words.
+    assert "terminal_tool_forced" in reasons
+    assert "terminal_tool_nudge" not in reasons
+    calls = in_memory_runtime["llm"].calls
+    assert len(calls) == 2
+    assert calls[1].extra.get("forced_tool_choice") == "pcm_answer"
     assert tool.calls == [{"message": "14", "outcome": "OUTCOME_OK", "refs": []}]
     assert engine.state is LoopState.COMPLETED
 

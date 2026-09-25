@@ -48,6 +48,7 @@ from protocore.contracts.types import (
     TextBlock,
     ToolCall,
 )
+from protocore.runtime import forced_terminal as _forced_terminal
 from protocore.runtime import soft_stop as _soft_stop
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
@@ -180,6 +181,11 @@ class OutputCapRecoveryPolicy:
             turn.finish_reason in ("length", "")
             and not turn.pending_tool_calls
             and not turn.engine.stop_requested
+            # A forced terminal call after a delivered answer has no prose to
+            # resume: its text is suppressed, and asking the model to carry on
+            # under a finished answer invites a second one. The forcing
+            # retries such a round on its own budget.
+            and not _forced_terminal.is_armed(turn.engine)
             and not (
                 turn.finish_reason == "length"
                 and turn.reasoning_emitted

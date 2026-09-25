@@ -334,7 +334,7 @@ governing `LoopConstants` field(s) and their safe/off default.
 | Failure classification | `contracts/resilience.py::IResilienceClassifier`, `runtime/error_kinds.py` | none — the classifier is `QueryEngineConfig.resilience_classifier`; unbound means no wording is recognised | Yes | Yes |
 | Run wind-down (soft stop) | `runtime/soft_stop.py` | `soft_stop_enabled` = `True`, `soft_stop_max_turns` = `3` | Yes | Yes |
 | Attempt ledger + adaptive safety band | `contracts/attempt_ledger.py`, host-owned band | band wired via per-call output budget | Yes | Yes |
-| Finalization gate + contract | host-owned | `terminal_tool_nudge_enabled` (`False`), `finalize_prose_gate_enabled` | Yes | Yes |
+| Finalization gate + contract | host-owned | `terminal_tool_nudge_enabled` (`False`), `terminal_tool_forced_max_attempts`, `finalize_prose_gate_enabled` | Yes | Yes |
 | Terminal-answer validation + references/grounding | host-owned (the core carries the evidence a run collects, `contracts/evidence.py`) | host knobs (validation and reference normalisation are both driven from the host's own model) | Yes | Yes |
 | IMemory subsystem | `contracts/memory.py`, `tools/memory.py` | `memory_enabled` = `False`; auto-recall is a host knob | Host-wired (tools held by core contract) | Yes |
 | Token counting | `runtime/token_counting.py` (+ the optional `protocore-native` estimator) | `chars_per_token_*` ratios in RC; `PROTOCORE_DISABLE_NATIVE` forces the pure-Python path | Yes | Yes |

@@ -1979,6 +1979,34 @@ class LoopConstants(BaseModel):
             "hardcoded in core."
         ),
     )
+    terminal_tool_forced_max_attempts: int = Field(
+        default=2,
+        ge=0,
+        description=(
+            "Requests the run may spend on a forced call to the terminal tool "
+            "once its answer is delivered. When a turn ends with a substantive "
+            "visible answer and no terminal tool result while "
+            "``terminal_tool_nudge_enabled`` is on, every further request "
+            "names the terminal tool in the provider's native ``tool_choice`` "
+            "and nothing is appended to the transcript. A forced request that "
+            "comes back without the call (reasoning only, a length cut, or a "
+            "tool error) is retried on this budget; once it is spent the run "
+            "completes on the answer already delivered. 0 completes on the "
+            "delivered answer without forcing at all."
+        ),
+    )
+    terminal_tool_forced_thinking_enabled: bool = Field(
+        default=False,
+        description=(
+            "Whether native thinking stays on for the forced terminal-tool "
+            "request. Off by default: the request can only produce the "
+            "terminal call's arguments, and a thinking model given a forced "
+            "tool choice was measured to spend its whole output budget "
+            "reasoning before the constrained call begins, ending length-cut "
+            "with no call, while the same request with thinking off returned "
+            "the call every time in about a second."
+        ),
+    )
 
  # ----- Universal prose-gate before a background terminal -----
  # terminal tool. The terminal tool (e.g. ``Finalize``) is being made a

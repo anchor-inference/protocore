@@ -15,6 +15,13 @@ post-tool nudge simply stops and lets the ordinary end-of-turn policies decide.
 
 A round that produced anything at all clears the counters, so a single early
 empty response does not permanently consume either budget.
+
+None of this applies while the run's terminal call is being forced after a
+delivered answer. The round that came back empty there was a request for one
+tool call, and every recovery above would put words in front of the model — a
+"continue" under a finished answer reads as an invitation to write another one.
+Such a round is the forcing's to retry, on its own budget, so it passes through
+untouched.
 """
 from __future__ import annotations
 
@@ -32,6 +39,7 @@ from protocore.runtime.events import TurnEvent
 from protocore.runtime.turn_policies import (
     HistoryAppender,
     RunCounter,
+    RunPredicate,
     StateChangeEmitter,
 )
 from protocore.runtime.turn_policies.run_ceilings import (
@@ -61,6 +69,7 @@ class EmptyModelTurnPolicy:
         "_continue_prompt_event",
         "_empty_rounds",
         "_enter_wind_down",
+        "_forcing_terminal_call",
         "_llm_terminal",
         "_post_tool_nudges",
         "_reasoning_cut_event",
@@ -88,7 +97,9 @@ class EmptyModelTurnPolicy:
         wind_down_budget: WindDownBudget,
         llm_terminal: TerminalEmitter,
         state_change: StateChangeEmitter,
+        forcing_terminal_call: RunPredicate,
     ) -> None:
+        self._forcing_terminal_call = forcing_terminal_call
         self._empty_rounds = empty_rounds
         self._reasoning_cut_rounds = reasoning_cut_rounds
         self._post_tool_nudges = post_tool_nudges
@@ -106,6 +117,8 @@ class EmptyModelTurnPolicy:
 
     async def apply(self, turn: TurnContext) -> AsyncIterator[TurnEvent]:
         engine = turn.engine
+        if self._forcing_terminal_call(engine):
+            return
         bound = engine.rc.max_consecutive_empty_responses
         empty_of_everything = (
             not turn.text_emitted

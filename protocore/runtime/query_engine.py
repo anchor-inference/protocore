@@ -1091,6 +1091,11 @@ class QueryEngine:
         # discovery calls. The runtime never synthesises the answer — the
         # model still chooses message / outcome / refs.
         self._terminal_only_active: bool = False
+        # The terminal call a run owes once its answer is delivered, and the
+        # forced requests spent on it (``protocore.runtime.forced_terminal``).
+        # Per run, snapshot-persisted, lowered with the terminal-only latch.
+        self._terminal_call_forced: bool = False
+        self._terminal_call_forced_attempts: int = 0
 
         # Wall-clock budget. Monotonic timestamp captured at
         # ``run()`` entry; the wall-clock equivalent (epoch seconds) is persisted
@@ -1511,6 +1516,10 @@ class QueryEngine:
         # rather than about the turn, and clearing it at a turn boundary would
         # hand the model back the tools the stop took away.
         self._terminal_only_active = False
+        # The forced terminal call belongs to the answer this run delivered; a
+        # new turn has delivered nothing yet and owes no call.
+        self._terminal_call_forced = False
+        self._terminal_call_forced_attempts = 0
         # Reset the transient-stream-error (rate-limit / timeout) retry counter
         # per run for the same reason: a reused engine must start each run with
         # its full retry budget, not one left exhausted by a prior run that
@@ -1978,6 +1987,19 @@ class QueryEngine:
             rc=self.config.rc,
             roles=self.config.tool_roles,
         )
+        # A forced terminal call must name a tool the request advertises, so
+        # while one is owed the terminal tool is pinned past the retrieval clip.
+        from protocore.runtime import forced_terminal as _forced_terminal
+
+        terminal_tool = self.config.expected_terminal_tool
+        if (
+            terminal_tool
+            and _forced_terminal.is_armed(self)
+            and terminal_tool not in policy.forced_pinned
+        ):
+            policy = policy.model_copy(
+                update={"forced_pinned": policy.forced_pinned | {terminal_tool}}
+            )
         # The wind-down has the last word, and it has to. Everything above this
         # line is a mechanism for keeping a tool on the surface — the RC floor
         # bypasses the retrieval clip, the discovery pins bypass it too, the
@@ -2616,6 +2638,10 @@ class QueryEngine:
             # correctness-affecting runtime state must not rely on per-pod
             # memory.
             "terminal_only_active": self._terminal_only_active,
+            # The forced terminal call and what it has spent, so a run picked
+            # up on another pod neither loses the forcing nor restarts its bound.
+            "terminal_call_forced": self._terminal_call_forced,
+            "terminal_call_forced_attempts": self._terminal_call_forced_attempts,
             # Persist "this run delegated" so a run re-driven on another pod
             # still renders its answer the way the pod that dispatched the
             # subtask would have. Same horizontal-scaling rule as the latches
@@ -3174,6 +3200,10 @@ class QueryEngine:
         # no field present resume as if the nudge had not fired.
         self._terminal_only_active = bool(
             snapshot.get("terminal_only_active", False)
+        )
+        self._terminal_call_forced = bool(snapshot.get("terminal_call_forced", False))
+        self._terminal_call_forced_attempts = int(
+            snapshot.get("terminal_call_forced_attempts", 0) or 0
         )
         # Restore the delegation fact. Default False so a snapshot taken before
         # the field existed resumes as a run that never delegated — the

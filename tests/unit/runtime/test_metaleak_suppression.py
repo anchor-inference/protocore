@@ -223,11 +223,11 @@ async def test_meta_text_suppressed_live_and_durable_answer_kept(
     user_msg = Message(role=MessageRole.user, content_blocks=[TextBlock(text="12*12?")])
     events = [evt async for evt in engine.run(user_msg)]
 
-    # The nudge fired (write-first recovery + Finalize path preserved).
+    # The answer was followed by a forced Finalize request, not a nudge.
     reasons = [
         e.payload.get("reason") for e in events if e.type is EventType.STATE_CHANGED
     ]
-    assert "terminal_tool_nudge" in reasons
+    assert "terminal_tool_forced" in reasons
     # Two LLM turns happened (answer + terminal-only).
     assert len(in_memory_runtime["llm"].calls) == 2
     # Finalize actually ran (background gate executed).
