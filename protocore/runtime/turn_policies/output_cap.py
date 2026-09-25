@@ -185,7 +185,7 @@ class OutputCapRecoveryPolicy:
             # resume: its text is suppressed, and asking the model to carry on
             # under a finished answer invites a second one. The forcing
             # retries such a round on its own budget.
-            and not _forced_terminal.is_armed(turn.engine)
+            and _forced_terminal.request_mode(turn.engine) is None
             and not (
                 turn.finish_reason == "length"
                 and turn.reasoning_emitted

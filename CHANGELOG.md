@@ -10,32 +10,63 @@ All notable changes to this project are recorded here. The format follows
 
 - **A delivered answer's terminal call is forced, not requested.** When a run
   with `expected_terminal_tool` and `terminal_tool_nudge_enabled` ends a turn
-  with a substantive visible answer and no terminal-tool result, the next
-  request names the terminal tool in `extra["forced_tool_choice"]` and appends
-  nothing to the transcript; the free-form `terminal_tool_nudge` text is no
-  longer sent on that path. Every further request is forced the same way until
-  the call succeeds, up to `terminal_tool_forced_max_attempts` (default 2), and
-  then the run completes on the answer it already delivered
-  (`state_changed` reason `terminal_tool_forced_exhausted`). While the call is
-  forced, a reasoning-only or finish-less round is retried on that budget
-  instead of receiving `continue_prompt_text`, the reasoning length-cut note or
-  the output-cap resume prompt, and any text a provider lets through on a
-  forced turn is kept off the stream and out of history — so no request after
-  the answer can produce a second one. Before, a thinking model answered the
-  nudge with reasoning only, was told "Please continue.", and started a new
-  answer, often to an earlier question in the session. The forced request is
-  sent with thinking off unless `terminal_tool_forced_thinking_enabled` is set:
-  measured on a self-hosted thinking model behind vLLM, a named `tool_choice`
-  with thinking on spent a 2,048-token budget reasoning in most attempts and
-  returned no call, and with thinking off it returned exactly the call every
-  time. The terminal tool is pinned to the surface while its call is owed; a
-  run whose terminal tool is not registered completes on its answer
-  (`terminal_tool_unavailable`). A turn that ends with no answer yet still gets
-  the one-time `terminal_tool_nudge` text, because the answer it owes is prose
-  and a forced call cannot write it; the answer it then writes is sealed by
-  force. A host adapter must render `forced_tool_choice` as its native
-  single-tool choice and send `enable_thinking=False` explicitly when the
-  request carries it.
+  with a substantive visible answer and no terminal-tool result, the following
+  requests are forced and append nothing to the transcript. Each one names the
+  terminal tool in `extra["forced_tool_choice"]`, except the one after a
+  terminal call the tool itself refused: that one carries the new
+  `extra["tool_choice_required"] = True` (any tool, no prose), so the model can
+  act on the refusal. The free-form `terminal_tool_nudge` text is no longer sent
+  on this path.
+
+  A forced turn's text is kept off the stream and out of history. Calls the
+  forced mode does not admit are dropped before they are recorded or run, so a
+  provider that ignores the forced choice cannot start new work under the
+  answer. A reasoning-only or finish-less forced round is retried instead of
+  receiving `continue_prompt_text`, the reasoning length-cut note or the
+  output-cap resume prompt. Before this, a thinking model answered the nudge
+  with reasoning only, was told "Please continue.", and started a second
+  answer, often to an earlier question in the session.
+
+  The forcing steps aside, and the model's text is shown again, when the model
+  has to act rather than seal:
+  - a gate refuses the call with a corrective (the prose gate, a host
+    pre-dispatch check);
+  - the user or a background task adds a message;
+  - a required call is answered with other work.
+
+  The answer the model ends on is then forced again. A gate's corrective closes
+  the answer window, so the refused prose no longer counts as the answer.
+
+  Forced requests and each step-aside share `terminal_tool_forced_max_attempts`
+  (default 3). When it is spent, the run completes on the answer it delivered
+  (`state_changed` reason `terminal_tool_forced_exhausted`). That completion is
+  a hard stop: it does not pass the answer floor, the voluntary artifact seal or
+  follow-up placement.
+
+  Forced requests go out with thinking off unless
+  `terminal_tool_forced_thinking_enabled` is set. Measured on a self-hosted
+  thinking model behind vLLM:
+  - with thinking on, a named `tool_choice` spent a 2,048-token budget
+    reasoning in most attempts and returned no call;
+  - with thinking off, it returned exactly the call every time;
+  - with thinking off, `tool_choice="required"` after a refused call returned a
+    tool call in 10 of 10 samples, the requested write in 8 of them.
+
+  Other changes:
+  - The terminal tool is pinned to the surface while its call is owed.
+  - A run whose terminal tool is not registered completes on its answer
+    (`terminal_tool_unavailable`).
+  - A continuation run (`run(None)`, including `resume`) keeps a forcing that
+    was in progress.
+  - A turn that ends with no answer yet still gets the one-time
+    `terminal_tool_nudge` text; the answer it then writes is forced. Prose that
+    only announces work ("now let me write the report") counts as an answer and
+    is sealed. Catching that is left to a host check on the declared
+    deliverables, whose refusal lets the model do the work.
+
+  A host adapter must render `forced_tool_choice` as its native single-tool
+  choice and `tool_choice_required` as `tool_choice="required"`, and must send
+  thinking off explicitly when the request carries `enable_thinking=False`.
 
 ### Fixed
 

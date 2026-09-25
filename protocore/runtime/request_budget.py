@@ -42,7 +42,7 @@ _SIZE_INDEPENDENT_FIELDS: frozenset[str] = frozenset(
 #: forced tool choice constrains decoding, not the template. Left in the digest,
 #: either would make the tool definitions look new on every iteration.
 _RENDER_NEUTRAL_EXTRA_KEYS: frozenset[str] = frozenset(
-    {"cache_breakpoints", "forced_tool_choice"}
+    {"cache_breakpoints", "forced_tool_choice", "tool_choice_required"}
 )
 
 RequestTokenCount = Callable[[LLMRequest], Awaitable[int | None]]

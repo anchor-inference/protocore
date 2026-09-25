@@ -76,6 +76,7 @@ _RESET_ON_REARM: frozenset[str] = frozenset(
         # both belong to the answer that armed them.
         "_terminal_call_forced",
         "_terminal_call_forced_attempts",
+        "_terminal_call_forced_mode",
         # Per-turn wire and streaming bookkeeping. ``turn_id()`` is built from
         # the round counter, so a turn opened on a stale one mints ids that
         # collide with the previous turn's.

@@ -1096,6 +1096,7 @@ class QueryEngine:
         # Per run, snapshot-persisted, lowered with the terminal-only latch.
         self._terminal_call_forced: bool = False
         self._terminal_call_forced_attempts: int = 0
+        self._terminal_call_forced_mode: str | None = None
 
         # Wall-clock budget. Monotonic timestamp captured at
         # ``run()`` entry; the wall-clock equivalent (epoch seconds) is persisted
@@ -1520,6 +1521,7 @@ class QueryEngine:
         # new turn has delivered nothing yet and owes no call.
         self._terminal_call_forced = False
         self._terminal_call_forced_attempts = 0
+        self._terminal_call_forced_mode = None
         # Reset the transient-stream-error (rate-limit / timeout) retry counter
         # per run for the same reason: a reused engine must start each run with
         # its full retry budget, not one left exhausted by a prior run that
@@ -1603,7 +1605,27 @@ class QueryEngine:
 
             _run_preconditions.observe_injected_result_message(self, initial_message)
         self.turn_count += 1
+        # A continuation (no new message) re-drives the turn that was already
+        # open, and a terminal call that turn was forcing is still owed: the
+        # answer it seals is in the history being continued. Dropping the
+        # forcing here would hand a run picked up on another pod a free request
+        # under a finished answer — the request that writes a second one.
+        carried_forcing = (
+            (
+                self._terminal_call_forced,
+                self._terminal_call_forced_attempts,
+                self._terminal_call_forced_mode,
+            )
+            if initial_message is None
+            else None
+        )
         self._reset_per_turn_state()
+        if carried_forcing is not None:
+            (
+                self._terminal_call_forced,
+                self._terminal_call_forced_attempts,
+                self._terminal_call_forced_mode,
+            ) = carried_forcing
         # Stamp the run-start clock ONCE for the wall-clock budget. A resumed run
         # keeps the start it was rehydrated with
         # (``resume_from_snapshot`` set ``_run_started_monotonic`` from the
@@ -2642,6 +2664,7 @@ class QueryEngine:
             # up on another pod neither loses the forcing nor restarts its bound.
             "terminal_call_forced": self._terminal_call_forced,
             "terminal_call_forced_attempts": self._terminal_call_forced_attempts,
+            "terminal_call_forced_mode": self._terminal_call_forced_mode,
             # Persist "this run delegated" so a run re-driven on another pod
             # still renders its answer the way the pod that dispatched the
             # subtask would have. Same horizontal-scaling rule as the latches
@@ -3204,6 +3227,10 @@ class QueryEngine:
         self._terminal_call_forced = bool(snapshot.get("terminal_call_forced", False))
         self._terminal_call_forced_attempts = int(
             snapshot.get("terminal_call_forced_attempts", 0) or 0
+        )
+        forced_mode = snapshot.get("terminal_call_forced_mode")
+        self._terminal_call_forced_mode = (
+            forced_mode if isinstance(forced_mode, str) else None
         )
         # Restore the delegation fact. Default False so a snapshot taken before
         # the field existed resumes as a run that never delegated — the

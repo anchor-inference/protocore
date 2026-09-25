@@ -1980,31 +1980,37 @@ class LoopConstants(BaseModel):
         ),
     )
     terminal_tool_forced_max_attempts: int = Field(
-        default=2,
+        default=3,
         ge=0,
         description=(
-            "Requests the run may spend on a forced call to the terminal tool "
-            "once its answer is delivered. When a turn ends with a substantive "
-            "visible answer and no terminal tool result while "
-            "``terminal_tool_nudge_enabled`` is on, every further request "
-            "names the terminal tool in the provider's native ``tool_choice`` "
-            "and nothing is appended to the transcript. A forced request that "
-            "comes back without the call (reasoning only, a length cut, or a "
-            "tool error) is retried on this budget; once it is spent the run "
-            "completes on the answer already delivered. 0 completes on the "
-            "delivered answer without forcing at all."
+            "Budget for forcing the terminal call once a run's answer is "
+            "delivered. When a turn ends with a substantive visible answer and "
+            "no terminal tool result while ``terminal_tool_nudge_enabled`` is "
+            "on, every further request is constrained to a tool call and "
+            "nothing is appended to the transcript: each names the terminal "
+            "tool in the provider's native ``tool_choice``, except that one "
+            "following a terminal call the tool itself refused requires any "
+            "tool call, so the model can act on the refusal. Each forced "
+            "request spends one; so does each "
+            "time the forcing steps aside for a gate's corrective or a user "
+            "message. Once it is spent the run completes on the answer it "
+            "delivered. 0 completes on the delivered answer without forcing."
         ),
     )
     terminal_tool_forced_thinking_enabled: bool = Field(
         default=False,
         description=(
-            "Whether native thinking stays on for the forced terminal-tool "
-            "request. Off by default: the request can only produce the "
-            "terminal call's arguments, and a thinking model given a forced "
-            "tool choice was measured to spend its whole output budget "
-            "reasoning before the constrained call begins, ending length-cut "
-            "with no call, while the same request with thinking off returned "
-            "the call every time in about a second."
+            "Whether native thinking stays on for forced terminal-tool "
+            "requests. Off by default: such a request can only produce tool "
+            "calls, and a thinking model given a forced tool choice was "
+            "measured to spend its whole output budget reasoning before the "
+            "constrained call begins, ending length-cut with no call, while "
+            "the same request with thinking off returned the call every time "
+            "in about a second. For a terminal tool whose arguments carry the "
+            "answer text, off also means those arguments are written without "
+            "thinking. Some providers reject a forced tool choice combined "
+            "with extended thinking outright, so turning this on can fail the "
+            "forced request there."
         ),
     )
 

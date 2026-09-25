@@ -1554,6 +1554,7 @@ def build_llm_request(
     thinking_enabled: bool | None = None,
     reasoning_effort: str | None = None,
     forced_tool_choice: str | None = None,
+    tool_choice_required: bool = False,
     response_format: Mapping[str, Any] | None = None,
     cache_breakpoints: Sequence[CacheBreakpoint] | None = None,
     observability: LLMObservabilityContext | None = None,
@@ -1574,7 +1575,10 @@ def build_llm_request(
       and it carries the tool NAME; a provider adapter renders it into whatever
       native single-tool ``tool_choice`` shape its wire wants. Stating the same
       intent in two spellings meant a single reader could not tell whether a
-      turn had been forced.
+      turn had been forced. ``extra["tool_choice_required"] = True`` is the
+      weaker constraint beside it — some tool call, any advertised one — which
+      an OpenAI-compatible adapter renders as ``tool_choice="required"``. A
+      request carries at most one of the two; a named tool wins.
     * **the temperature**. The caller's value when it has one, and ``None``
       otherwise. A path with no opinion (the action stream, the deep loop's
       plan call and its fallback) leaves the choice to the host, which may
@@ -1605,6 +1609,8 @@ def build_llm_request(
         extra["reasoning_effort"] = reasoning_effort
     if forced_tool_choice is not None:
         extra["forced_tool_choice"] = forced_tool_choice
+    elif tool_choice_required:
+        extra["tool_choice_required"] = True
     if response_format is not None:
         extra["response_format"] = dict(response_format)
     return LLMRequest(
@@ -3562,6 +3568,17 @@ async def _stream_one_assistant_message(
         if flags.terminal_yielded:
             return
 
+        # A forced terminal turn carries only what its mode admits, whatever
+        # the provider did with the constraint. Dropped here, before the
+        # turn's calls are recorded, they are never run and never read as work.
+        if _forced_terminal.request_mode(engine) is not None:
+            pending_tool_calls = _drop_calls_a_forced_turn_does_not_admit(
+                engine, pending_tool_calls
+            )
+            history_tool_calls = _drop_calls_a_forced_turn_does_not_admit(
+                engine, history_tool_calls
+            )
+
         # An exhaustion exit inside the inner stream loop armed the forced
         # terminal backstop. Restart the OUTER loop so the next assistant
         # turn streams with the injected nudge + the terminal-only latch
@@ -4677,27 +4694,37 @@ async def _drive_one_stream(
     # everything but a precondition: the call is the only thing left for the
     # run to do, so a convergence hint or a read-back cannot be served by this
     # request anyway, and neither loses anything by staying pending.
-    forced_terminal_tool = (
-        _resolved_terminal_tool_name(engine)
-        if precondition_tool is None and _forced_terminal.is_armed(engine)
-        else None
+    forced_terminal_mode = (
+        _forced_terminal.request_mode(engine) if precondition_tool is None else None
     )
-    if forced_terminal_tool is not None:
-        if any(
-            getattr(t, "name", None) == forced_terminal_tool for t in context.tools
-        ):
-            forced_tool_choice = forced_terminal_tool
+    tool_choice_required = False
+    if forced_terminal_mode is not None:
+        terminal_tool = _resolved_terminal_tool_name(engine) or ""
+        advertised_terminal = next(
+            (
+                t.name
+                for t in context.tools
+                if _is_terminal_tool_name(getattr(t, "name", None), terminal_tool)
+            ),
+            None,
+        )
+        if advertised_terminal is not None:
+            if forced_terminal_mode == _forced_terminal.MODE_TERMINAL:
+                forced_tool_choice = advertised_terminal
+            else:
+                tool_choice_required = True
         else:
             # The terminal tool is pinned while the call is owed, so only a
             # surface that blocks it outright lands here. Nothing can force it,
             # so the bound is spent now and the run completes on its answer at
             # the next turn start; this request still goes out, with its text
-            # suppressed like any other forced turn's.
+            # suppressed and every call it returns dropped, like any other
+            # forced turn's.
             _forced_terminal.spend_all(engine)
             _logger.warning(
                 "DIAG forced_terminal.not_advertised run=%s tool=%s",
                 engine.config.run_id,
-                forced_terminal_tool,
+                terminal_tool,
             )
     elif precondition_tool is not None:
         # Unlike the hint below, an unforceable precondition is charged as a
@@ -4811,12 +4838,13 @@ async def _drive_one_stream(
         max_tokens=max_output_tokens,
         thinking_enabled=(
             False
-            if forced_terminal_tool is not None
+            if forced_terminal_mode is not None
             and not rc.terminal_tool_forced_thinking_enabled
             else engine.effective_thinking_enabled
         ),
         reasoning_effort=engine.effective_reasoning_effort,
         forced_tool_choice=forced_tool_choice,
+        tool_choice_required=tool_choice_required,
         cache_breakpoints=cache_breakpoints,
         observability=_observability_context(
             engine,
@@ -7262,7 +7290,7 @@ def _suppress_terminal_only_meta_text(engine: QueryEngine) -> bool:
     # carry that call. Whatever text a provider lets through on it is not an
     # answer, whatever the terminal tool's schema — a message-carrying tool
     # takes its answer in its arguments — so none of it reaches the reader.
-    if _forced_terminal.is_armed(engine):
+    if _forced_terminal.request_mode(engine) is not None:
         return True
     if not getattr(engine, "_terminal_only_active", False):
         return False
@@ -7802,6 +7830,27 @@ def _is_non_terminal_tool_activity(
     return False
 
 
+#: Corrective turns a gate appends when it REFUSES the terminal call because
+#: the answer before it is not the answer. Each closes the answer window the
+#: way work does: prose written before it was refused, and only prose written
+#: after it can count as the run's answer.
+_ANSWER_REFUSAL_KINDS: Final[frozenset[str]] = frozenset(
+    {
+        SYNTHETIC_RECOVERY_PROSE_GATE_REPAIR,
+        SYNTHETIC_RECOVERY_PRE_DISPATCH_TERMINAL_VERIFY,
+    }
+)
+
+
+def _refuses_answer(message: Message) -> bool:
+    """True iff ``message`` is a gate's corrective turn refusing the answer."""
+    return (
+        message.role is MessageRole.user
+        and message.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
+        in _ANSWER_REFUSAL_KINDS
+    )
+
+
 def _has_visible_assistant_prose_after_work(
     engine: QueryEngine, terminal_tool: str, min_chars: int
 ) -> bool:
@@ -7841,6 +7890,8 @@ def _has_visible_assistant_prose_after_work(
     run_messages = _this_run_messages(engine)
     call_names = tool_names_by_call_id(run_messages)
     for message in run_messages:
+        if _refuses_answer(message):
+            last_work_pos = pos
         for block in message.content_blocks:
             if _is_non_terminal_tool_activity(block, terminal_tool, call_names):
                 last_work_pos = pos
@@ -8398,6 +8449,10 @@ def _plain_stop_answer_floor_applies(engine: QueryEngine) -> bool:
 def _run_did_non_terminal_work(engine: QueryEngine, terminal_tool: str) -> bool:
     """True iff this run called at least one non-terminal tool.
 
+    A gate's corrective that refused the terminal call counts too, as the
+    refused call's error result once did: the run owes a report on something,
+    and the prose it was refused for was not it.
+
     The floor is a length test, and a length test cannot by itself tell a reply
     that COLLAPSED from one that is correctly brief. What separates them is
     whether there was anything to report: a run that searched, delegated or
@@ -8416,6 +8471,8 @@ def _run_did_non_terminal_work(engine: QueryEngine, terminal_tool: str) -> bool:
     run_messages = _this_run_messages(engine)
     call_names = tool_names_by_call_id(run_messages)
     for message in run_messages:
+        if _refuses_answer(message):
+            return True
         for block in message.content_blocks:
             if _is_non_terminal_tool_activity(block, terminal_tool, call_names):
                 return True
@@ -8528,6 +8585,9 @@ def _visible_answer_after_work(engine: QueryEngine, terminal_tool: str) -> str:
         partial_attempt = (
             message.metadata.get(PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY) is True
         )
+        if _refuses_answer(message):
+            answer_parts.clear()
+            continue
         for block in message.content_blocks:
             if _is_non_terminal_tool_activity(block, terminal_tool, call_names):
                 # Work landed — everything said before it was narration about
@@ -8899,6 +8959,11 @@ def _resolve_pre_dispatch_terminal_veto(
     return corrective
 
 
+def _forcing_this_request(engine: object) -> bool:
+    """True iff the request that just came back was a forced terminal request."""
+    return _forced_terminal.request_mode(engine) is not None
+
+
 def _terminal_answer_delivered(engine: QueryEngine) -> bool:
     """True iff this run's answer is written and only its terminal call is owed.
 
@@ -8936,7 +9001,106 @@ def _arm_forced_terminal_call(engine: QueryEngine) -> bool:
 
 
 def _release_forced_terminal_call(engine: QueryEngine) -> None:
+    """Lift the forcing; the terminal-only latch goes back to the wind-down's.
+
+    The latch hides a turn's text as narration after an answer. A lifted
+    forcing hands the model a turn in which it is asked to act — a corrective
+    to answer, work to resume — and what it writes there is not narration.
+    """
     _forced_terminal.release(engine, reason=_forced_terminal.REASON_RELEASED)
+    engine._terminal_only_active = _soft_stop.is_armed(engine)
+
+
+def _trailing_tool_results(engine: QueryEngine) -> list[ToolResultBlock]:
+    """The tool results after the latest assistant turn, in history order."""
+    results: list[ToolResultBlock] = []
+    for message in reversed(_this_run_messages(engine)):
+        if message.role is MessageRole.assistant:
+            break
+        if message.role is not MessageRole.tool:
+            return []
+        results[:0] = [
+            block
+            for block in message.content_blocks
+            if isinstance(block, ToolResultBlock)
+        ]
+    return results
+
+
+def _forced_terminal_question_pending(engine: QueryEngine) -> bool:
+    """True iff the transcript ends in a message asking the model something.
+
+    Nothing the forcing does appends to the transcript, so a user-role message
+    at its end came from elsewhere: a gate's corrective after it refused the
+    call, a message the user sent meanwhile, a background result. A forced
+    call can answer none of them. The wind-down's notice is the exception — it
+    asks for the answer and the terminal call, which the run has and is making.
+    """
+    run_messages = _this_run_messages(engine)
+    if not run_messages:
+        return False
+    last = run_messages[-1]
+    return (
+        last.role is MessageRole.user
+        and last.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
+        != _soft_stop.SYNTHETIC_RECOVERY_SOFT_STOP
+    )
+
+
+def _forced_terminal_working_again(engine: QueryEngine) -> bool:
+    """True iff the last forced turn called a tool other than the terminal one."""
+    terminal_tool = _resolved_terminal_tool_name(engine) or ""
+    return any(
+        not _is_terminal_tool_name(
+            _tool_name_for_call_id(engine, block.tool_call_id), terminal_tool
+        )
+        for block in _trailing_tool_results(engine)
+    )
+
+
+def _forced_terminal_call_refused(engine: QueryEngine) -> bool:
+    """True iff the terminal tool itself refused the last call to it."""
+    terminal_tool = _resolved_terminal_tool_name(engine) or ""
+    return any(
+        block.is_error
+        and _is_terminal_tool_name(
+            _tool_name_for_call_id(engine, block.tool_call_id), terminal_tool
+        )
+        for block in _trailing_tool_results(engine)
+    )
+
+
+def _forced_terminal_slot_taken(engine: QueryEngine) -> bool:
+    """True iff a run-level precondition owns the next request's forced slot."""
+    return _preconditions.outstanding_tool(engine) is not None
+
+
+def _forced_terminal_admits(engine: QueryEngine, tool_name: str) -> bool:
+    """Whether a call to ``tool_name`` may leave a forced turn.
+
+    A provider may ignore the forced ``tool_choice``, and a fallback endpoint
+    may not support it at all. What such a turn returns beyond what its mode
+    admits is dropped before it is recorded or run, so the constraint holds
+    whether or not the provider kept it.
+    """
+    mode = _forced_terminal.request_mode(engine)
+    if mode is None or mode == _forced_terminal.MODE_ANY_TOOL:
+        return True
+    return _is_terminal_tool_name(tool_name, _resolved_terminal_tool_name(engine) or "")
+
+
+def _drop_calls_a_forced_turn_does_not_admit(
+    engine: QueryEngine, calls: list[ToolCall]
+) -> list[ToolCall]:
+    kept = [call for call in calls if _forced_terminal_admits(engine, call.name)]
+    if len(kept) != len(calls):
+        _logger.warning(
+            "DIAG forced_terminal.dropped_calls run=%s mode=%s dropped=%s",
+            engine.config.run_id,
+            _forced_terminal.request_mode(engine),
+            ",".join(call.name for call in calls if call not in kept),
+        )
+    return kept
 
 
 async def _complete_on_delivered_answer(
@@ -8944,9 +9108,13 @@ async def _complete_on_delivered_answer(
 ) -> AsyncIterator[TurnEvent]:
     """Complete the run on the answer it delivered, without the terminal call.
 
-    The same ending a voluntary finish has — a wind-down that is running is
-    marked finalised and named on the ``message_stop`` — preceded by the state
-    change that says why the terminal tool was never called.
+    The same closing events a voluntary finish has — a wind-down that is
+    running is marked finalised and named on the ``message_stop`` — preceded by
+    the state change that says why the terminal tool was never called. It is a
+    hard stop rather than a voluntary finish: the finish seams (the answer
+    floor, a voluntary artifact seal) and follow-up placement are not passed,
+    because each of them can open another request, and another request under a
+    delivered answer is what the forcing exists to prevent.
     """
     _logger.warning(
         "DIAG forced_terminal.complete run=%s reason=%s attempts=%d: completing "
@@ -8955,6 +9123,7 @@ async def _complete_on_delivered_answer(
         reason,
         _forced_terminal.attempts_spent(engine),
     )
+    _release_forced_terminal_call(engine)
     yield _emit_state_change(engine, engine.state, engine.state, reason=reason)
     async for event in _emit_voluntary_completion(engine):
         yield event
@@ -12519,7 +12688,7 @@ _CORE_TURN_POLICIES: Final[TurnPolicyRegistry] = TurnPolicyRegistry(
             wind_down_budget=_soft_stop_turn_budget,
             llm_terminal=_emit_llm_terminal,
             state_change=_policy_state_change,
-            forcing_terminal_call=_forced_terminal.is_armed,
+            forcing_terminal_call=_forcing_this_request,
         ),
         EmptyCompletionGuardPolicy(
             has_terminal_tool_result=_history_has_terminal_tool_result,
@@ -12546,8 +12715,12 @@ _CORE_TURN_POLICIES: Final[TurnPolicyRegistry] = TurnPolicyRegistry(
                 arm=_arm_forced_terminal_call,
                 armed=_forced_terminal.is_armed,
                 release=_release_forced_terminal_call,
-                writing_requested=_prose_gate_injected,
+                question_pending=_forced_terminal_question_pending,
+                working_again=_forced_terminal_working_again,
+                call_refused=_forced_terminal_call_refused,
+                slot_taken=_forced_terminal_slot_taken,
                 charge=_forced_terminal.charge_attempt,
+                set_mode=_forced_terminal.set_request_mode,
                 exhausted=_forced_terminal.exhausted,
                 complete=_complete_on_delivered_answer,
             ),
