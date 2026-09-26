@@ -265,6 +265,10 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/query.py::_emit_llm_terminal": _whole(
         "pairs orphan tool_use blocks so a resumed snapshot is wire-valid"
     ),
+    "protocore/runtime/soft_stop.py::leave": _whole(
+        "removes the wind-down notice wherever it sits in the session transcript, however it "
+        "got there: the executor's seed may carry one whose wind-down was never driven to its end"
+    ),
     "protocore/runtime/query.py::_emit_empty_completion_terminal": _whole(
         "pairs orphan tool_use blocks so a resumed snapshot is wire-valid"
     ),
@@ -471,6 +475,10 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/context/compaction.py::_plan_tier2": _whole(
         "decides which units anywhere in the transcript Tier 2 would send"
     ),
+    "protocore/runtime/context/compaction.py::_group_small_units": _whole(
+        "joins adjacent units by INDEX into the transcript Tier 2 was handed; "
+        "adjacency is a fact about positions in the whole list"
+    ),
     "protocore/runtime/context/compaction.py::tier2_has_work": _whole(
         "asks, without calling the summariser, whether Tier 2 has a unit to send"
     ),
@@ -495,6 +503,53 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     ),
     "protocore/runtime/context/manager.py::ContextManager._fold": _whole(
         "hands the whole transcript to the Tier-3 fold after Tier-2"
+    ),
+    "protocore/runtime/context/manager.py::ContextManager._run_pass": _whole(
+        "runs every tier of one compaction pass over the whole transcript"
+    ),
+    "protocore/runtime/context/compaction.py::_age_mask_candidates": _whole(
+        "ranks tool outputs by age across the whole transcript to find the old ones"
+    ),
+    "protocore/runtime/context/compaction.py::_bounded_span": _whole(
+        "measures a run of positions of the transcript against the summariser's input cap"
+    ),
+    "protocore/runtime/context/compaction.py::_floor_units": _whole(
+        "partitions everything outside the protected set, whichever run wrote it"
+    ),
+    "protocore/runtime/context/compaction.py::floor_has_work": _whole(
+        "asks, without removing anything, whether the floor has a span to remove"
+    ),
+    "protocore/runtime/context/compaction.py::run_floor": _whole(
+        "removes the oldest spans of the whole transcript"
+    ),
+    "protocore/runtime/context/compaction.py::_ledger_position": _whole(
+        "finds the boundary between the compacted past and the kept present"
+    ),
+    "protocore/runtime/context/compaction.py::place_ledger": _whole(
+        "replaces every ledger message in the transcript with one rebuilt from state"
+    ),
+    "protocore/runtime/context/ledger.py::ledger_from_history": _whole(
+        "merges every ledger message the transcript carries, whichever run wrote it"
+    ),
+    "protocore/runtime/context/compaction.py::render_span_for_summary": _Declaration(
+        reason="renders one span a pass is about to replace, for the summariser",
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
+    "protocore/runtime/context/compaction.py::_originals_for": _Declaration(
+        reason="reads back the stored outputs of one span a pass is about to replace",
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
+    "protocore/runtime/context/compaction.py::_store_originals": _Declaration(
+        reason="stores the messages one summary or digest replaces",
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
+    "protocore/runtime/context/compaction.py::_floor_digest": _Declaration(
+        reason="describes the span the floor is removing",
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
+    "protocore/runtime/context/ledger.py::Ledger.absorb": _Declaration(
+        reason="records the messages one tier is taking out of the window",
+        claim=_Claim.NOT_THE_TRANSCRIPT,
     ),
     # --- building the seed, from messages the caller supplies ---------------
     "protocore/runtime/context/session_memory.py::_serialize_turns": _whole(
@@ -528,14 +583,6 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "request; it reaches no engine and selects nothing"
     ),
     # --- identity lookups keyed on a tool call id ---------------------------
-    "protocore/runtime/query.py::_run_produced_output": _run_scoped(
-        "asks whether there is anything a final answer could be about, and "
-        "looks only after the LAST message the caller put in — the operator's "
-        "task, or the tool result a parked run was resumed with. A seeded turn "
-        "precedes that message, so nothing from an earlier run is in the span "
-        "it walks",
-        f"{_CLAIMS}::test_produced_output_ignores_a_seeded_prior_run",
-    ),
     "protocore/runtime/query.py::_tool_name_for_call_id": _run_scoped(
         "resolves ONE tool_call_id to its tool name; a call id identifies a "
         "single call, so the search cannot land on another run's",
@@ -565,6 +612,18 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
             "structural check that ONE approved tool call matches its pending tool_use block",
             f"{_CLAIMS}::test_pending_tool_use_assertion_is_keyed_on_the_approved_call",
         )
+    ),
+    # --- what the round now driving has produced ----------------------------
+    "protocore/runtime/query.py::_this_round_messages": _run_scoped(
+        "answers about the round now driving: it starts at the message AFTER "
+        "the last one a caller put in — the operator's prompt, or the tool "
+        "result a parked run was resumed with — so a prior run's prose and "
+        "tool calls precede the boundary and cannot answer it. The boundary is "
+        "re-derived rather than taken from the seed tag because the tag is set "
+        "by the executor and not by every host, and a host that hands over a "
+        "session's earlier turns verbatim would otherwise have the predicate "
+        "answer for a run that is over",
+        f"{_CLAIMS}::test_produced_output_ignores_a_seeded_prior_run",
     ),
     # --- the tail --------------------------------------------------------
     "protocore/runtime/turn_policies/sibling_walk.py::prose_gate_just_injected": _run_scoped(
@@ -1510,6 +1569,15 @@ _SEED_KEY_DERIVED_ELSEWHERE: dict[str, str] = {
     ),
     "protocore/runtime/context/compaction.py::_fold_item_text": (
         "labels one indexed message for the fold summariser by its provenance"
+    ),
+    "protocore/runtime/context/compaction.py::_floor_units": (
+        "reactive recovery lets the floor remove an earlier run's turns but "
+        "never in one span with this run's, which is a per-message provenance "
+        "test on the list it partitions"
+    ),
+    "protocore/runtime/context/compaction.py::run_floor": (
+        "the digest that replaces an earlier run's turns keeps their seed tag, "
+        "read per message from the span being removed"
     ),
     "protocore/runtime/context/compaction.py::run_tier3_fold": (
         "reactive folding transfers seed provenance from each indexed span"

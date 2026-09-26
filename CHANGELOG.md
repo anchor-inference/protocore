@@ -6,6 +6,101 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Compaction ends below its trigger or at a floor, whatever the summariser
+  does.** A pass now masks old tool outputs, summarises the oldest spans,
+  folds old summaries, and — when those stop short — removes the oldest spans
+  without a model, until the whole prompt is at `compaction_target_ratio` of
+  the trigger or nothing removable is left. A summariser that fails, hangs,
+  returns nothing or returns something unparseable is a normal outcome, and a
+  pass that could change nothing is not opened. See `docs/compaction.md`.
+- **A summary is plain text under five fixed headings**, requested with
+  `complete_text` under a system-role instruction, read tolerantly (a JSON
+  envelope, an unterminated one, a reply without headings and a reply the
+  output cap cut are all kept) and clamped section by section at line
+  boundaries. The single JSON `summary` string and its 1,024-character ceiling
+  are gone.
+- **Exact values are carried by code.** Every tier records what it takes out
+  of the window — operator instructions, files touched, identifiers of
+  recognisable shape with their line, failed calls, the latest plan — in one
+  ledger message, rebuilt by code on every pass and never shown to the
+  summariser.
+- **Old tool outputs are masked by age** (`compaction_mask_keep_recent_results`,
+  `compaction_mask_min_tokens`), keeping the lines the output said only once
+  (`compaction_mask_distinct_lines`) and a readable pointer to the stored
+  original. The summariser is shown a masked output in full.
+- **Adjacent units are summarised as one span** up to
+  `compaction_summary_group_max_tokens`, whatever their size, and a span's
+  output budget is `compaction_summary_ratio` of it, clamped by
+  `compaction_summary_min_output_tokens` and `compaction_summary_max_output_tokens`
+  (now 2,048). The summariser's input is bounded
+  (`compaction_summariser_input_max_tokens`, and a quarter of the window) and
+  each call has a deadline (`compaction_summary_timeout_seconds`).
+- **`compaction_completed` reports every tier and the pass's `outcome`**, and
+  the whole prompt before and after; `compaction_fold_min_messages` is now 4.
+
+### Removed
+
+- `compaction_routine_min_clear_ratio` (replaced by `compaction_target_ratio`),
+  `compaction_summary_string_max_chars`, `compaction_summary_envelope_tokens`,
+  `compaction_summary_chars_per_word`, `compaction_summary_output_tokens_per_word`,
+  `compaction_summary_tokens_per_word`, `compaction_summary_min_words` and
+  `compaction_fold_summary_target_words`: they sized a JSON string in words.
+
+### Fixed
+
+- **A compaction the `pre_compact` hook refuses leaves the run running.** The
+  refusal returned from inside `COMPACTING`, and the run stayed in that state
+  for the rest of the turn. It now returns to `RUNNING` with the reason
+  `compaction_refused_by_hook`.
+- **The compaction gate sizes the whole prompt.** The trigger and the
+  emergency cliff are whole-prompt sizes, but the gate held the history's
+  estimate against them. With a large system prompt and tool surface — 56k of
+  a 256k window in the case that showed it — the history reached the trigger
+  only after the request had passed the provider's ceiling, so the fit clipped
+  the output cap turn after turn and compaction first ran on a refusal. The
+  gate now adds what the last request carried besides the history (its system
+  messages and tool definitions, calibrated); the figure rides the snapshot.
+- **A history made only of short rounds can be compacted.** Tier 2 skipped
+  every unit below `compaction_summary_min_unit_tokens`, and the fold takes only
+  summaries and operator turns, so a run that works in many rounds of one short
+  tool call each built a history no tier could reduce: every pass freed
+  nothing and the run failed on the retry budget. Adjacent small units of the
+  same provenance, with nothing between them, are now joined up to
+  `compaction_summary_group_max_tokens` (6,000; 0 disables it) and summarised
+  as one unit when the group clears the floor.
+- **A failed round never completes on an earlier run's answer.** Completing a
+  failed run "on its preserved answer" read every message not tagged as
+  seeded, so on a host that hands the engine a session's earlier turns
+  untagged, the previous run's reply counted: a run whose every request was
+  refused completed with nothing written and no error reported. The answer
+  must now have been written in the round that failed, the span after the
+  last message a caller put in.
+- **A refusal the adapter classified as final is neither retried nor wound
+  down.** The retry decision read only the `reason` of an attached
+  classification and ignored its `retryable` flag, although `ClassifiedLike`
+  carries both; the flag now decides when it is set. And a permanent
+  `LLMProviderError` no longer enters the wind-down: its one turn is a request
+  to the endpoint that has just refused the run, and it was refused the same
+  way. The fallback chain is still tried first.
+- **The wind-down notice names a deadline and a stalled model for what they
+  are.** A run stopped by its wall clock was told it had reached its budget,
+  and a run whose model kept returning reasoning with no answer and no tool
+  call was told the model endpoint had failed — which the model then passed on
+  to the operator as the reason. `soft_stop_notice_text_deadline` names the
+  time limit, and the new `model_no_progress` cause, entered by the
+  empty-round policy, carries `soft_stop_notice_text_model_no_progress`. Blank
+  texts fall back to the general notice.
+- **The wind-down notice does not outlive its run.** The "tools are withdrawn,
+  write your answer" message the loop writes into history when a run winds
+  down stayed there after the run ended. When the wind-down's own final turn
+  failed — a provider outage that caused the wind-down also killed the answer —
+  the notice was the last thing in the session, and the next turn obeyed it:
+  the model reported what it had not finished and called nothing, although
+  every tool was back. The notice is removed once the drive reaches a terminal
+  state and written back only for a resumed run that is still wound down.
+
 ## [2.0.0a21] - 2026-09-25
 
 ### Added

@@ -412,22 +412,48 @@ async def test_a_wind_down_that_produced_no_answer_does_not_complete() -> None:
 
 @pytest.mark.asyncio
 async def test_the_notification_lands_in_history_as_the_runtimes_own_words() -> None:
-    """Marked synthetic, so it cannot be mistaken for the model answering."""
+    """Marked synthetic, so it cannot be mistaken for the model answering — and gone once the run is over."""
     rc = LoopConstants(model_context_window=4_096, leader_tool_call_soft_cap=1)
     llm = _ScriptedLLM([{"tool": "Read", "args": {"x": "a"}}, {"text": "done"}])
+    engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
+    seen: list[list[Message]] = []
+
+    async for _ in engine.run(_user()):
+        seen.append(list(engine.history))
+
+    def notices(history: list[Message]) -> list[Message]:
+        return [
+            m
+            for m in history
+            if m.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
+            == _soft_stop.SYNTHETIC_RECOVERY_SOFT_STOP
+        ]
+
+    during = [n for h in seen for n in notices(h)]
+    assert during and all(n.role is MessageRole.user for n in during)
+    assert notices(engine.history) == []  # the run is over; the next one starts with its tools
+
+
+@pytest.mark.asyncio
+async def test_a_failed_wind_down_does_not_leave_its_notice_behind() -> None:
+    """The notice told the model its tools were gone. A later run on the same history has them
+    back, and must not read an instruction to give up that was written for the run that failed."""
+    rc = LoopConstants(
+        model_context_window=4_096,
+        leader_tool_call_soft_cap=1,
+        soft_stop_max_turns=1,
+    )
+    llm = _ScriptedLLM([{"tool": "Read", "args": {"x": "a"}}])
     engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
 
     async for _ in engine.run(_user()):
         pass
 
-    notices = [
-        m
+    assert engine.state is LoopState.FAILED
+    assert not any(
+        m.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY) == _soft_stop.SYNTHETIC_RECOVERY_SOFT_STOP
         for m in engine.history
-        if m.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
-        == _soft_stop.SYNTHETIC_RECOVERY_SOFT_STOP
-    ]
-    assert len(notices) == 1
-    assert notices[0].role is MessageRole.user
+    )
 
 
 @pytest.mark.asyncio
@@ -442,9 +468,10 @@ async def test_the_notification_is_bilingual_and_names_the_bound_that_was_hit() 
     async for _ in engine.run(_user()):
         pass
 
+    # The notice is gone from the finished run's history; the model read it in its last request.
     notice = next(
         m
-        for m in engine.history
+        for m in llm.calls[-1].messages
         if m.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
         == _soft_stop.SYNTHETIC_RECOVERY_SOFT_STOP
     )
@@ -825,6 +852,19 @@ def test_the_notice_names_the_cause_it_was_entered_for() -> None:
     assert "not a budget limit" in provider.lower()
     assert "model endpoint failed" in provider
 
+    # A model that kept reasoning without answering is not an endpoint outage.
+    stalled = _soft_stop.notification_text(
+        engine, cause_name=_soft_stop.CAUSE_MODEL_NO_PROGRESS
+    )
+    assert "model endpoint failed" not in stalled
+    assert "reached its budget" not in stalled
+    assert "failure of the model's output" in stalled
+
+    # The wall clock is named as the wall clock.
+    deadline = _soft_stop.notification_text(engine, cause_name=_soft_stop.CAUSE_DEADLINE)
+    assert "time limit" in deadline
+    assert "reached its budget" not in deadline
+
     # The bounds that really are budgets keep the wording they had.
     for cause in (
         _soft_stop.CAUSE_TOOL_CALL_BUDGET,
@@ -999,6 +1039,41 @@ async def test_a_provider_failure_takes_the_wind_down() -> None:
     assert causes == {_soft_stop.CAUSE_PROVIDER_ERROR}
     assert engine.state is LoopState.COMPLETED
     assert _final_stop(events).payload["has_final_answer"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_refusal_after_work_is_not_wound_down() -> None:
+    """The wind-down's turn goes to the endpoint that has just refused the run for good.
+
+    It carries the same history and one more message, so it is refused the same
+    way: the run fails a turn later, and a host that reads the notice's cause
+    reports a wind-down where the provider had refused the request. A refusal
+    the adapter classified as final ends the run on the provider's own words.
+    """
+
+    class _Verdict:
+        reason = "format_error"
+        retryable = False
+
+    refusal = LLMProviderError("HTTP 400: this client version is no longer supported")
+    object.__setattr__(refusal, "classified", _Verdict())
+    rc = LoopConstants(model_context_window=4_096)
+    llm = _FailsOnLLM(
+        [{"tool": "Read", "args": {"x": "a"}}, {"text": "what I found so far"}],
+        refusal,
+        fail_on={2, 3, 4},
+    )
+    engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
+
+    events = [evt async for evt in engine.run(_user())]
+
+    reasons = [e.payload.get("reason") for e in events if e.type is EventType.STATE_CHANGED]
+    assert "soft_stop_notified" not in reasons
+    assert "transient_llm_error_retry" not in reasons
+    assert len(llm.calls) == 2
+    assert engine.state is LoopState.FAILED
+    errors = [e.payload for e in events if e.type is EventType.ERROR]
+    assert errors and "no longer supported" in str(errors[-1].get("message"))
 
 
 @pytest.mark.asyncio
