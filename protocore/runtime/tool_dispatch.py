@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import difflib
 import hashlib
 import json
 import re
@@ -81,12 +82,21 @@ from protocore.contracts.run_state import (
     ToolStreak,
 )
 from protocore.contracts.tool_registry import (
+    ADVERTISED_TOOLS_METADATA_KEY,
+    TOOL_ALLOWLIST_METADATA_KEY,
     TOOL_VISIBILITY_POLICY_METADATA_KEY,
     IToolRegistry,
     ToolVisibilityPolicy,
+    policy_admits,
 )
 from protocore.contracts.tool_roles import EMPTY_TOOL_ROLE_MAP, ToolRole, ToolRoleMap
-from protocore.contracts.tools import ToolContext, ToolPolicyDenied, copy_metadata
+from protocore.contracts.tools import (
+    Tool,
+    ToolContext,
+    ToolPolicyDenied,
+    copy_metadata,
+    read_metadata,
+)
 from protocore.contracts.types import (
     TOOL_RESULT_CONSECUTIVE_CAP_ELIGIBLE_METADATA_KEY,
     TOOL_RESULT_COUNT_AS_ERROR_METADATA_KEY,
@@ -106,6 +116,7 @@ from protocore.runtime.tool_preconditions import (
     check_preconditions,
     record_satisfaction,
 )
+from protocore.runtime.tool_retrieval import tool_line
 from protocore.tools.ask_user import AskUserPauseRequested
 
 _logger = get_logger(__name__)
@@ -747,6 +758,11 @@ STRUCTURED_ERROR_REASON_KEY: str = "reason"
 #: uses ``LoopConstants.tool_cancel_drain_seconds``; this mirrors its default
 #: so behaviour is identical when the RC is unreachable.
 _TOOL_CANCEL_DRAIN_FALLBACK_SECONDS: Final[float] = 2.0
+
+# How many near names an unknown-tool error offers. Three is enough to contain
+# the right one when a case or a word was wrong, and few enough that the model
+# is not handed a menu to pick a plausible stranger from.
+_UNKNOWN_TOOL_SUGGESTIONS: Final[int] = 3
 
 
 def _dispatch_replay_metadata(
@@ -1539,6 +1555,30 @@ class ToolDispatcher:
             )
         return produced[0]
 
+    def _nearest_admitted_names(
+        self,
+        name: str,
+        policy: ToolVisibilityPolicy | None,
+        allowlist: frozenset[str] | None = None,
+    ) -> list[str]:
+        """Up to three registered names close to ``name`` that the policy admits.
+
+        A model that misremembers a name is usually one case change or one
+        word away — ``Mcp_github_x`` for ``Mcp_Github_x`` — and without the
+        right spelling in front of it, it tends to keep guessing. Only admitted
+        names are offered, so a blocked tool is never revealed by being near.
+        """
+        admitted = {
+            tool.name.casefold(): tool.name
+            for tool in self._registry.list_all()
+            if policy_admits(policy, tool.name)
+            and (allowlist is None or tool.name in allowlist)
+        }
+        close = difflib.get_close_matches(
+            name.casefold(), list(admitted), n=_UNKNOWN_TOOL_SUGGESTIONS, cutoff=0.6
+        )
+        return [admitted[candidate] for candidate in close]
+
     async def dispatch(
         self,
         *,
@@ -1592,11 +1632,17 @@ class ToolDispatcher:
         """
         metadata = copy_metadata(ctx)
         metadata.setdefault("tool_call_id", tool_call.id)
-        # tools-initiative A2: expose the live per-run visibility policy to
-        # policy-aware tools (ToolSearch) so discovery honours the SAME
-        # visible/blocked contract the permission gate enforces below. A live
-        # model instance, not a serialised copy.
-        metadata.setdefault(TOOL_VISIBILITY_POLICY_METADATA_KEY, visibility_policy)
+        # The live policy and the child's declared tool set, for policy-aware
+        # tools (ToolSearch), so discovery honours the SAME contract the
+        # permission gate enforces below. Assigned, never set-if-absent: a
+        # value already in the bag is a host's or a stale one, and a search
+        # that trusted it could report as loaded a tool the gate then refuses.
+        metadata[TOOL_VISIBILITY_POLICY_METADATA_KEY] = visibility_policy
+        allowlist = _declared_allowlist(subagent_whitelist)
+        if allowlist is None:
+            metadata.pop(TOOL_ALLOWLIST_METADATA_KEY, None)
+        else:
+            metadata[TOOL_ALLOWLIST_METADATA_KEY] = allowlist
         ctx = ctx.model_copy(update={"metadata": metadata})
 
         # ── Step 1: registry lookup ────────────────────────────────
@@ -1616,6 +1662,11 @@ class ToolDispatcher:
                 )
             else:
                 msg = f"unknown tool: {tool_call.name!r}"
+                nearest = self._nearest_admitted_names(
+                    tool_call.name, visibility_policy, allowlist
+                )
+                if nearest:
+                    msg += f". Did you mean: {', '.join(nearest)}?"
             final_kind, final_msg = self._apply_consecutive_error_cap(
                 ctx, tool_call.name, DispatchErrorKind.unknown_tool, msg
             )
@@ -1641,6 +1692,11 @@ class ToolDispatcher:
             }
         )
 
+        # A call of a tool the request did not advertise was written without
+        # its schema; when such a call fails on its arguments, the answer
+        # carries the tool's line so the retry is right the first time.
+        unseen_signature = _unseen_tool_signature(ctx, tool, visibility_policy, allowlist)
+
         # ── Step 2: schema validation (input dict shape) ───────────
         # Core ABC accepts dict; tool-specific Pydantic input_model
         # validation lives in the host adapter. We
@@ -1659,7 +1715,7 @@ class ToolDispatcher:
                 "tool arguments nest deeper than "
                 f"{depth_ceiling} levels — re-issue the call with a "
                 "flatter payload"
-            )
+            ) + unseen_signature
             final_kind, final_msg = self._apply_consecutive_error_cap(
                 ctx, tool_call.name, DispatchErrorKind.validation, msg
             )
@@ -1677,7 +1733,7 @@ class ToolDispatcher:
         try:
             arguments_json = json.dumps(tool_call.arguments, ensure_ascii=False)
         except (TypeError, ValueError) as exc:
-            msg = f"tool arguments not JSON-serialisable: {exc}"
+            msg = f"tool arguments not JSON-serialisable: {exc}" + unseen_signature
             final_kind, final_msg = self._apply_consecutive_error_cap(
                 ctx, tool_call.name, DispatchErrorKind.validation, msg
             )
@@ -1703,7 +1759,9 @@ class ToolDispatcher:
             arguments=tool_call.arguments,
             ctx=ctx,
             visibility_policy=visibility_policy,
-            subagent_whitelist=subagent_whitelist,
+            # Frozen once above: an iterator handed in here would otherwise
+            # reach the gate already spent, which reads as no declaration.
+            subagent_whitelist=allowlist,
             child_run=child_run,
             hook_manager=self._hooks,
             skip_pre_tool_approval=preapproved_tool_call_id == tool_call.id,
@@ -1942,6 +2000,8 @@ class ToolDispatcher:
         except Exception as exc:
             duration_ms = int((loop.time() - started_at) * 1000)
             msg = f"tool {tool_call.name!r} execution failed: {exc}"
+            if isinstance(exc, _ARGUMENT_ERRORS):
+                msg += unseen_signature
             _logger.warning(
                 "tool dispatch raised for tool=%s call_id=%s",
                 tool_call.name,
@@ -2008,6 +2068,8 @@ class ToolDispatcher:
         # tool produced.
         canonical_content = tool_result.content
         content = tool_result.model_content
+        # What the parallel path's replay rebuilds a failed result's text from.
+        replay_message = tool_result.content
         ui_payload = tool_result.ui_payload
         canonical_ref = tool_result.canonical_ref
         result_path = tool_result.path
@@ -2101,6 +2163,12 @@ class ToolDispatcher:
                 TOOL_RESULT_CONSECUTIVE_CAP_ELIGIBLE_METADATA_KEY,
                 default=True,
             )
+            if count_as_error and unseen_signature:
+                # A tool that checks its own arguments reports a bad one as an
+                # error result, not an exception, so every counted failure of an
+                # unseen tool gets the line; a benign exit status does not.
+                content += unseen_signature
+                replay_message += unseen_signature
             if count_as_error:
                 await self._record_tool_error(ctx)
             if cap_eligible:
@@ -2196,7 +2264,7 @@ class ToolDispatcher:
                 **result_metadata,
                 **_dispatch_replay_metadata(
                     DispatchErrorKind.execution,
-                    tool_result.content,
+                    replay_message,
                     replay_extra,
                 ),
             }
@@ -2281,6 +2349,46 @@ class ToolDispatcher:
                 "content_blocks": [{"type": "text", "text": message}],
             },
         )
+
+
+# The exceptions a tool raises when the arguments it was called with do not
+# fit it: a pydantic model's ValidationError (a ValueError), a missing or
+# unexpected keyword (TypeError), a required key read straight off the dict.
+_ARGUMENT_ERRORS: Final[tuple[type[Exception], ...]] = (TypeError, ValueError, KeyError)
+
+
+def _declared_allowlist(subagent_whitelist: Iterable[str] | None) -> frozenset[str] | None:
+    """A child's declared tool set as the gate reads it: ``None`` or empty admits all."""
+    if subagent_whitelist is None:
+        return None
+    allow = frozenset(subagent_whitelist)
+    return allow or None
+
+
+def _unseen_tool_signature(
+    ctx: ToolContext,
+    tool: Tool,
+    policy: ToolVisibilityPolicy,
+    allowlist: frozenset[str] | None,
+) -> str:
+    """The tool's line, to append to a failure, when the model never saw its schema.
+
+    Empty when the loop did not say what it advertised (a dispatch outside a
+    run) or when the tool was on the list, where the schema is already in
+    front of the model and repeating it is noise. Empty, too, for a tool the
+    policy or the child's declared set refuses: the argument checks run before
+    the gate, so a blocked tool called with bad arguments was answered with
+    its parameters and told it was "loaded now", which it never is.
+    """
+    advertised = read_metadata(ctx, ADVERTISED_TOOLS_METADATA_KEY)
+    if not isinstance(advertised, frozenset | set | tuple | list) or tool.name in advertised:
+        return ""
+    if not policy_admits(policy, tool.name) or (allowlist is not None and tool.name not in allowlist):
+        return ""
+    return (
+        "\nThis tool was not in your tool list, so it was called without its "
+        f"parameters; it is loaded now. It takes: {tool_line(tool.definition)}"
+    )
 
 
 def consume_transport_down_injection_signal(

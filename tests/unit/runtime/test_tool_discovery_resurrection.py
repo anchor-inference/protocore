@@ -8,22 +8,21 @@ Covers the three core seams the initiative added:
 2. ``ToolRegistry.search`` honours the per-run :class:`ToolVisibilityPolicy`
    (blocked tools never leak through discovery) — and the dispatcher injects
    that policy into ``ToolContext.metadata`` for policy-aware tools.
-3. RU-capable matching — per-tool ``search_hint`` (EN+RU) joins the BM25
+3. RU-capable matching — per-tool ``search_hint`` (EN+RU) joins the
    discovery corpus, and a normalized substring/prefix fallback catches
-   inflected forms BM25 scores 0.0.
+   what the main ranking scores nothing for.
 """
 from __future__ import annotations
 
 from protocore.contracts.tool_registry import (
+    TOOL_ALLOWLIST_METADATA_KEY,
     TOOL_VISIBILITY_POLICY_METADATA_KEY,
     ToolVisibilityPolicy,
     policy_admits,
 )
-from protocore.runtime.tool_registry import ToolRegistry
-from protocore.runtime.tool_retrieval import (
-    build_candidate,
-    normalized_fallback_match,
-)
+from protocore.contracts.tool_retrieval import ToolDocument
+from protocore.runtime.tool_registry import ToolRegistry, tool_document
+from protocore.runtime.tool_retrieval import normalized_fallback_match
 from protocore.tools.memory import (
     MEMORY_TOOL_NAMES,
     RECALL_TOOL_NAME,
@@ -270,41 +269,55 @@ def test_ru_query_blocked_memory_stays_hidden() -> None:
 
 
 def test_inflected_ru_query_matches_via_fallback() -> None:
-    """BM25 scores 0.0 for an inflected form; the prefix fallback catches it."""
-    cand = build_candidate(
+    """A form no stem matches is still caught by the prefix fallback.
+
+    The stemmer maps "памяти" and "память" to different stems (the soft sign
+    and the ending both go), so only the fallback's shared prefix links them.
+    """
+    remember = ToolDocument(
         "Remember",
         "Save a durable fact to long-term memory",
-        hint="память запомнить сохранить",
+        search_hint="память запомнить сохранить",
     )
-    other = build_candidate("Bash", "Run a shell command", hint="")
-    hits = normalized_fallback_match("памяти", [cand, other], top_k=5)
-    assert [c.name for c in hits] == ["Remember"]
+    other = ToolDocument("Bash", "Run a shell command")
+    assert normalized_fallback_match("памяти", [remember, other], limit=5) == ["Remember"]
 
 
 def test_fallback_partial_tool_name_match() -> None:
-    cand = build_candidate("List", "List workspace files", hint="")
-    hits = normalized_fallback_match("workspace", [cand], top_k=5)
-    assert [c.name for c in hits] == ["List"]
+    listing = ToolDocument("List", "List workspace files")
+    assert normalized_fallback_match("workspace", [listing], limit=5) == ["List"]
 
 
 def test_fallback_no_overlap_returns_empty() -> None:
-    cand = build_candidate("Bash", "Run a shell command", hint="")
-    assert normalized_fallback_match("совершенно другое", [cand], top_k=5) == []
+    bash = ToolDocument("Bash", "Run a shell command")
+    assert normalized_fallback_match("совершенно другое", [bash], limit=5) == []
 
 
 def test_fallback_deterministic_order() -> None:
-    cands = [
-        build_candidate("Bravo", "memory helper", hint=""),
-        build_candidate("Alpha", "memory helper", hint=""),
+    documents = [
+        ToolDocument("Bravo", "memory helper"),
+        ToolDocument("Alpha", "memory helper"),
     ]
-    hits = normalized_fallback_match("memory", cands, top_k=5)
-    assert [c.name for c in hits] == ["Alpha", "Bravo"]
+    assert normalized_fallback_match("memory", documents, limit=5) == ["Alpha", "Bravo"]
+
+
+def test_fallback_ignores_single_letter_words() -> None:
+    """A one-letter word inside a query token is not a match.
+
+    The fallback once counted any document word contained in a query token,
+    so the article "a" in an English description matched every query token
+    with an "a" in it, and nearly every tool came back.
+    """
+    documents = [ToolDocument("Bash", "Run a shell command"), ToolDocument("Grep", "Search text")]
+    assert normalized_fallback_match("database", documents, limit=5) == []
 
 
 def test_hint_never_reaches_description() -> None:
-    cand = build_candidate("X", "desc", hint="секретный hint")
-    assert "hint" not in cand.description
-    assert "секретный" in cand.text
+    tool = MockTool(tool_name="X", description="desc", search_hint="секретный hint")
+    document = tool_document(tool)
+    assert document.description == "desc"
+    assert document.search_hint == "секретный hint"
+    assert "секретный" not in tool.definition.description
 
 
 # ----------------------------------------------------------------------
@@ -344,3 +357,116 @@ def test_pinned_blocked_stays_blocked() -> None:
         "tenant-1", policy, query="common keyword", top_k=5
     )
     assert "ZZPinned" not in [d.name for d in defs]
+
+
+# ----------------------------------------------------------------------
+# 4. what the dispatcher stamps, and the line a blind call is answered with
+# ----------------------------------------------------------------------
+
+
+def _dispatch_once(
+    tool: MockTool,
+    *,
+    policy: ToolVisibilityPolicy,
+    arguments: dict[str, object],
+    metadata: dict[str, object] | None = None,
+    subagent_whitelist: frozenset[str] | None = None,
+) -> tuple[dict[str, object], str]:
+    import asyncio
+
+    from protocore.contracts.tools import ToolContext
+    from protocore.contracts.types import ToolCall
+    from protocore.runtime.tool_dispatch import DispatchOutcome, ToolDispatcher
+    from protocore.runtime.tool_permission import ToolPermissionGate
+
+    seen: dict[str, object] = {}
+    real_invoke = tool.invoke
+
+    async def _spy_invoke(context, arguments):  # type: ignore[no-untyped-def]
+        seen.update(context.metadata or {})
+        return await real_invoke(context, arguments)
+
+    tool.invoke = _spy_invoke  # type: ignore[method-assign]
+    dispatcher = ToolDispatcher(
+        registry=_registry_with(tool),
+        permission_gate=ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES),
+    )
+    ctx = ToolContext(run_id="run-1", tenant_id="tenant-1", session_id="sess-1", metadata=metadata or {})
+    content = ""
+
+    async def _run() -> None:
+        nonlocal content
+        async for item in dispatcher.dispatch(
+            tool_call=ToolCall(id="tc-1", name=tool.name, arguments=arguments),
+            ctx=ctx,
+            visibility_policy=policy,
+            timeout_seconds=5,
+            subagent_whitelist=subagent_whitelist,
+        ):
+            if isinstance(item, DispatchOutcome):
+                content = item.content
+
+    asyncio.run(_run())
+    return seen, content
+
+
+def test_the_dispatcher_stamps_its_own_policy_over_whatever_the_bag_carried() -> None:
+    """Stamped only when absent, a policy already in the bag — a stale one, or
+    a host key of the same bare name — reached ToolSearch instead of the one
+    the gate enforced."""
+    stale = ToolVisibilityPolicy()
+    live = ToolVisibilityPolicy(blocked={"SomethingElse"})
+    seen, _ = _dispatch_once(
+        MockTool(tool_name="Probe", description="probe"),
+        policy=live,
+        arguments={},
+        metadata={TOOL_VISIBILITY_POLICY_METADATA_KEY: stale, TOOL_ALLOWLIST_METADATA_KEY: frozenset({"X"})},
+        subagent_whitelist=frozenset({"Probe"}),
+    )
+    assert seen[TOOL_VISIBILITY_POLICY_METADATA_KEY] is live
+    assert seen[TOOL_ALLOWLIST_METADATA_KEY] == frozenset({"Probe"})
+    seen, _ = _dispatch_once(
+        MockTool(tool_name="Probe", description="probe"),
+        policy=live,
+        arguments={},
+        metadata={TOOL_ALLOWLIST_METADATA_KEY: frozenset({"X"})},
+    )
+    assert TOOL_ALLOWLIST_METADATA_KEY not in seen
+
+
+def _too_deep() -> dict[str, object]:
+    arguments: dict[str, object] = {}
+    for _ in range(250):
+        arguments = {"x": arguments}
+    return arguments
+
+
+def test_a_blind_call_of_a_refused_tool_is_never_given_its_line() -> None:
+    """The argument checks run before the gate, so a blocked tool called
+    blind with bad arguments was answered with its parameters and told it was
+    loaded, which a refused tool never is."""
+    from protocore.contracts.tool_registry import ADVERTISED_TOOLS_METADATA_KEY
+
+    blind = {ADVERTISED_TOOLS_METADATA_KEY: frozenset({"Other"})}
+    _, admitted = _dispatch_once(
+        MockTool(tool_name="Probe", description="probe things"),
+        policy=ToolVisibilityPolicy(),
+        arguments=_too_deep(),
+        metadata=dict(blind),
+    )
+    assert "It takes: Probe" in admitted
+    _, blocked = _dispatch_once(
+        MockTool(tool_name="Probe", description="probe things"),
+        policy=ToolVisibilityPolicy(blocked={"Probe"}),
+        arguments=_too_deep(),
+        metadata=dict(blind),
+    )
+    assert "It takes" not in blocked and "loaded" not in blocked
+    _, outside = _dispatch_once(
+        MockTool(tool_name="Probe", description="probe things"),
+        policy=ToolVisibilityPolicy(),
+        arguments=_too_deep(),
+        metadata=dict(blind),
+        subagent_whitelist=frozenset({"Other"}),
+    )
+    assert "It takes" not in outside

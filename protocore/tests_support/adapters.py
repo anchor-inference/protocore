@@ -81,9 +81,12 @@ from protocore.contracts.skills import (
 from protocore.contracts.todo import ITodoStorage
 from protocore.contracts.tool_registry import (
     IToolRegistry,
+    ToolGroup,
     ToolVisibilityPolicy,
+    make_tool_group,
     policy_admits,
 )
+from protocore.contracts.tool_retrieval import RetrievalSettings
 from protocore.contracts.tools import Tool
 from protocore.contracts.types import (
     BlobMetadata,
@@ -2103,9 +2106,35 @@ class InMemoryToolRegistry(IToolRegistry):
 
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
+        self._groups: dict[str, ToolGroup] = {}
 
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
+
+    def declare_group(
+        self,
+        name: str,
+        description: str,
+        *,
+        dynamic: bool = False,
+        prefix: str | None = None,
+        load: str = "auto",
+        instructions: str = "",
+    ) -> None:
+        self._groups[name] = make_tool_group(
+            name,
+            description,
+            dynamic=dynamic,
+            prefix=prefix,
+            load=load,
+            instructions=instructions,
+        )
+
+    def undeclare_group(self, name: str) -> None:
+        self._groups.pop(name, None)
+
+    def tool_groups(self) -> Sequence[ToolGroup]:
+        return sorted(self._groups.values(), key=lambda group: group.name)
 
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
@@ -2141,8 +2170,9 @@ class InMemoryToolRegistry(IToolRegistry):
         tenant_id: str = "",
         whitelist: Sequence[str] | None = None,
         policy: ToolVisibilityPolicy | None = None,
+        retrieval: RetrievalSettings | None = None,
     ) -> Sequence[Tool]:
-        del tenant_id
+        del tenant_id, retrieval
         pool: list[Tool] = list(self._tools.values())
         if whitelist is not None:
             allow = frozenset(whitelist)
@@ -2167,13 +2197,24 @@ class InMemoryToolRegistry(IToolRegistry):
         *,
         query: str = "",
         top_k: int | None = None,
+        retrieval: RetrievalSettings | None = None,
     ) -> Sequence[ToolDefinition]:
-        del query
+        del query, retrieval
         tools = self.list_for_tenant(tenant_id, policy)
-        defs = [t.definition for t in tools]
-        if top_k is not None:
-            defs = defs[:top_k]
-        return defs
+        if top_k is None:
+            return [t.definition for t in tools]
+        # The clip keeps what is pinned and ``top_k`` others in registration
+        # order: pinned tools do not count against it, as in the real registry.
+        pinned = set(policy.pinned) | set(policy.forced_pinned)
+        kept: list[ToolDefinition] = []
+        others = 0
+        for tool in tools:
+            if tool.name in pinned or bool(getattr(tool, "always_load", False)):
+                kept.append(tool.definition)
+            elif others < top_k:
+                kept.append(tool.definition)
+                others += 1
+        return kept
 
 
 # ---------------------------------------------------------------------------

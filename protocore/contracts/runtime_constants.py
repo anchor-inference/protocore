@@ -466,9 +466,168 @@ class LoopConstants(BaseModel):
 
  # ----- Tool retrieval / surface -----
     tool_retrieval_top_k: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Per-message clip of the advertised tool surface: how many tools "
+            "retrieval picks for the latest user message, beyond the pinned, "
+            "forced and always-load ones, which never count against it. 0 "
+            "turns the clip off, and off is the recommended setting: the clip "
+            "re-ranks the surface on every user message, so the tool list and "
+            "the provider's prompt cache change with it, and a message in one "
+            "language finds too little among descriptions written in another. "
+            "Keep a large catalogue off the surface with tool_deferral_mode "
+            "and ToolSearch instead."
+        ),
+    )
+    tool_deferral_mode: Literal["off", "auto"] = Field(
+        default="auto",
+        description=(
+            "Whether declared tool groups may be held back from the advertised "
+            "surface and named in the system prompt instead, to be loaded "
+            "with ToolSearch. 'auto' holds back every dynamic group, then "
+            "other groups, largest first, while the surface is over "
+            "tool_definitions_ratio of the context window or over "
+            "max_advertised_tools; it does nothing when no group is declared, "
+            "when nothing is over, or when no ToolSearch-like tool (role "
+            "discovers_tools) is registered. 'off' always advertises the "
+            "whole surface."
+        ),
+    )
+    max_advertised_tools: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "The most tool definitions the provider accepts in one request, "
+            "or 0 for no limit. Some providers refuse a request above a fixed "
+            "count (128 and 350 are both seen in practice); over it, "
+            "tool_deferral_mode 'auto' holds back groups until the surface "
+            "plus pinned_tool_max_count loaded tools fits."
+        ),
+    )
+    tool_search_max_results: int = Field(
+        default=8,
+        gt=0,
+        description="Most tools one ToolSearch call lists, best match first.",
+    )
+    tool_search_autoload_count: int = Field(
+        default=3,
+        ge=0,
+        description=(
+            "How many of a ToolSearch query's best matches are loaded at once, "
+            "without a separate select: call. A model that searched finds the "
+            "tool it needs among the first three nearly every time."
+        ),
+    )
+    tool_catalogue_max_listed_names: int = Field(
         default=12,
         gt=0,
-        description="BM25 tool retrieval top-K (per-call surface).",
+        description=(
+            "Above this many held-back tools, a group that declares a name "
+            "prefix is listed in the system prompt's tool catalogue by that "
+            "prefix and a count instead of by every name."
+        ),
+    )
+    max_tool_calls_per_turn: int = Field(
+        default=64,
+        ge=0,
+        description=(
+            "Most tool calls dispatched from one model message; 0 for no "
+            "limit. Calls past it are answered with an error each, so every "
+            "call still has its result, and none of them runs. A model can "
+            "emit a runaway batch of identical calls — over a thousand in one "
+            "message has been seen — and each would otherwise run."
+        ),
+    )
+    tool_retrieval_name_weight: float = Field(
+        default=1.0,
+        ge=0.0,
+        description=(
+            "BM25F weight of a tool's name, split into its words, in tool "
+            "retrieval. The field weights were chosen together by "
+            "cross-validation over a labelled set of English and Russian "
+            "queries against a catalogue of about 700 tools; move one and "
+            "the others stop being the best fit."
+        ),
+    )
+    tool_retrieval_search_hint_weight: float = Field(
+        default=1.0,
+        ge=0.0,
+        description=(
+            "BM25F weight of a tool's search_hint in tool retrieval. 1.0 is "
+            "the best value with the query-expansion lexicon on; with the "
+            "lexicon off (tool_retrieval_lexicon_weight = 0) 2.0 does better, "
+            "because the hint is then the only Russian text a tool has. A "
+            "heavier hint with the lexicon on lets a host's hinted tools pull "
+            "Russian queries away from unhinted third-party tools."
+        ),
+    )
+    tool_retrieval_summary_weight: float = Field(
+        default=1.0,
+        ge=0.0,
+        description=(
+            "BM25F weight of the first sentence of a tool's description — "
+            "the sentence that says what the tool is for."
+        ),
+    )
+    tool_retrieval_description_weight: float = Field(
+        default=0.6,
+        ge=0.0,
+        description=(
+            "BM25F weight of the rest of a tool's description after the "
+            "first sentence. Lower than the summary: the tail is caveats and "
+            "usage notes, which mention other tools' subjects."
+        ),
+    )
+    tool_retrieval_parameters_weight: float = Field(
+        default=0.3,
+        ge=0.0,
+        description=(
+            "BM25F weight of a tool's parameter names and parameter "
+            "descriptions. Low because parameters such as path or query are "
+            "shared by many tools and say little about which one is meant."
+        ),
+    )
+    tool_retrieval_bm25_k1: float = Field(
+        default=1.5,
+        gt=0.0,
+        description=(
+            "BM25 term-frequency saturation in tool retrieval: how quickly "
+            "repeating a word in a tool's text stops adding to its score."
+        ),
+    )
+    tool_retrieval_bm25_b: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "BM25 length normalisation in tool retrieval, 0 (none) to 1 "
+            "(full). Kept low so a tool with a long, careful description is "
+            "not ranked below a terse one for the same words."
+        ),
+    )
+    tool_retrieval_lexicon_weight: float = Field(
+        default=0.5,
+        ge=0.0,
+        description=(
+            "Weight of the English terms a Russian query word is expanded to "
+            "through the tool registry's Russian-to-English lexicon, relative "
+            "to the query's own terms. 0 turns expansion off. Expansion is "
+            "what lets a Russian query reach a tool whose name and "
+            "description are English only; values from 0.3 to 1.0 rank "
+            "almost identically."
+        ),
+    )
+    tool_retrieval_fusion_rank_constant: int = Field(
+        default=60,
+        gt=0,
+        description=(
+            "The k of reciprocal rank fusion, used only when a host supplies "
+            "its own tool retriever to combine with the lexical ranking: a "
+            "tool at rank r in one ranking contributes 1 / (k + r). Larger "
+            "values flatten the difference between the top ranks. 60 is the "
+            "value the method was published with."
+        ),
     )
 
  # ----- Compaction ergonomics -----
@@ -1075,10 +1234,18 @@ class LoopConstants(BaseModel):
         description="Loaded skill bodies budget as fraction of context window.",
     )
     tool_definitions_ratio: float = Field(
-        default=0.05,
+        default=0.25,
         gt=0.0,
         le=1.0,
-        description="Tool definitions budget as fraction of context window.",
+        description=(
+            "Tool definitions budget as fraction of context window. Enforced "
+            "by tool_deferral_mode 'auto': a surface over it holds back "
+            "declared tool groups. A quarter, because advertising every tool "
+            "was measured to answer at least as well as searching for them "
+            "for as long as the definitions fit; the budget exists to stop "
+            "the definitions from crowding out the conversation, not to "
+            "keep the list short."
+        ),
     )
     user_context_ratio: float = Field(
         default=0.01,
@@ -1209,9 +1376,11 @@ class LoopConstants(BaseModel):
         default=15,
         gt=0,
         description=(
-            "Maximum number of pinned tools (always-include) carried into "
-            "the tool pool. Caps cache-prefix bloat from "
-            "ToolSearch-pinned tools."
+            "Most tools a run keeps loaded after discovering them (through "
+            "ToolSearch, or by calling a tool that was not advertised). Over "
+            "it, the least recently used are unloaded — only where the "
+            "prompt prefix is rebuilt anyway, at compaction and at the start "
+            "of a run, never between two requests of one run."
         ),
     )
     tool_surface_forced_pins: tuple[str, ...] = Field(

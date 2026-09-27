@@ -221,6 +221,35 @@ The literal in the "wrong" example is exactly what the model exists to
 eliminate: the bound lives on the `max_turns_per_run` field, not in the
 branch.
 
+## Knobs that are tuned together
+
+Most fields stand alone: one threshold, one effect. The tool-retrieval ranking
+fields do not. `tool_retrieval_name_weight`,
+`tool_retrieval_search_hint_weight`, `tool_retrieval_summary_weight`,
+`tool_retrieval_description_weight`, `tool_retrieval_parameters_weight`,
+`tool_retrieval_bm25_k1` and `tool_retrieval_bm25_b` were chosen as one set, by
+cross-validation over labelled English and Russian queries, and moving one
+changes what the others should be. `tool_retrieval_lexicon_weight` switches the
+Russian-to-English query expansion (0 turns it off); with it off, a hint weight
+of 2 is the better fit. `tool_retrieval_fusion_rank_constant` matters only when
+a host supplies its own ranker. The loop passes all of them to the registry as
+one `RetrievalSettings` value per call, and the registry keeps an index per
+distinct value, so a tenant with its own weights gets its own index rather than
+another tenant's. What the fields weigh is described in
+[`tools.md`](tools.md#tool-retrieval).
+
+The tool-deferral fields are a second such set. `tool_deferral_mode` decides
+whether declared tool groups may be held back at all; `tool_definitions_ratio`
+(default a quarter of the window, and now enforced) and `max_advertised_tools`
+(0 for no limit) are the two limits a surface is held to; `pinned_tool_max_count`
+caps the tools a run keeps loaded, and is also the headroom the count limit
+leaves for them. `tool_search_max_results` and `tool_search_autoload_count` shape
+a `ToolSearch` result, `tool_catalogue_max_listed_names` decides when a
+prefix-declared group is listed by its prefix, and `max_tool_calls_per_turn`
+bounds one model message's batch. `tool_retrieval_top_k` is `0` — the
+per-message clip is off, and turning it on is not recommended. See
+[`tools.md`](tools.md#holding-tool-groups-back).
+
 ## See also
 
 - [`architecture.md`](architecture.md) — the LoopConstants system in the

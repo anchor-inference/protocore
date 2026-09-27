@@ -23,8 +23,9 @@ import logging
 import time
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from protocore.contracts.background import (
@@ -78,7 +79,11 @@ from protocore.contracts.snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
     migrate_snapshot,
 )
-from protocore.contracts.tool_registry import IToolRegistry, ToolVisibilityPolicy
+from protocore.contracts.tool_registry import (
+    TOOL_GROUP_LOADS,
+    IToolRegistry,
+    ToolVisibilityPolicy,
+)
 from protocore.contracts.tool_roles import (
     EMPTY_TOOL_ROLE_MAP,
     ToolRoleMap,
@@ -109,6 +114,7 @@ from protocore.runtime.loop_state import (
     is_terminal,
 )
 from protocore.runtime.request_budget import ExactTokenCountCache
+from protocore.runtime.tool_deferral import ToolDeferral, tool_rules_mark
 from protocore.runtime.usage import TokenUsage
 
 _logger = logging.getLogger(__name__)
@@ -131,6 +137,9 @@ REASONING_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh
 _READER_TURN_INTERIOR_EVENT_TYPES = frozenset(
     {
         EventType.TOOL_SURFACE_ADVERTISED,
+        EventType.TOOL_DISCOVERED,
+        EventType.TOOL_UNADVERTISED_CALL,
+        EventType.TOOL_GROUP_LOADED,
         EventType.TOOL_USE_START,
         EventType.TOOL_USE_INPUT_DELTA,
         EventType.TOOL_USE_STOP,
@@ -161,7 +170,10 @@ _REQUIRED_CONTINUITY_FIELDS: tuple[str, ...] = (
     "session_grants",
     "profile_audit",
     "spans",
-    "context_manager_pinned_tools",
+    "discovered_tools",
+    "deferred_tool_groups",
+    "tool_group_rules_given",
+    "tool_group_rules_mark",
     "skill_catalog_block_sha256",
 )
 
@@ -176,7 +188,10 @@ class _RunContinuity:
     session_grants: list[Any]
     profile_audit: list[dict[str, Any]]
     spans: list[Any]
-    pinned_tools: list[str]
+    discovered_tools: list[Any]
+    deferred_tool_groups: tuple[str, ...] | None
+    tool_group_rules_given: tuple[str, ...]
+    tool_group_rules_mark: str
     skill_catalog_block_sha256: str | None
 
 
@@ -282,11 +297,24 @@ def _parse_run_continuity(snapshot: dict[str, Any]) -> _RunContinuity:
             for item in snapshot["spans"] or []
             if isinstance(item, dict)
         ],
-        pinned_tools=[
-            name
-            for name in snapshot["context_manager_pinned_tools"] or []
-            if isinstance(name, str)
+        discovered_tools=[
+            row
+            for row in snapshot["discovered_tools"] or []
+            if isinstance(row, dict | str)
         ],
+        deferred_tool_groups=(
+            tuple(name for name in groups if isinstance(name, str))
+            if isinstance(groups := snapshot["deferred_tool_groups"], list)
+            else None
+        ),
+        tool_group_rules_given=tuple(
+            name
+            for name in snapshot["tool_group_rules_given"] or []
+            if isinstance(name, str)
+        ),
+        tool_group_rules_mark=(
+            mark if isinstance(mark := snapshot["tool_group_rules_mark"], str) else ""
+        ),
         skill_catalog_block_sha256=(
             digest if isinstance(digest := snapshot["skill_catalog_block_sha256"], str) else None
         ),
@@ -543,6 +571,41 @@ class QueryEngineConfig:
     would hand the model a callable schema that deterministically fails.
     """
 
+    discovered_tools: tuple[str, ...] = ()
+    """Tools an earlier run of the same session loaded, to load again at the start.
+
+    A run begins with nothing discovered, so without this every run of a
+    session would pay again for the searches the last one made, and the loaded
+    tail of its tool list — which a prefix cache keys on — would come back in
+    whatever order the new run happened to search in. A host that keeps the
+    last run's ``discovered_tools`` (it is in the snapshot and in every
+    ``tool_surface_advertised`` event) hands it back here. Oldest first: over
+    ``pinned_tool_max_count``, the first names are the ones left out.
+    """
+
+    loaded_tool_groups: tuple[str, ...] = ()
+    """Groups to load whole at the start, as ``ToolSearch(group=...)`` loads one.
+
+    A group seeded here is one entry under ``pinned_tool_max_count``, as a
+    group the model loaded is, where the same tools passed one by one in
+    :attr:`discovered_tools` would be as many entries and a large group would
+    push the rest of the seed out. Only the group's tools the run may call are
+    loaded; a name no group has, or a group none of whose tools is admitted,
+    loads nothing. Loaded after :attr:`discovered_tools`, so a group is the
+    newer entry. The groups a run loaded whole are
+    ``ContextManager.loaded_tool_group_names()``.
+    """
+
+    tool_group_loads: Mapping[str, str] = field(default_factory=dict)
+    """Load modes for this run, by group name, over the registry's declarations.
+
+    Each value is ``eager``, ``auto`` or ``lazy`` (see
+    :class:`~protocore.contracts.tool_registry.ToolGroup`). The declaration is
+    the host's default for a group; this is where an operator's setting, or
+    one session's exception to it, reaches a run without redeclaring a group
+    that every other session shares. A name no group has is ignored.
+    """
+
     tool_preconditions: tuple[ToolPrecondition, ...] = field(default_factory=tuple)
     """Ordered tools this run MUST call before the agent is free to answer.
 
@@ -645,6 +708,19 @@ class QueryEngineConfig:
                 "reasoning_effort must be one of "
                 f"{REASONING_EFFORTS!r}, got {self.reasoning_effort!r}"
             )
+        for group, load in self.tool_group_loads.items():
+            if load not in TOOL_GROUP_LOADS:
+                raise ValueError(
+                    f"tool_group_loads[{group!r}] must be one of {TOOL_GROUP_LOADS!r}, "
+                    f"got {load!r}"
+                )
+        # A list is accepted as the documented sequence and kept as a tuple:
+        # the config is frozen, and a list the host still holds could change
+        # under it.
+        object.__setattr__(self, "loaded_tool_groups", tuple(self.loaded_tool_groups))
+        # A copy nobody else holds: the host's dict could otherwise change
+        # under a run whose deferral decision is keyed on it.
+        object.__setattr__(self, "tool_group_loads", MappingProxyType(dict(self.tool_group_loads)))
         max_entries = self.rc.run_tool_precondition_max_entries
         if len(self.tool_preconditions) > max_entries:
             raise ValueError(
@@ -720,7 +796,7 @@ class QueryEngine:
             # ── The continuity that makes the next turn a continuation ──────
             # The conversation and everything derived from it. ``context_manager``
             # is here for two things it holds: the compaction machinery and the
-            # discovery pin LRU, which is the agent keeping the tools it went
+            # discovered tools, which are the agent keeping the tools it went
             # looking for. Both are bounded, so neither grows without limit.
             "history",
             # What the store already holds. A turn boundary is not a reason to
@@ -753,6 +829,32 @@ class QueryEngine:
             "_pinned_tool_result_ids",
             "_trimmed_tool_result_ids",
             "_skill_catalog_block",
+            # The held-back tool groups and their catalogue sit beside the
+            # skill catalog at the head of the cached prompt, for the same
+            # reason: the next turn is the same conversation, and a catalogue
+            # remade at every turn boundary would move under the cache.
+            "_tool_deferral",
+            "_tool_deferral_key",
+            # A resume's record of what was held back, waiting for the first
+            # surface build to replay it. A resumed run is re-armed before its
+            # first turn, so dropping it here would drop it every time.
+            "_restored_deferred_groups",
+            # The rules the run was given stay given: the result or catalogue
+            # that gave them is still in the conversation.
+            "_tool_group_rules_given",
+            # A compaction's request for the rules to be written into the
+            # catalogue, owed to the next request whichever turn it falls in.
+            "_catalogue_takes_loaded_rules",
+            # Named in the catalogue and in every rules heading given so far;
+            # a new one at a turn boundary would disown the rules already in
+            # the conversation.
+            "_tool_rules_mark",
+            # Emptied once announced; reset, the fresh engine would announce
+            # the seed again at every turn.
+            "_seeded_tool_names",
+            # Emptied once loaded; reset, a group the model has since let go
+            # would be loaded again at every turn.
+            "_pending_seed_tool_groups",
             # The digest the run's catalog block had before it was picked up,
             # kept until the new process rebuilds one and can be compared
             # against it. Cleared by that comparison, not by a turn boundary.
@@ -1437,8 +1539,10 @@ class QueryEngine:
         # the tree's budgets, the cancel event, the satisfied preconditions, and
         # whatever slots the host wires for its own tools. A run composed by a
         # host is handed the object its tree shares; a run built without one
-        # gets this empty state, which bounds only itself.
-        self.run_state: RunScopedState = RunScopedState()
+        # gets this empty state, which bounds only itself — and carries the
+        # run's own constants, so a core tool reading a tunable off it reads
+        # this run's value rather than a module fallback.
+        self.run_state: RunScopedState = RunScopedState(rc=config.rc)
         self.run_state.tool_shared_state_lock = self._tool_shared_state_lock
 
         # Skill catalog block (the enabled account catalog + project pins
@@ -1473,6 +1577,50 @@ class QueryEngine:
             prompts=self.prompt_provider,
             tool_roles=config.tool_roles,
         )
+        # A new run is one of the places the prompt prefix starts over, so it
+        # is where a seed longer than the cap is cut down to it.
+        if config.discovered_tools:
+            self.context_manager.restore_discovered_tools(list(config.discovered_tools))
+            self.context_manager.evict_discovered_tools()
+        # What the seed loaded, announced as ``tool_group_loaded`` beside the
+        # first advertisement and then emptied; a resume, which is not a
+        # seed, empties it at once.
+        self._seeded_tool_names: tuple[str, ...] = (
+            self.context_manager.discovered_tool_names() if config.discovered_tools else ()
+        )
+        # The groups the host seeded whole, loaded at the first surface build
+        # and then emptied. Not here: a group is found by its declaration and
+        # its tools by the policy that admits them, and a host may still be
+        # declaring groups on a registry it has already handed over.
+        self._pending_seed_tool_groups: tuple[str, ...] = config.loaded_tool_groups
+        # The groups whose rules the run has been given — in the catalogue or
+        # in a result. A call of a tool of such a group is never held back to
+        # give them again.
+        self._tool_group_rules_given: set[str] = set()
+        # The mark genuine rules carry in their heading, named in the
+        # catalogue, so rules a web page imitates can be told apart.
+        self._tool_rules_mark = tool_rules_mark(config.session_id)
+        # Set where the cached prefix starts over, so the next decision writes
+        # the loaded tools' rules into the catalogue again.
+        self._catalogue_takes_loaded_rules = False
+        # Calls of the current model message answered with their group's rules
+        # instead of being run, each mapped to its group.
+        self._rules_first_tool_call_ids: dict[str, str] = {}
+        # Which tool groups this run holds back and the catalogue naming them:
+        # decided once, on the first surface build, and remade only when the
+        # registry's catalogue changes (``_tool_deferral_key``). See
+        # :mod:`protocore.runtime.tool_deferral`.
+        self._tool_deferral: ToolDeferral | None = None
+        self._tool_deferral_key: tuple[Any, ...] | None = None
+        # Set only by a resume, until the first surface build replays it: the
+        # groups the snapshot says were held back.
+        self._restored_deferred_groups: tuple[str, ...] | None = None
+        # The tool names the last request advertised, so a call of a tool it
+        # did not advertise can be recognised; ``None`` before any request.
+        self._advertised_tool_names: frozenset[str] | None = None
+        # Calls of the current model message past ``max_tool_calls_per_turn``:
+        # answered with an error each instead of being dispatched.
+        self._over_cap_tool_call_ids: set[str] = set()
 
     # ------------------------------------------------------------------
     # Turn boundary — shared by every entry that opens a turn
@@ -2002,7 +2150,10 @@ class QueryEngine:
         base = self.config.tool_visibility_policy
         rc_floor = frozenset(self.config.rc.tool_surface_forced_pins)
         merged_floor = base.forced_pinned | rc_floor
-        dynamic_pins = frozenset(self.context_manager.pinned_tool_names())
+        # Discovered tools join ``pinned`` so dispatch admits them under a
+        # ``visible`` whitelist, exactly as it admits what it advertises. The
+        # surface builder takes them back out and appends them after the base.
+        dynamic_pins = frozenset(self.context_manager.discovered_tool_names())
         merged_pins = set(base.pinned) | set(dynamic_pins)
         # Union the per-run circuit-broken tools into ``blocked`` so a
         # tool that crossed ``max_consecutive_tool_errors`` is removed from the
@@ -2171,6 +2322,9 @@ class QueryEngine:
         # subagents that may still be drawing on it — but the per-run streaks
         # and one-shot signals inside it are allowances like any other.
         self.run_state.clear_run_scoped_streaks()
+        # A turn boundary is one of the places the prompt prefix starts over,
+        # so it is where loaded tools over the cap are unloaded.
+        self.context_manager.evict_discovered_tools()
         # The compaction state is continuity — what was summarised, what was
         # shed, which units the summariser cannot handle — but its retry
         # budgets are allowances sized for one question, like the rest.
@@ -2907,12 +3061,29 @@ class QueryEngine:
             item.to_dict() if hasattr(item, "to_dict") else item for item in self.spans
         ]
         # The context manager itself is rebuilt from the config on the new pod.
-        # The one thing it holds that no rebuild can produce is the pin LRU —
-        # the tools the agent went looking for and asked to keep — so that is
-        # what travels, in LRU order, least-recently-pinned first.
-        snapshot["context_manager_pinned_tools"] = list(
-            self.context_manager.pinned_tool_names()
-        )
+        # The one thing it holds that no rebuild can produce is the tools the
+        # agent went looking for — in discovery order, which is the order the
+        # surface appends them in, each with its last use, which is what the
+        # next eviction reads.
+        snapshot["discovered_tools"] = self.context_manager.discovered_tool_state()
+        # The held-back groups travel as the decision itself rather than being
+        # measured again on the new pod: the catalogue they render is at the
+        # head of the cached prompt, and a remeasurement against a registry
+        # that grew in between would move it. ``None`` means no decision had
+        # been made yet; a resumed run that has not built a surface since still
+        # owes the decision it was handed, so that is what it passes on.
+        if self._tool_deferral is not None:
+            snapshot["deferred_tool_groups"] = list(self._tool_deferral.deferred_groups)
+        elif self._restored_deferred_groups is not None:
+            snapshot["deferred_tool_groups"] = list(self._restored_deferred_groups)
+        else:
+            snapshot["deferred_tool_groups"] = None
+        # A resumed run holds back no call it has already cleared: the rules
+        # that cleared it are in the history it resumes with.
+        snapshot["tool_group_rules_given"] = sorted(self._tool_group_rules_given)
+        # The rules in the history were given under this mark; a resumed run
+        # that named another would have its own rules read as imitations.
+        snapshot["tool_group_rules_mark"] = self._tool_rules_mark
         # The skill catalog block is rebuilt from the store on the new pod, so
         # its BYTES are not carried; its digest is, because those bytes are the
         # head of the cached prompt prefix and a resume that silently rebuilds
@@ -3603,11 +3774,11 @@ class QueryEngine:
             for item in restored_lanes
             if isinstance(item, dict)
         ]
-        # Put the run continuity back. The pin LRU is re-pinned in the order it
-        # was persisted so the least-recently-pinned entry is still the one the
-        # next overflow evicts; the manager's own cap applies as it would to a
-        # live pin, which is what keeps a snapshot from restoring more pins than
-        # the current configuration allows.
+        # Put the run continuity back. Discovered tools return in discovery
+        # order with their last use, so the surface appends them where it did
+        # and the next eviction picks the same ones. Nothing is evicted here:
+        # a resume is not a point where the prompt prefix starts over, and a
+        # lowered cap takes effect at the next one.
         self.compact_checkpoint = restored_continuity.compact_checkpoint
         self.active_rule_paths = restored_continuity.active_rule_paths
         self.discovered_rules = restored_continuity.discovered_rules
@@ -3616,8 +3787,18 @@ class QueryEngine:
         self.spans = restored_continuity.spans
         self._resumed_skill_catalog_sha256 = restored_continuity.skill_catalog_block_sha256
         self._last_request_manifest = restored_manifest_reference
-        for pinned_name in restored_continuity.pinned_tools:
-            self.context_manager.pin_tool(pinned_name)
+        self.context_manager.restore_discovered_tools(
+            restored_continuity.discovered_tools, replace=True
+        )
+        self._restored_deferred_groups = restored_continuity.deferred_tool_groups
+        self._tool_deferral = None
+        self._tool_deferral_key = None
+        self._tool_group_rules_given = set(restored_continuity.tool_group_rules_given)
+        # A payload lifted from before marks existed carries none, and no
+        # rules were given under one: this process's own mark is as good.
+        self._tool_rules_mark = restored_continuity.tool_group_rules_mark or self._tool_rules_mark
+        self._seeded_tool_names = ()
+        self._pending_seed_tool_groups = ()
 
         # Put the tree budgets back into the state object the whole tree shares
         # by reference, so the resumed run and everything it dispatches keep

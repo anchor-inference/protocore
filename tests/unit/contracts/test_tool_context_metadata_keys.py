@@ -23,7 +23,13 @@ from pathlib import Path
 import pytest
 
 from protocore.contracts import tools
-from protocore.contracts.tool_registry import TOOL_VISIBILITY_POLICY_METADATA_KEY
+from protocore.contracts.tool_registry import (
+    ADVERTISED_TOOLS_METADATA_KEY,
+    TOOL_ALLOWLIST_METADATA_KEY,
+    TOOL_GROUP_RULES_GIVEN_METADATA_KEY,
+    TOOL_GROUP_RULES_MARK_METADATA_KEY,
+    TOOL_VISIBILITY_POLICY_METADATA_KEY,
+)
 from protocore.contracts.tools import (
     CORE_STAMPED_TOOL_CONTEXT_METADATA_KEYS,
     CORE_TOOL_CONTEXT_METADATA_KEYS,
@@ -61,6 +67,11 @@ EXPECTED_READ = frozenset(
         "memory_enabled",
         "memory_write_similarity_threshold",
         "memory_max_records_per_scope",
+        "protocore.tool_visibility_policy",
+        "protocore.tool_allowlist",
+        "protocore.advertised_tools",
+        "protocore.tool_group_rules_given",
+        "protocore.tool_group_rules_mark",
     }
 )
 
@@ -68,7 +79,11 @@ EXPECTED_READ = frozenset(
 EXPECTED_STAMPED = frozenset(
     {
         "tool_call_id",
-        "tool_visibility_policy",
+        "protocore.tool_visibility_policy",
+        "protocore.tool_allowlist",
+        "protocore.advertised_tools",
+        "protocore.tool_group_rules_given",
+        "protocore.tool_group_rules_mark",
         "protocore.subagent_dispatch_order",
         "protocore.subagent_dispatch_group",
         "protocore.subagent_tree_permit",
@@ -99,6 +114,18 @@ DECLARED_CONSTANTS: tuple[tuple[str, str, frozenset[str]], ...] = (
     (
         "TOOL_VISIBILITY_POLICY_METADATA_KEY",
         TOOL_VISIBILITY_POLICY_METADATA_KEY,
+        EXPECTED_STAMPED,
+    ),
+    ("TOOL_ALLOWLIST_METADATA_KEY", TOOL_ALLOWLIST_METADATA_KEY, EXPECTED_STAMPED),
+    ("ADVERTISED_TOOLS_METADATA_KEY", ADVERTISED_TOOLS_METADATA_KEY, EXPECTED_STAMPED),
+    (
+        "TOOL_GROUP_RULES_GIVEN_METADATA_KEY",
+        TOOL_GROUP_RULES_GIVEN_METADATA_KEY,
+        EXPECTED_STAMPED,
+    ),
+    (
+        "TOOL_GROUP_RULES_MARK_METADATA_KEY",
+        TOOL_GROUP_RULES_MARK_METADATA_KEY,
         EXPECTED_STAMPED,
     ),
     (

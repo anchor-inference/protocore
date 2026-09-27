@@ -95,6 +95,11 @@ from protocore.contracts.tool_chunking import (
     chunkable_content_mutation_names,
     is_chunkable_content_mutation,
 )
+from protocore.contracts.tool_registry import (
+    ADVERTISED_TOOLS_METADATA_KEY,
+    TOOL_GROUP_RULES_GIVEN_METADATA_KEY,
+    TOOL_GROUP_RULES_MARK_METADATA_KEY,
+)
 from protocore.contracts.tool_roles import (
     WORKSPACE_INSPECTION_ROLES,
     WORKSPACE_MUTATION_ROLES,
@@ -224,6 +229,16 @@ from protocore.runtime.skill_index import (
 )
 from protocore.runtime.subagent_budget import SubagentTreeBudget, SubagentTreePermit
 from protocore.runtime.tool_arguments import argument_names, string_argument
+from protocore.runtime.tool_deferral import (
+    build_tool_surface,
+    calls_held_for_rules,
+    hold_call_for_rules,
+    note_prompt_prefix_restarted,
+    observe_dispatched_tool,
+    seed_group_events,
+    tool_catalogue_block,
+    tool_group_states,
+)
 from protocore.runtime.tool_dispatch import (
     DISPATCH_POST_TOOL_OUTPUT_MODIFIED_METADATA_KEY,
     DISPATCH_REPLAY_ERROR_KIND_METADATA_KEY,
@@ -1739,9 +1754,11 @@ def _tool_surface_advertised_payload(
 
     policy = engine.effective_tool_policy
     roles = engine.config.tool_roles
-    toolsearch_pins = frozenset(engine.context_manager.pinned_tool_names())
+    discovered = engine.context_manager.discovered_tool_names()
+    discovered_set = frozenset(discovered)
     forced_pins = frozenset(policy.forced_pinned)
-    configured_pins = frozenset(policy.pinned) - toolsearch_pins
+    configured_pins = frozenset(engine.config.tool_visibility_policy.pinned)
+    deferral = engine._tool_deferral
     surface = read_tool_surface(context.tools)
     audience = engine.config.session_id or engine.config.run_id
     describe = surface_needs_describing(surface.digest, audience)
@@ -1749,8 +1766,8 @@ def _tool_surface_advertised_payload(
     tools: list[dict[str, object]] = []
     for tool in context.tools:
         sources: list[str] = []
-        if tool.name in toolsearch_pins:
-            sources.append("toolsearch_pin")
+        if tool.name in discovered_set:
+            sources.append("discovered")
         if tool.name in configured_pins:
             sources.append("configured_pin")
         if tool.name in forced_pins:
@@ -1771,9 +1788,19 @@ def _tool_surface_advertised_payload(
         "tool_names": tool_names,
         "tool_surface_digest": surface.digest,
         "tool_surface_described": describe,
-        "toolsearch_pinned_tool_names": sorted(toolsearch_pins),
+        # Discovery order, not name order: it is the order the loaded tools
+        # sit in at the end of ``tool_names``, and the order a host hands
+        # back as ``QueryEngineConfig.discovered_tools`` for the next run.
+        "discovered_tool_names": list(discovered),
         "configured_pinned_tool_names": sorted(configured_pins),
         "forced_pinned_tool_names": sorted(forced_pins),
+        # What the run holds back, in the order it was held back, and why.
+        "deferred_tool_groups": list(deferral.deferred_groups) if deferral else [],
+        "deferred_tool_count": len(deferral.deferred_names) if deferral else 0,
+        "tool_deferral_reasons": list(deferral.reasons) if deferral else [],
+        # Every group on the would-be surface, its load mode for this run, and
+        # whether it is advertised, held back, or held back with tools loaded.
+        "tool_groups": tool_group_states(deferral, tool_names, engine),
         "retrieval_top_k": engine.config.rc.tool_retrieval_top_k,
         "argument_names": {
             slot.value: list(names)
@@ -2293,23 +2320,17 @@ async def _drive_turn(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
         return
 
     # ── 4. Build context bundle ──────────────────────────────────────
-    # ``effective_tool_policy`` applies the RC core tool-surface floor so
-    # the six core file tools survive the BM25 RU clip on the live engine path.
-    tool_defs = list(
-        engine.tools.compute_effective_surface(
-            tenant_id=engine.config.tenant_id,
-            policy=engine.effective_tool_policy,
-            query=engine.latest_user_message.text if engine.latest_user_message else "",
-            top_k=engine.config.rc.tool_retrieval_top_k,
-        )
-    )
+    # ``effective_tool_policy`` (read inside) applies the RC core tool-surface
+    # floor; the builder holds back deferred groups and appends discovered
+    # tools after the name-sorted base.
+    tool_defs = build_tool_surface(engine)
 
     # Skill catalog: the account's enabled skills (plus project pins) rendered
     # into a stable ``<system-reminder>`` block, built ONCE per run (cached on
     # the engine) and placed in the static system-prompt prefix so it is
     # byte-identical across turns + the inner agent loop + every recovery
     # rebuild (keeps the prompt cache; no redundant per-turn store round-trip).
-    skill_catalog_block = await _ensure_run_skill_catalog(engine)
+    skill_catalog_block = await _run_catalogue_blocks(engine)
     if engine.config.rc.rules_discovery_enabled and engine.active_rule_paths:
         from protocore.runtime.rules_activation import bodies_for_prompt
 
@@ -2726,6 +2747,10 @@ async def _run_compaction(
         return
 
     engine._proactive_compaction_attempted_for_next_message = True
+    # Compaction rewrote the head of the conversation, so the cached prefix is
+    # gone past the tools anyway: the one kind of point at which loaded tools
+    # over the cap may be unloaded without costing the cache anything more.
+    _unload_tools_over_cap(engine, reason=reason)
 
     yield TurnEvent(
         type=EventType.COMPACTION_COMPLETED,
@@ -3799,6 +3824,18 @@ async def _stream_one_assistant_message(
         # discarded.
         flags.approval_pending = False
         flags.terminal_tool_completed = False
+        # Calls past the per-message cap are not run. Each is still answered —
+        # with an error, through the ordinary serial path so it lands in the
+        # order the model asked — because a call without a result is a
+        # transcript the provider refuses.
+        engine._over_cap_tool_call_ids = _calls_over_cap(engine, pending_tool_calls)
+        # Blind calls of tools whose group has rules the run has not been given
+        # are answered with the rules, and not run. Decided for the whole
+        # message at once, so two calls of one such group are both held.
+        engine._rules_first_tool_call_ids = calls_held_for_rules(
+            engine,
+            [tc for tc in pending_tool_calls if tc.id not in engine._over_cap_tool_call_ids],
+        )
         # Set True when a bounded pre-terminal self-verify turn was injected
         # at a would-be-terminal site. It breaks the dispatch loop WITHOUT
         # finalising; flow then falls through to the
@@ -3862,6 +3899,18 @@ async def _stream_one_assistant_message(
             ]
         else:
             delegation_eligible = [False] * len(pending_tool_calls)
+        # Calls answered without being run take the serial path, where the
+        # answer lands in the order the model asked.
+        not_run = engine._over_cap_tool_call_ids | set(engine._rules_first_tool_call_ids)
+        if not_run:
+            parallel_eligible = [
+                eligible and tc.id not in not_run
+                for eligible, tc in zip(parallel_eligible, pending_tool_calls, strict=True)
+            ]
+            delegation_eligible = [
+                eligible and tc.id not in not_run
+                for eligible, tc in zip(delegation_eligible, pending_tool_calls, strict=True)
+            ]
 
         # Record that this run hands work to subagents, once, for the whole run.
         # Set from the RAW structural predicate rather than from
@@ -4100,6 +4149,10 @@ async def _stream_one_assistant_message(
                         events, adjusted_outcome
                     ):
                         yield evt
+                    for evt in observe_dispatched_tool(
+                        engine, tool_call.name, tool_call.id, adjusted_outcome
+                    ):
+                        yield evt
                     _apply_deferred_tool_history(engine, tool_call, adjusted_outcome)
                     if not flags.approval_pending and _dispatch_outcome_is_terminal(
                         adjusted_outcome,
@@ -4325,6 +4378,10 @@ async def _stream_one_assistant_message(
                             events, adjusted_outcome
                         ):
                             yield evt
+                        for evt in observe_dispatched_tool(
+                            engine, tool_call.name, tool_call.id, adjusted_outcome
+                        ):
+                            yield evt
                         _apply_deferred_tool_history(
                             engine, tool_call, adjusted_outcome
                         )
@@ -4479,14 +4536,7 @@ async def _stream_one_assistant_message(
         if steer_evt is not None:
             yield steer_evt
             await _persist_live_control(engine)
-        tool_defs = list(
-            engine.tools.compute_effective_surface(
-                tenant_id=engine.config.tenant_id,
-                policy=engine.effective_tool_policy,
-                query=engine.latest_user_message.text if engine.latest_user_message else "",
-                top_k=engine.config.rc.tool_retrieval_top_k,
-            )
-        )
+        tool_defs = build_tool_surface(engine)
         next_history, _ = _llm_history(engine)
         # Reuse the run's once-built skill catalog (NOT rebuilt per iteration —
         # a per-turn rebuild would bust the cached system-prompt prefix).
@@ -4494,7 +4544,7 @@ async def _stream_one_assistant_message(
             history=next_history,
             tools=tool_defs,
             system_prompt_sections=engine.config.system_prompt_sections,
-            skill_index_block=await _ensure_run_skill_catalog(engine),
+            skill_index_block=await _run_catalogue_blocks(engine),
             skills_loaded=engine._skill_loaded_bundles,
         )
         # The rebuilt context (above) carries the injected continue message; the
@@ -4819,6 +4869,12 @@ async def _drive_one_stream(
                 else:
                     _pending_reads.charge_forced_attempt(engine)
                     forced_tool_choice = readback_tool
+    # The calls this request comes back with are judged against what it
+    # offered: a call of anything else is a call of a tool the model was not
+    # shown (see ``observe_dispatched_tool``).
+    engine._advertised_tool_names = frozenset(t.name for t in context.tools)
+    for seed_event in seed_group_events(engine):
+        yield seed_event
     advert = _tool_surface_advertised_payload(engine, context)
     yield TurnEvent(
         type=EventType.TOOL_SURFACE_ADVERTISED,
@@ -5706,6 +5762,7 @@ async def _handle_context_window_exceeded(
         )
         return
 
+    _unload_tools_over_cap(engine, reason="reactive_413")
     yield TurnEvent(
         type=EventType.COMPACTION_COMPLETED,
         run_id=engine.config.run_id,
@@ -5973,20 +6030,13 @@ async def _rebuild_context_for_recovery(
     block is the run's once-built value (NOT rebuilt here) so a recovery
     rebuild cannot bust the cached system-prompt prefix mid-run.
     """
-    tool_defs = list(
-        engine.tools.compute_effective_surface(
-            tenant_id=engine.config.tenant_id,
-            policy=engine.effective_tool_policy,
-            query=engine.latest_user_message.text if engine.latest_user_message else "",
-            top_k=engine.config.rc.tool_retrieval_top_k,
-        )
-    )
+    tool_defs = build_tool_surface(engine)
     recovery_history, _ = _llm_history(engine)
     return engine.context_manager.build_context(
         history=recovery_history,
         tools=tool_defs,
         system_prompt_sections=engine.config.system_prompt_sections,
-        skill_index_block=await _ensure_run_skill_catalog(engine),
+        skill_index_block=await _run_catalogue_blocks(engine),
         skills_loaded=engine._skill_loaded_bundles,
     )
 
@@ -6440,6 +6490,7 @@ async def _drain_dispatch_tool_deferred(
     # cannot shadow ``tool_call_id`` / ``protocore.*`` on the parallel-dispatch
     # path either.
     _merge_run_metadata_into(metadata, engine.run_state)
+    _stamp_advertised_tools(metadata, engine)
     # Carry the child's LLM-requested batch position + its fan-out group id so
     # the host runner can declare its deliverables into the parent ledger in
     # batch order (not gather completion order), scoped per group so a later
@@ -10222,7 +10273,24 @@ def _build_replay_metadata(engine: QueryEngine) -> dict[str, Any]:
     _rehydrate_satisfied_from_history(engine)
     metadata: dict[str, Any] = {}
     _merge_run_metadata_into(metadata, engine.run_state)
+    _stamp_advertised_tools(metadata, engine)
     return metadata
+
+
+def _stamp_advertised_tools(metadata: dict[str, Any], engine: QueryEngine) -> None:
+    """Tell the tool which names the request that called it advertised.
+
+    Set after the run-metadata merge, which skips ``protocore.*`` names, so an
+    operator's envelope cannot claim a tool was on the surface. Nothing is set
+    before the first request, when no surface has been advertised yet.
+    """
+    advertised = engine._advertised_tool_names
+    if advertised is not None:
+        metadata[ADVERTISED_TOOLS_METADATA_KEY] = advertised
+    # Stamped whether or not any were given, so a search inside a loop never
+    # reads the key's absence as "outside a loop".
+    metadata[TOOL_GROUP_RULES_GIVEN_METADATA_KEY] = frozenset(engine._tool_group_rules_given)
+    metadata[TOOL_GROUP_RULES_MARK_METADATA_KEY] = engine._tool_rules_mark
 
 
 def _rehydrate_satisfied_from_history(engine: QueryEngine) -> None:
@@ -10762,6 +10830,124 @@ def _insert_tool_result_after_use(
     return False
 
 
+def _unload_tools_over_cap(engine: QueryEngine, *, reason: str) -> None:
+    """Unload the least recently used discovered tools over ``pinned_tool_max_count``.
+
+    Called only after a compaction, which is also where the catalogue is
+    written again with the rules of the groups still loaded, and the rules
+    counted as given are cut back to those: the results that gave rules may
+    be in the summary now, and only as its gist. Writing them costs the
+    system prompt's cache once when they are new to the catalogue (see
+    :func:`~protocore.runtime.tool_deferral.note_prompt_prefix_restarted`).
+    """
+    note_prompt_prefix_restarted(engine)
+    evicted = engine.context_manager.evict_discovered_tools()
+    if evicted:
+        _logger.info(
+            "DIAG query.discovered_tools.evicted run=%s reason=%s tools=%s",
+            engine.config.run_id,
+            reason,
+            ",".join(evicted),
+        )
+
+
+def _calls_over_cap(engine: QueryEngine, calls: Sequence[ToolCall]) -> set[str]:
+    """The ids of the calls past ``max_tool_calls_per_turn``, in one model message."""
+    cap = engine.config.rc.max_tool_calls_per_turn
+    if cap <= 0 or len(calls) <= cap:
+        return set()
+    over = {tc.id for tc in calls[cap:]}
+    _logger.warning(
+        "DIAG query.tool_call_cap.exceeded run=%s turn=%s calls=%d cap=%d refused=%d",
+        engine.config.run_id,
+        engine.turn_id(),
+        len(calls),
+        cap,
+        len(over),
+    )
+    return over
+
+
+async def _refuse_call_over_cap(
+    engine: QueryEngine, tool_call: ToolCall
+) -> AsyncIterator[TurnEvent]:
+    """Answer one call past the per-message cap with an error, without running it.
+
+    Nothing about the call counts as the tool failing: it is not charged to the
+    circuit breaker or the error streaks, because the tool never ran, and a
+    thousand refused copies of one search would otherwise disable that search
+    for the rest of the run. The snapshot is written once, after the last of
+    them, rather than once per refusal.
+    """
+    engine._over_cap_tool_call_ids.discard(tool_call.id)
+    cap = engine.config.rc.max_tool_calls_per_turn
+    message = (
+        f"Not run: one message may make at most {cap} tool calls, and this "
+        "call came after that. Make the calls you still need in a later "
+        "message, fewer at a time."
+    )
+    yield TurnEvent(
+        type=EventType.TOOL_RESULT,
+        run_id=engine.config.run_id,
+        payload={
+            "tool_call_id": tool_call.id,
+            "success": False,
+            "is_error": True,
+            "error": {"kind": "tool_call_cap", "message": message},
+            "content_blocks": [{"type": "text", "text": message}],
+        },
+    )
+    engine.history.append(
+        Message(
+            role=MessageRole.tool,
+            content_blocks=[
+                ToolResultBlock(tool_call_id=tool_call.id, content=message, is_error=True)
+            ],
+        )
+    )
+    engine.forget_tool_name(tool_call.id)
+    if not engine._over_cap_tool_call_ids:
+        await engine._persist_snapshot()
+
+
+async def _answer_with_group_rules(
+    engine: QueryEngine, tool_call: ToolCall
+) -> AsyncIterator[TurnEvent]:
+    """Answer a blind call of a rule-bearing group's tool with the rules, unrun.
+
+    Like a call over the cap, it is not charged to the circuit breaker or the
+    error streaks: the tool never ran. Unlike one, it is not an error — the
+    tool is loaded and the next call of it runs.
+    """
+    group = engine._rules_first_tool_call_ids.pop(tool_call.id)
+    content, events = hold_call_for_rules(engine, tool_call, group)
+    # Before the result, not after it as for a call that ran: a host that times
+    # tool calls or counts them as used learns from ``executed: false`` that the
+    # result about to come answers a call that never ran.
+    for evt in events:
+        yield evt
+    yield TurnEvent(
+        type=EventType.TOOL_RESULT,
+        run_id=engine.config.run_id,
+        payload={
+            "tool_call_id": tool_call.id,
+            "success": True,
+            "is_error": False,
+            "content_blocks": [{"type": "text", "text": content}],
+        },
+    )
+    engine.history.append(
+        Message(
+            role=MessageRole.tool,
+            content_blocks=[
+                ToolResultBlock(tool_call_id=tool_call.id, content=content, is_error=False)
+            ],
+        )
+    )
+    engine.forget_tool_name(tool_call.id)
+    await engine._persist_snapshot()
+
+
 async def _dispatch_tool(
     engine: QueryEngine,
     tool_call: ToolCall,
@@ -10787,6 +10973,14 @@ async def _dispatch_tool(
  ``tool_transport_starting`` is emitted by the **host's transport**
  (never by core) on cold start only.
  """
+    if tool_call.id in engine._over_cap_tool_call_ids:
+        async for evt in _refuse_call_over_cap(engine, tool_call):
+            yield evt
+        return
+    if tool_call.id in engine._rules_first_tool_call_ids:
+        async for evt in _answer_with_group_rules(engine, tool_call):
+            yield evt
+        return
     _pin_keep_flag(engine, tool_call)
     # Terminal-only finalisation guard. Once the terminal-answer nudge has
     # fired and no terminal tool result is in history yet, every
@@ -11204,6 +11398,7 @@ async def _dispatch_tool(
     # authoritative ``tool_call_id`` is then set by the dispatcher from the real
     # ``tool_call.id``.
     _merge_run_metadata_into(metadata, engine.run_state)
+    _stamp_advertised_tools(metadata, engine)
     # Flag the SYNTHETIC dispatch so a backend MAY default a required terminal
     # field (e.g. ``outcome``) ONLY for the runtime-synthesised last-resort
     # guaranteed-terminal answer, never for a model-emitted one.
@@ -11614,6 +11809,9 @@ async def _dispatch_tool(
     # that shares this seam. Recorded from the DISPATCH rather than read back
     # out of history because compaction rewrites the turn and drops the names.
     engine.record_tool_call(tool_call.name, ok=not outcome.is_error)
+    # What this call loaded — a discovery tool's result, or the call itself
+    # when the request had not advertised it. Announced after the result.
+    surface_events = observe_dispatched_tool(engine, tool_call.name, tool_call.id, outcome)
 
     if soft_cap_warnings:
         annotated_content = outcome.content
@@ -11649,6 +11847,8 @@ async def _dispatch_tool(
 
     # Flush any events that were buffered ahead of the final outcome.
     for evt in buffered:
+        yield evt
+    for evt in surface_events:
         yield evt
 
     # A SUCCESSFUL chunkable write (Write/AppendFile) marks the path
@@ -12342,6 +12542,20 @@ _COMMAND_NAME_PATTERN = re.compile(
     r"<command-name>([^<\s][^<]*?)</command-name>",
     re.IGNORECASE,
 )
+
+
+async def _run_catalogue_blocks(engine: QueryEngine) -> str:
+    """The run's catalogues for the system prompt: skills, then held-back tools.
+
+    Both are built once per run and reused byte for byte, so together they are
+    a stable part of the cached prefix. The tool catalogue is empty unless the
+    run holds tool groups back, which leaves the prompt exactly as it was.
+    """
+    skills = await _ensure_run_skill_catalog(engine)
+    tools = tool_catalogue_block(engine)
+    if not tools:
+        return skills
+    return f"{skills}\n{tools}" if skills else tools
 
 
 async def _ensure_run_skill_catalog(engine: QueryEngine) -> str:

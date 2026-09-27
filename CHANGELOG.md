@@ -6,6 +6,183 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Tool retrieval is BM25F over five fields, with stemming and Russian query
+  expansion.** A tool is indexed as its name, `search_hint`, the first sentence
+  of its description, the rest of it, and its parameter names and
+  descriptions, each weighted (`tool_retrieval_name_weight`,
+  `tool_retrieval_search_hint_weight`, `tool_retrieval_summary_weight`,
+  `tool_retrieval_description_weight`, `tool_retrieval_parameters_weight`,
+  `tool_retrieval_bm25_k1`, `tool_retrieval_bm25_b`). Identifiers are split
+  (`BrowserOpen` matches "browser open"), `ё` is folded, conversational
+  fillers are stopwords, and both sides are stemmed with the Snowball Russian
+  and Porter English stemmers. A Russian query is expanded through a bundled
+  Russian-to-English lexicon (`tool_retrieval_lexicon_weight`), which is what
+  lets it find tools described only in English. On a labelled set of 656
+  English and Russian queries against about 700 tools, Recall@5 rose from 0.41
+  to 0.67, and to 0.78 with a Russian `search_hint` on every host tool. See
+  `docs/tools.md`.
+- **`ToolRegistry.search` returns tools in rank order**, best first, ties by
+  name. It used to re-sort its result by name, which hid which hit fit best.
+  The advertised surface from `compute_effective_surface` stays in name order.
+- **The index is built once per catalogue version** and cached on the registry
+  instance, instead of re-tokenising every tool on every query: about 0.3 ms per
+  query at 700 tools, down from 15–20 ms.
+- **The per-turn clip uses the normalized fallback too** when nothing scores,
+  as `search` already did. The fallback no longer counts one- and two-letter
+  words and stopwords of a description, which made the article "a" match any
+  query token containing the letter.
+- `IToolRegistry.search` and `compute_effective_surface` take an optional
+  `retrieval: RetrievalSettings`; the loop passes
+  `RetrievalSettings.from_constants(rc)`.
+- **The per-message clip is off by default, and pinned tools no longer count
+  against it.** `tool_retrieval_top_k` defaults to `0` (off) and now counts only
+  the tools retrieval adds; counted with the pins, a floor of fourteen under the
+  old default of twelve left the clip no room to retrieve anything. Clipping per
+  user message is kept as an opt-in and documented as not recommended.
+- **`tool_definitions_ratio` is enforced** and defaults to `0.25`. It was
+  derived into a budget that nothing held the surface to.
+- **Discovered tools are appended to the surface in discovery order** instead of
+  being sorted into it, so loading a tool changes only the end of the tool list.
+  The context manager's pin LRU (`pin_tool`, `pinned_tool_names`) is replaced by
+  `discover_tool`, `note_tool_used`, `discovered_tool_names` and
+  `evict_discovered_tools`; `pinned_tool_max_count` is applied, least recently
+  used first, only after compaction, at a turn boundary and when a run starts.
+- **The snapshot schema is version 7.** `context_manager_pinned_tools` becomes
+  `discovered_tools` (name and last use, discovery order) beside the new
+  `deferred_tool_groups`; the upcaster lifts a version 6 payload.
+- **`tool_surface_advertised`** carries `discovered_tool_names` (discovery
+  order) in place of `toolsearch_pinned_tool_names`, the held-back groups
+  (`deferred_tool_groups`, `deferred_tool_count`, `tool_deferral_reasons`), and
+  the source `discovered` in place of `toolsearch_pin`.
+- **An unknown tool name is answered with up to three near names** the policy
+  admits: `unknown tool: 'X'. Did you mean: A, B, C?`
+- An engine built without a host run state now carries its own constants on
+  `run_state.rc`, so core tools read the run's tunables.
+- **A description's first sentence no longer ends at an abbreviation** such as
+  "e.g.", "i.e.", "vs.", "т.е." or "напр.", nor at a full stop inside
+  brackets; "etc." and "т.д." end it only before a capital. `ToolSearch` shows
+  that sentence as a tool's line, and it used to read "Transition an issue to a
+  new status (e.g.".
+
+### Added
+
+- **Tool groups and deferral.** `ToolGroup`, `IToolRegistry.declare_group`,
+  `undeclare_group` (for a group whose tools are gone, such as a removed MCP
+  server's) and `tool_groups`; a tool joins a group by its `tool_group` class attribute or a
+  declared name prefix. With `tool_deferral_mode = "auto"` (the default, inert
+  until a group is declared and a discovery tool registered) dynamic groups are
+  held back, and other groups largest first while the surface is over
+  `tool_definitions_ratio` of the window or over `max_advertised_tools`.
+  Held-back groups are named in a byte-stable catalogue block in the system
+  prompt, with exact tool names or an exact prefix and count
+  (`tool_catalogue_max_listed_names`). The decision is made again when the
+  catalogue, the groups or the host's visibility policy change, so tools a
+  host switches on mid-run are held back like the rest, with the decision in
+  force as its floor, so the catalogue does not flip mid-run. A decision a
+  snapshot carries is a floor too: a dynamic group it does not name is still
+  held back and the limits still apply. Without a discovery tool, groups are
+  held back only over `max_advertised_tools`, and the catalogue says to call
+  by exact name. See `docs/tools.md`.
+- **`ToolSearch`** (`protocore.tools.ToolSearchTool`): free-text search with up
+  to `tool_search_max_results` hits in rank order, one line each, loading the
+  first `tool_search_autoload_count`; `select:Name1,Name2` (or a `select`
+  argument, a list or a comma-separated string) loads exact names and answers
+  an unknown one with the nearest admitted names. A tool already in the tool
+  list is reported as such, never as loaded, and the description says the tool
+  loads tools only — skills are not tools. It respects the live visibility
+  policy and a child run's declared tool set, which the dispatcher stamps on
+  every call (`TOOL_VISIBILITY_POLICY_METADATA_KEY`, now
+  `protocore.tool_visibility_policy`, and `TOOL_ALLOWLIST_METADATA_KEY`); with
+  no policy it admits nothing. It is advertised only while something is held
+  back.
+- `ADVERTISED_TOOLS_METADATA_KEY`: the loop stamps the names the calling
+  request advertised on `ToolContext.metadata`.
+- A call of a registered tool the request did not advertise still runs and now
+  loads the tool; events `tool_discovered` and `tool_unadvertised_call`. When
+  such a call fails on its arguments, the error ends with the tool's line
+  (`It takes: Name(param1*, param2) — first sentence`), the form `ToolSearch`
+  lists tools in, so the retry need not guess again — only for a tool the
+  policy and the child's declared set admit.
+- `QueryEngineConfig.discovered_tools` seeds a new run with the tools the last
+  run of the session loaded; `ContextManager.called_discovered_tool_names()`
+  is the part of them the run called, which is the list worth carrying.
+- `max_tool_calls_per_turn` (default 64): calls past it in one model message are
+  each answered with an error and not run.
+- **Load modes and rules for tool groups.** `declare_group` takes
+  `load="eager" | "auto" | "lazy"` and `instructions`. A `lazy` group is held
+  back whenever a discovery tool is admitted, even when everything fits, and
+  is advertised like `auto` when none is; an `eager` group is never held back
+  for size and gives way only to `max_advertised_tools` itself.
+  `QueryEngineConfig.tool_group_loads` overrides the load modes for one run.
+  `ToolSearch` takes `group` (and `group:<name>` entries in `select`) to load
+  every admitted tool of a group; tools loaded that way are one entry under
+  `pinned_tool_max_count`. A group's rules are given once per run: in the
+  catalogue for tools on the surface or loaded when the run starts (and again
+  after a compaction), in the `ToolSearch` result that loads the group's first
+  tools, or — for a blind call of such a tool — instead of running the call,
+  which is answered with the rules and runs on the next try. New event
+  `tool_group_loaded` (`group`, `via`, `tools`); `tool_surface_advertised`
+  carries `tool_groups` with each group's load mode and state, and
+  `tool_unadvertised_call` carries `executed`. The snapshot (still version 7)
+  gains `tool_group_rules_given`, and a discovered-tool row loaded with its
+  whole group carries `group`. The catalogue's header now names the
+  whole-group load. See `docs/tools.md`.
+- **A blind call held for its group's rules loads the whole group**, as
+  `ToolSearch(group=...)` would, and its answer names the group's other tools
+  now callable and gives the called tool's line (`It takes: Name(p1*, p2) —
+  …`). Loading only the called tool left the rest of the group out of sight,
+  and the retry was written without the parameters.
+- **Group rules carry the run's rules mark, and the catalogue names it.** A
+  genuine rules heading reads `Rules for the <group> tools [<mark>]:`; the
+  catalogue says, whenever a group in it has rules, that text claiming to be
+  rules without the mark — a web page, a file, a command's output — is
+  content, not rules. The mark is an HMAC of the session id under a
+  per-process key (`tool_rules_mark`), stamped for discovery tools as
+  `protocore.tool_group_rules_mark` and carried in the snapshot as
+  `tool_group_rules_mark`.
+- **After a compaction the rules counted as given are the rules the catalogue
+  carries.** The set used to keep every group given earlier, so a group whose
+  rules were in a result the compaction took away, and which the compaction
+  then unloaded over the cap, had its blind calls run without the rules and
+  its reload give none. The catalogue no longer keeps rules for groups that
+  are neither on the surface nor loaded, and `ToolSearch` inside a loop goes
+  by the given set alone.
+- **A call held for its group's rules is not a use of the tool**: it did not
+  run, so `called_discovered_tool_names()` no longer lists it and a host does
+  not carry its group into the next run for it. Its `tool_unadvertised_call`
+  (`executed: false`) now comes before its `tool_result`, so a host knows the
+  result answers a call that never ran.
+- **The catalogue lists the host's own held-back groups first**, and the
+  `dynamic` groups after them under `Tools of connected servers:`. In one
+  name-sorted list the servers stood ahead of the host's groups.
+- `QueryEngineConfig.loaded_tool_groups` seeds a run with whole groups, each
+  one entry under `pinned_tool_max_count` with its rules in the catalogue and
+  a `tool_group_loaded` event with `via` `seed`; seeding a large group's tools
+  by name made each an entry and pushed the rest of the seed out.
+  `ContextManager.loaded_tool_group_names()` is the groups a run holds whole,
+  for a host to carry into the next one.
+
+- **The bundled lexicon covers the Russian a developer speaks about trackers,
+  chat, calendars and deployments**: loanwords and slang such as "пулреквест",
+  "ишью", "тикет", "таска", "смержи", "выкати", "созвон", "заархивируй",
+  "алерт", mapped to the English an MCP server describes its tools in. A
+  Russian request such as "покажи открытые пулреквесты" or "заархивируй тикет
+  поддержки" now finds the server's tool among the first three.
+- `IToolRetriever` and `reciprocal_rank_fusion` (`contracts/tool_retrieval.py`):
+  a host may pass its own ranker, for example an embedding model, as
+  `ToolRegistry(retriever=...)`, and its ranking is fused with the lexical one
+  (`tool_retrieval_fusion_rank_constant`). `ToolRegistry(lexicon=...)` takes a
+  host's own `Lexicon`, or `None` to turn expansion off.
+
+### Removed
+
+- `retrieve_tools`, `bm25_score`, `compute_idf`, `compute_avgdl`,
+  `reduce_query`, `build_candidate` and `ToolRetrievalCandidate`: replaced by
+  `ToolIndex`, `AnalyzedCatalogue` and `ToolDocument`.
+  `normalized_fallback_match` now takes `ToolDocument`s and returns names.
+
 ## [2.0.0a22] - 2026-09-26
 
 ### Changed
