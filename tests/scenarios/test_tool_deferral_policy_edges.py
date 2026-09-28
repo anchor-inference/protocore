@@ -15,7 +15,7 @@ import pytest
 
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.tools import ToolContext
-from protocore.contracts.types import ToolResult
+from protocore.contracts.types import MessageRole, TextBlock, ToolResult
 from protocore.runtime.tool_surface import forget_tool_surfaces
 from protocore.tools import ToolSearchTool
 
@@ -142,3 +142,34 @@ async def test_a_clipped_surface_keeps_its_search_tool(scenario: ScenarioFactory
     advertised = run.advertised_tool_names(0)
     assert len(advertised) < len(_tools()) + 1  # the clip did leave tools off
     assert "ToolSearch" in advertised
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "ensure_tool_deferral plans from the policy's surface alone; the run's "
+        "declared tool set, which ToolSearch and the gate both honour, is not applied"
+    ),
+)
+async def test_the_catalogue_names_no_group_the_declared_tool_set_cannot_reach(
+    scenario: ScenarioFactory,
+) -> None:
+    """A child declared to use Note alone is told the github tools are there to
+    load; every search for them comes back empty and every call is refused."""
+    run = _with_search(
+        scenario(tools=_tools(), subagent_tool_allowlist=("Note", "ToolSearch"))
+    )
+    run.llm.queue_response(text="done")
+    await run.run("hello")
+
+    assert "Mcp_Github_" not in _system_text(run)
+
+
+def _system_text(run: Scenario) -> str:
+    return "\n".join(
+        block.text
+        for message in run.requests[0].messages
+        if message.role is MessageRole.system
+        for block in message.content_blocks
+        if isinstance(block, TextBlock)
+    )
