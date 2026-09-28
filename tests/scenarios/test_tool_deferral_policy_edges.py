@@ -173,3 +173,50 @@ def _system_text(run: Scenario) -> str:
         for block in message.content_blocks
         if isinstance(block, TextBlock)
     )
+
+
+@dataclass
+class _LeavePlan(ScriptedTool):
+    """Stands in for the host ending plan mode mid-run: the profile, not the
+    visibility policy, is what changes."""
+
+    tool_name: str = "LeavePlan"
+    description: str = "leave plan mode"
+    engine: Any = None
+
+    async def invoke(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        self.engine.config = replace(self.engine.config, execution_profile="default")
+        return await super().invoke(context, arguments)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "_catalogue_key carries the host's visibility policy but not the execution "
+        "profile, which also reshapes the effective policy the decision is planned from"
+    ),
+)
+async def test_a_dynamic_group_a_profile_change_admits_is_held_back(
+    scenario: ScenarioFactory,
+) -> None:
+    """Planned under the plan profile, the github tools were not admitted and
+    nothing was held back; the profile ends and the decision is not made again,
+    so the whole server lands on the surface instead of in the catalogue."""
+    leave = _LeavePlan()
+    run = _with_search(
+        scenario(
+            tools=[*_tools(), leave],
+            execution_profile="plan",
+            rc=default_rc(
+                execution_profile_plan_enabled=True,
+                execution_profile_plan_tools="Note,Zeta,LeavePlan,ToolSearch",
+            ),
+        )
+    )
+    leave.engine = run.engine
+    run.llm.queue_tool_call_response(tool_call_id="l-1", tool_name="LeavePlan", tool_input={})
+    run.llm.queue_response(text="done")
+    await run.run("plan, then act")
+
+    assert not any(name.startswith("Mcp_Github_") for name in run.advertised_tool_names(0))
+    assert not any(name.startswith("Mcp_Github_") for name in run.advertised_tool_names(1))
