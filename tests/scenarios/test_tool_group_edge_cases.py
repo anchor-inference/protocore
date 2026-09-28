@@ -8,10 +8,13 @@ from __future__ import annotations
 import subprocess
 import sys
 from collections.abc import Iterator
+from dataclasses import dataclass
+from typing import Any
 
 import pytest
 
-from protocore.contracts.types import MessageRole, TextBlock
+from protocore.contracts.tools import ToolContext
+from protocore.contracts.types import MessageRole, TextBlock, ToolResult
 from protocore.runtime.context.budgets import derive_budgets
 from protocore.runtime.token_counting import estimate_tokens
 from protocore.runtime.tool_deferral import tool_rules_mark
@@ -46,24 +49,14 @@ def _browser(count: int) -> list[ScriptedTool]:
     ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the count limit reserves room for pinned_tool_max_count loaded TOOLS while a "
-        "group loaded whole is one ENTRY of many tools; _fit_loaded then trims the "
-        "loaded tail tool by tool and leaves half of a group the model was told is loaded"
-    ),
-)
-async def test_a_group_loaded_whole_stays_whole_under_the_provider_tool_limit(
-    scenario: ScenarioFactory,
-) -> None:
+def _six_browser_tools_under_a_limit(scenario: ScenarioFactory, limit: int) -> Scenario:
     run = scenario(
         tools=[
             ScriptedTool(tool_name="Note", description="record a note"),
             ScriptedTool(tool_name="Zeta", description="the last tool"),
             *_browser(6),
         ],
-        rc=default_rc(max_advertised_tools=6, pinned_tool_max_count=2),
+        rc=default_rc(max_advertised_tools=limit, pinned_tool_max_count=2),
     )
     run.tools.register(ToolSearchTool(run.tools))
     run.tools.declare_group("browser", "Drive a web browser", prefix="Browser", load="lazy")
@@ -71,17 +64,89 @@ async def test_a_group_loaded_whole_stays_whole_under_the_provider_tool_limit(
         tool_call_id="s-1", tool_name="ToolSearch", tool_input={"group": "browser"}
     )
     run.llm.queue_response(text="loaded")
-    await run.run("open a page")
+    return run
 
-    (search_result,) = run.tool_results()
-    # The model is told all six are loaded and callable ...
-    assert search_result.content.startswith(
+
+async def test_a_group_loaded_whole_stays_whole_under_the_provider_tool_limit(
+    scenario: ScenarioFactory,
+) -> None:
+    """What the model is told about a group is true of the next tool list:
+    a group that fits the provider's limit is carried whole, and one that
+    would not is not loaded at all rather than loaded and then cut in half."""
+    fits = _six_browser_tools_under_a_limit(scenario, limit=9)
+    await fits.run("open a page")
+    (result,) = fits.tool_results()
+    assert result.content.startswith(
         "Loaded, and callable from your next step: " + ", ".join(f"Browser{i:02d}" for i in range(6))
     )
-    # ... and the next request must then carry all six, or none of them.
-    advertised = run.advertised_tool_names(1)
-    loaded = [name for name in advertised if name.startswith("Browser")]
-    assert loaded in ([], [f"Browser{i:02d}" for i in range(6)])
+    assert [n for n in fits.advertised_tool_names(1) if n.startswith("Browser")] == [
+        f"Browser{i:02d}" for i in range(6)
+    ]
+
+    # Note, Zeta and ToolSearch leave room for three: six cannot come whole.
+    over = _six_browser_tools_under_a_limit(scenario, limit=6)
+    await over.run("open a page")
+    (result,) = over.tool_results()
+    assert result.content.startswith("Nothing was loaded.\n\nThe browser group (6 tools) is not loaded")
+    assert "over the provider's limit on the number of tools" in result.content
+    assert not any(n.startswith("Browser") for n in over.advertised_tool_names(1))
+    assert over.engine.context_manager.loaded_tool_group_names() == ()
+
+
+@dataclass
+class _Register(ScriptedTool):
+    """Stands in for the host registering a tool mid-run, which grows the base
+    surface under the loaded tail."""
+
+    tool_name: str = "Register"
+    description: str = "register another tool"
+    registry: Any = None
+
+    async def invoke(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        self.registry.register(ScriptedTool(tool_name="Extra", description="an extra tool"))
+        return await super().invoke(context, arguments)
+
+
+async def test_a_loaded_tail_over_the_provider_limit_is_trimmed_by_whole_entries(
+    scenario: ScenarioFactory,
+) -> None:
+    """When the base grows under a loaded tail that fit before, the tail is
+    trimmed by entries: a group loaded whole leaves the request whole, and a
+    single tool loaded after it — more recent, and small enough — stays."""
+    register = _Register()
+    run = scenario(
+        tools=[
+            ScriptedTool(tool_name="Note", description="record a note"),
+            ScriptedTool(tool_name="Solo", description="a tool on its own"),
+            *_browser(2),
+            register,
+        ],
+        rc=default_rc(max_advertised_tools=6, pinned_tool_max_count=3),
+    )
+    register.registry = run.tools
+    run.tools.register(ToolSearchTool(run.tools))
+    run.tools.declare_group("browser", "Drive a web browser", prefix="Browser", load="lazy")
+    run.tools.declare_group("solo", "A tool of its own", prefix="Solo", load="lazy")
+    run.llm.queue_tool_call_response(
+        tool_call_id="s-1", tool_name="ToolSearch", tool_input={"group": "browser"}
+    )
+    run.llm.queue_tool_call_response(
+        tool_call_id="s-2", tool_name="ToolSearch", tool_input={"select": ["Solo"]}
+    )
+    run.llm.queue_tool_call_response(tool_call_id="r-1", tool_name="Register", tool_input={})
+    run.llm.queue_response(text="done")
+    await run.run("load, then grow")
+
+    # Base Note, Register, ToolSearch plus the group and Solo: six, at the limit.
+    before = run.advertised_tool_names(2)
+    assert len(before) == 6 and before[-3:] == ["Browser00", "Browser01", "Solo"]
+    # Extra makes the base four; two places are left. The group of two is the
+    # older entry and does not fit beside the more recent Solo, so it leaves
+    # whole; Solo stays. Nothing is unloaded: both come back when there is room.
+    after = run.advertised_tool_names(3)
+    assert "Extra" in after and after[-1] == "Solo" and len(after) == 5
+    assert not any(name.startswith("Browser") for name in after)
+    assert run.engine.context_manager.loaded_tool_group_names() == ("browser",)
 
 
 async def test_rules_of_a_group_on_the_surface_count_against_the_tool_budget(

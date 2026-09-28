@@ -856,17 +856,36 @@ def _clip_left_tools_off(engine: QueryEngine, present: set[str]) -> bool:
 def _fit_loaded(
     engine: QueryEngine, appended: list[ToolDefinition], room: int
 ) -> list[ToolDefinition]:
-    """Keep the ``room`` most recently used loaded tools, in discovery order.
+    """Keep the most recently used loaded entries that fit in ``room``, in discovery order.
+
+    An entry is one tool, or every tool of a group loaded whole, as it is for
+    eviction: a group the model asked for as a unit is carried whole or not at
+    all. Trimmed tool by tool, the list carried half of a group the model had
+    been told was loaded, and what it had been told was no longer true of the
+    list in front of it. An entry too large for the room left is passed over
+    and a smaller, older one may still fit.
 
     Only reached when a provider's tool limit would otherwise refuse the
     request. Dropping from the middle of the loaded tail costs the cache
     everything after it, which is still better than a request that fails.
     """
-    recency = engine.context_manager.discovered_tool_last_used()
-    keep = {
-        definition.name
-        for definition in sorted(appended, key=lambda d: recency.get(d.name, 0), reverse=True)[:room]
-    }
+    manager = engine.context_manager
+    recency = manager.discovered_tool_last_used()
+    groups = manager.discovered_tool_groups()
+    entries: dict[str, list[ToolDefinition]] = {}
+    for definition in appended:
+        group = groups.get(definition.name)
+        key = f"group:{group}" if group else f"tool:{definition.name}"
+        entries.setdefault(key, []).append(definition)
+    keep: set[str] = set()
+    for members in sorted(
+        entries.values(),
+        key=lambda members: max(recency.get(member.name, 0) for member in members),
+        reverse=True,
+    ):
+        if len(members) <= room:
+            keep.update(member.name for member in members)
+            room -= len(members)
     return [definition for definition in appended if definition.name in keep]
 
 

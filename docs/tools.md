@@ -636,8 +636,12 @@ prefix starts over anyway: after compaction, at a turn boundary (`rearm`), and
 when a run starts. Unloading a tool in the middle of a run would pull a schema
 out from under a model that may be about to call it, and would cost the cache
 exactly what the cap exists to save. The one exception is a provider limit:
-when base plus loaded tools would exceed `max_advertised_tools`, the least
-recently used loaded tools are left off that request (they stay loaded).
+when base plus loaded tools would exceed `max_advertised_tools` — the base grew
+under a loaded tail that fit before — the least recently used loaded entries
+are left off that request (they stay loaded). An entry is a tool, or a group
+loaded whole, as for eviction: a group is left off whole, never cut to the
+room left, so what the model was told about it stays true of the list in
+front of it; a smaller, older entry may still fit in its place.
 
 The loaded tools and the held-back groups travel in the snapshot
 (`discovered_tools`, `deferred_tool_groups`), and a resumed run keeps the

@@ -56,6 +56,11 @@ All notable changes to this project are recorded here. The format follows
   Both are judged by `group_load_overflow` now: a held call loads the called
   tool alone and says how many more there are and how to load them, and
   `ToolSearch` lists a group that would not fit instead of loading it.
+- **A loaded tail over `max_advertised_tools` is trimmed by whole entries.**
+  It was trimmed one tool at a time by recency, so a group loaded whole was
+  left half on the list while the model had been told all of it was loaded.
+  A group now leaves the request whole, as it leaves the cap, and a smaller
+  older entry may take its place.
 
 ## [2.0.0a23] - 2026-09-27
 
