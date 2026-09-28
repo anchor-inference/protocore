@@ -612,7 +612,7 @@ class TestLoopGroup:
 
     def test_compaction_trigger_turn_headroom_is_dashboard_configurable(self) -> None:
         spec = build_loop_group().spec("compaction_trigger_turn_headroom_ratio")
-        assert spec.default == 0.15
+        assert spec.default == 0.10
         assert spec.minimum == 0.0
         assert spec.maximum == 1.0
         assert spec.exclusive_maximum is True

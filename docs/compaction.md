@@ -232,9 +232,15 @@ user bubble, and seeded into the next run as an operator turn.
 
 ## Budget arithmetic
 
-With `O = W × llm_output_max_tokens_ratio` when the provider reserves the
-output inside the window (`provider_reserves_output_in_context_window`), else
-0:
+With `O = min(W × llm_output_max_tokens_ratio, llm_output_min_tokens)` when the
+provider reserves the output inside the window
+(`provider_reserves_output_in_context_window`), else 0. Every request is fitted
+to the window — its output cap is cut to what the prompt leaves — so the trigger
+keeps back room for a usable answer, not for the whole configured output cap.
+When the ceiling is lower than `W × compaction_trigger_ratio`, the trigger in
+force is the ceiling and every compaction event says so:
+`configured_trigger_tokens` is the configured trigger, `trigger_threshold` the
+one in force and `trigger_limited_by` is `accept_ceiling`.
 
 ```text
 T      = min(W × compaction_trigger_ratio,
@@ -325,7 +331,8 @@ nothing or keep nothing; point the same code at a real provider to measure it.
 | Constant | Default | Role |
 |---|---|---|
 | `compaction_trigger_ratio` | 0.8 | upper bound on `T` as a share of the window |
-| `compaction_trigger_turn_headroom_ratio` | 0.15 | one turn's room below the acceptance ceiling |
+| `compaction_trigger_turn_headroom_ratio` | 0.10 | one turn's room below the acceptance ceiling |
+| `llm_output_min_tokens` | 4096 | answer room the trigger keeps back when smaller than `llm_output_max_tokens_ratio` of the window |
 | `compaction_target_ratio` | 0.6 | where a pass aims, below the trigger |
 | `compaction_emergency_ratio` | 0.95 | the proactive emergency line |
 | `compaction_keep_recent_turns` | 4 | trailing messages kept verbatim, while they fit the bound below |

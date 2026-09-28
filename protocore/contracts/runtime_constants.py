@@ -72,7 +72,7 @@ class LoopConstants(BaseModel):
         ),
     )
     compaction_trigger_turn_headroom_ratio: float = Field(
-        default=0.15,
+        default=0.10,
         ge=0.0,
         lt=1.0,
         description=(
@@ -84,10 +84,10 @@ class LoopConstants(BaseModel):
             "window; and it has to sit a whole turn below it, because the "
             "check runs BEFORE a turn whose tool results can add tens of "
             "thousands of tokens and because the character-based estimate runs "
-            "short of the provider's own count. A sixth of the window is what "
-            "a large tool turn plus that undercount measured at, and it is the "
-            "figure a 65k window running a non-Latin script needs to keep "
-            "proactive compaction reachable at all."
+            "short of the provider's own count. A tenth of the window: a fresh "
+            "tool result is cut to tool_result_truncation_ratio of the window "
+            "where it enters, so one turn's result fits it, and a larger batch "
+            "is what reactive recovery is for."
         ),
     )
     compaction_target_ratio: float = Field(
@@ -1371,6 +1371,17 @@ class LoopConstants(BaseModel):
             "Fraction of ``max_context`` used as ``LLMRequest.max_tokens`` "
             "for assistant-stream calls (default 0.25 — i.e. quarter of "
             "the window reserved for output)."
+        ),
+    )
+    llm_output_min_tokens: int = Field(
+        default=4096,
+        gt=0,
+        description=(
+            "The output budget the compaction trigger keeps back for the "
+            "answer, when it is smaller than llm_output_max_tokens_ratio of the "
+            "window. Every request is fitted to the window — its output cap is "
+            "cut to what the prompt leaves — so the trigger only has to leave "
+            "room for a usable answer, not for the whole configured cap."
         ),
     )
     context_overflow_retry_output_ratio: float = Field(

@@ -615,6 +615,8 @@ class ContextManager:
             tokens_before=tokens_before,
             prompt_before=tokens_before + overhead,
             trigger_tokens=trigger,
+            configured_trigger_tokens=budgets.configured_trigger_tokens,
+            trigger_limited_by=budgets.trigger_limited_by,
             target_tokens=target,
             fixed_tokens=fixed,
         )

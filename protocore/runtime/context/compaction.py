@@ -176,6 +176,10 @@ class CompactionAttempt:
     prompt_before: int = 0
     prompt_after: int = 0
     trigger_tokens: int = 0
+    configured_trigger_tokens: int = 0
+    """``model_context_window * compaction_trigger_ratio``; ``trigger_tokens`` is below it only when clamped."""
+    trigger_limited_by: str = ""
+    """Why ``trigger_tokens`` is below the configured trigger; empty when it is not."""
     target_tokens: int = 0
     fixed_tokens: int = 0
     """What no tier could remove: the overhead plus the protected history. The
@@ -2969,6 +2973,8 @@ def compaction_event_payload(attempt: CompactionAttempt, *, reason: str) -> dict
         "prompt_before": attempt.prompt_before,
         "prompt_after": attempt.prompt_after,
         "trigger_threshold": attempt.trigger_tokens,
+        "configured_trigger_tokens": attempt.configured_trigger_tokens,
+        "trigger_limited_by": attempt.trigger_limited_by,
         "target_tokens": attempt.target_tokens,
         "fixed_tokens": attempt.fixed_tokens,
         "tier1_freed": tier1.tokens_freed if tier1 else 0,

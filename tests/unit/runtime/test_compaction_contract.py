@@ -333,7 +333,13 @@ async def test_the_ledger_carries_what_left_the_window_and_is_never_summarised()
     roles = ToolRoleMap.declare({"Write": [ToolRole.writes_path]})
     llm = _Summariser("drop")
     manager = ContextManager(
-        rc=LoopConstants(model_context_window=32_768, compaction_keep_recent_turns=2),
+        # A trigger low enough that the passes reach the round with the write:
+        # what the ledger must carry is what actually left the window.
+        rc=LoopConstants(
+            model_context_window=32_768,
+            compaction_keep_recent_turns=2,
+            compaction_trigger_ratio=0.55,
+        ),
         blob_store=InMemoryBlobStore(),
         compaction_llm=llm,
         tool_roles=roles,

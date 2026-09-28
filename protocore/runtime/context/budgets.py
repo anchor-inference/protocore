@@ -37,6 +37,14 @@ class TokenBudgets:
     reserve is large is well below the ratio alone.
     """
 
+    configured_trigger_tokens: int
+    """``model_context_window * compaction_trigger_ratio`` — the trigger as configured."""
+
+    trigger_limited_by: str
+    """Why the effective trigger is below the configured one: ``"accept_ceiling"``
+    when the ratio leaves no room for a usable answer, the safety margin and one
+    turn's headroom; empty when the configured trigger is the one in force."""
+
     compaction_emergency_tokens: int
     """Emergency cliff: when current_tokens > this, a proactive
     ``force_compaction`` runs before the LLM call (both tiers, unconditional)
@@ -92,8 +100,11 @@ def derive_budgets(rc: LoopConstants) -> TokenBudgets:
     # overflows. A trigger above the ceiling is unreachable: the provider
     # rejects the request before the history ever grows into it, and proactive
     # compaction never runs at all.
+    # Requests are fitted to the window (their output cap is cut to what the
+    # prompt leaves), so the trigger keeps back room for a usable answer rather
+    # than for the whole configured output cap.
     output_reserve = (
-        int(max_context * rc.llm_output_max_tokens_ratio)
+        min(int(max_context * rc.llm_output_max_tokens_ratio), rc.llm_output_min_tokens)
         if rc.provider_reserves_output_in_context_window
         else 0
     )
@@ -103,7 +114,9 @@ def derive_budgets(rc: LoopConstants) -> TokenBudgets:
         - rc.request_context_safety_tokens
         - int(max_context * rc.compaction_trigger_turn_headroom_ratio)
     )
-    compaction_trigger = max(1, min(int(max_context * rc.compaction_trigger_ratio), accept_ceiling))
+    configured_trigger = int(max_context * rc.compaction_trigger_ratio)
+    compaction_trigger = max(1, min(configured_trigger, accept_ceiling))
+    trigger_limited_by = "accept_ceiling" if compaction_trigger < configured_trigger else ""
     compaction_emergency = max(
         int(max_context * rc.compaction_emergency_ratio), compaction_trigger + 1
     )
@@ -126,6 +139,8 @@ def derive_budgets(rc: LoopConstants) -> TokenBudgets:
     return TokenBudgets(
         max_context=max_context,
         compaction_trigger_tokens=compaction_trigger,
+        configured_trigger_tokens=configured_trigger,
+        trigger_limited_by=trigger_limited_by,
         compaction_emergency_tokens=compaction_emergency,
         tool_result_truncation_threshold=tool_result_threshold,
         system_prompt_max_tokens=system_prompt_max,

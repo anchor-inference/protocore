@@ -54,15 +54,18 @@ def test_token_budgets_is_frozen_dataclass() -> None:
 
 def test_the_trigger_sits_below_the_prompt_size_the_provider_still_accepts() -> None:
     """A server that reserves the output budget inside the window rejects any
-    prompt above ``window - max output``. With the stock ratios on a 65 536
-    window the ratio alone would put the trigger ABOVE that cliff, so proactive
-    compaction could never fire before the rejection."""
+    prompt above ``window - output``. Requests are fitted to the window, so the
+    output a prompt near the trigger is sent with is what the window leaves, and
+    the trigger has to leave room for a usable answer — ``llm_output_min_tokens``
+    — the safety margin and one turn, not for the whole configured output cap."""
     rc = LoopConstants(model_context_window=65_536)
     budgets = derive_budgets(rc)
 
-    output_cap = int(rc.model_context_window * rc.llm_output_max_tokens_ratio)
+    usable_output = min(
+        int(rc.model_context_window * rc.llm_output_max_tokens_ratio), rc.llm_output_min_tokens
+    )
     accepted_prompt_ceiling = (
-        rc.model_context_window - output_cap - rc.request_context_safety_tokens
+        rc.model_context_window - usable_output - rc.request_context_safety_tokens
     )
     assert budgets.compaction_trigger_tokens < accepted_prompt_ceiling
     # And a whole turn below it, not merely one token.
@@ -70,8 +73,8 @@ def test_the_trigger_sits_below_the_prompt_size_the_provider_still_accepts() -> 
         accepted_prompt_ceiling - budgets.compaction_trigger_tokens
         >= int(rc.model_context_window * rc.compaction_trigger_turn_headroom_ratio)
     )
-    # The ratio on its own would have been unreachable.
-    assert int(rc.model_context_window * rc.compaction_trigger_ratio) > accepted_prompt_ceiling
+    # The configured ratio is the trigger in force.
+    assert budgets.compaction_trigger_tokens == int(rc.model_context_window * rc.compaction_trigger_ratio)
 
 
 def test_the_ratio_still_binds_when_it_is_the_lower_of_the_two() -> None:
@@ -102,34 +105,29 @@ def test_an_output_reserve_that_leaves_no_headroom_is_refused() -> None:
 def test_a_provider_that_does_not_reserve_output_keeps_that_share_of_the_window() -> None:
     """The output-reserve deduction answers a serving stack that counts the
     requested output against the same window as the prompt. A provider that
-    sizes its input window independently gives that share back."""
+    sizes its input window independently gives that share back — visible where
+    the ceiling, not the ratio, binds."""
     window = 65_536
-    reserving = derive_budgets(LoopConstants(model_context_window=window))
+    reserving = derive_budgets(LoopConstants(model_context_window=window, compaction_trigger_ratio=0.9))
     independent = derive_budgets(
         LoopConstants(
             model_context_window=window,
+            compaction_trigger_ratio=0.9,
             provider_reserves_output_in_context_window=False,
         )
     )
-    rc = LoopConstants(model_context_window=window)
     assert independent.compaction_trigger_tokens > reserving.compaction_trigger_tokens
-    # Without the reserve the ceiling rises above the configured ratio, which
-    # then binds — the operator gets back the trigger the ratio asks for.
-    assert independent.compaction_trigger_tokens == int(window * 0.8)
-    assert (
-        window
-        - rc.request_context_safety_tokens
-        - int(window * rc.compaction_trigger_turn_headroom_ratio)
-    ) > int(window * 0.8)
+    assert reserving.trigger_limited_by == "accept_ceiling"
 
 
 def test_the_reserve_is_deducted_by_default_so_a_reserving_server_is_covered() -> None:
     rc = LoopConstants(model_context_window=65_536)
     assert rc.provider_reserves_output_in_context_window is True
     budgets = derive_budgets(rc)
-    assert budgets.compaction_trigger_tokens == (
+    ceiling = (
         65_536
-        - int(65_536 * rc.llm_output_max_tokens_ratio)
+        - min(int(65_536 * rc.llm_output_max_tokens_ratio), rc.llm_output_min_tokens)
         - rc.request_context_safety_tokens
         - int(65_536 * rc.compaction_trigger_turn_headroom_ratio)
     )
+    assert budgets.compaction_trigger_tokens == min(int(65_536 * rc.compaction_trigger_ratio), ceiling)

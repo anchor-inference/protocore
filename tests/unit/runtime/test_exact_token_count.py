@@ -389,7 +389,8 @@ async def test_the_gate_reads_the_count_near_the_trigger(engine_factory: Any) ->
     engine = engine_factory(rc=rc)
     provider = _CountingProvider(count=rc.model_context_window)
     _install(engine, provider)
-    engine.history.append(_msg("0123456789abcdef" * 6_000))
+    # Within the margin below the trigger, and still under it by the estimate.
+    engine.history.append(_msg("0123456789abcdef" * 6_600))
     assert not engine.needs_compaction()
 
     await _calibrate_near_compaction_trigger(engine)

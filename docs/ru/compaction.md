@@ -248,8 +248,15 @@
 
 ## Арифметика бюджета
 
-При `O = W × llm_output_max_tokens_ratio`, если провайдер резервирует вывод
-внутри окна (`provider_reserves_output_in_context_window`), иначе 0:
+При `O = min(W × llm_output_max_tokens_ratio, llm_output_min_tokens)`, если
+провайдер резервирует вывод внутри окна
+(`provider_reserves_output_in_context_window`), иначе 0. Каждый запрос
+подгоняется под окно — его лимит вывода урезается до того, что оставляет
+промпт, — поэтому порог оставляет место для полезного ответа, а не для всего
+настроенного лимита. Если потолок ниже `W × compaction_trigger_ratio`, действует
+потолок, и каждое событие компакции это показывает: `configured_trigger_tokens`
+— настроенный порог, `trigger_threshold` — действующий, `trigger_limited_by` —
+`accept_ceiling`.
 
 ```text
 T      = min(W × compaction_trigger_ratio,
@@ -344,7 +351,8 @@ JSON, отвечают незакрытым JSON, не отвечают ниче
 | Константа | По умолчанию | Роль |
 |---|---|---|
 | `compaction_trigger_ratio` | 0,8 | верхняя граница `T` как доли окна |
-| `compaction_trigger_turn_headroom_ratio` | 0,15 | запас в один ход ниже потолка приёма |
+| `compaction_trigger_turn_headroom_ratio` | 0,10 | запас в один ход ниже потолка приёма |
+| `llm_output_min_tokens` | 4096 | место под ответ, которое оставляет порог, если оно меньше `llm_output_max_tokens_ratio` окна |
 | `compaction_target_ratio` | 0,6 | куда целится проход, ниже триггера |
 | `compaction_emergency_ratio` | 0,95 | проактивная аварийная черта |
 | `compaction_keep_recent_turns` | 4 | последние сообщения, сохраняемые дословно, пока укладываются в предел ниже |

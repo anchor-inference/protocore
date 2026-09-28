@@ -10,6 +10,17 @@ All notable changes to this project are recorded here. The format follows
 
 - `LoopConstants.compaction_keep_recent_max_ratio` (default 0.25): the share of
   the compaction trigger the kept tail may hold.
+- `LoopConstants.llm_output_min_tokens` (default 4096): the answer room the
+  compaction trigger keeps back.
+- `TokenBudgets.configured_trigger_tokens` and `TokenBudgets.trigger_limited_by`,
+  also carried by `compaction_started` and `compaction_completed`
+  (`configured_trigger_tokens`, `trigger_limited_by`).
+
+### Changed
+
+- `compaction_trigger_turn_headroom_ratio` defaults to 0.10 (was 0.15): a fresh
+  tool result is now cut to `tool_result_truncation_ratio` of the window where
+  it enters, so one turn fits a tenth of it.
 
 ### Fixed
 
@@ -34,6 +45,15 @@ All notable changes to this project are recorded here. The format follows
   and never the unread batch of results or the message that asked for it. When
   the fixed part is still at or over the trigger, a routine pass runs only the
   model-free tiers; a forced or reactive pass keeps its model tiers.
+- **The configured `compaction_trigger_ratio` is the trigger in force, and a
+  clamp is visible.** The trigger was the lower of the ratio and a ceiling that
+  kept back the whole configured output cap (`llm_output_max_tokens_ratio` of
+  the window) although every request is fitted to the window, so on a 65k window
+  a ratio of 0.8 became 0.57 without a word anywhere. The ceiling now keeps back
+  `min(that cap, llm_output_min_tokens)`; on a 65k window the default 0.8 is the
+  trigger. A ratio the ceiling still clamps is reported by
+  `configured_trigger_tokens` and `trigger_limited_by` on the budgets and on
+  every compaction event.
 
 ## [2.0.0a24] - 2026-09-28
 
