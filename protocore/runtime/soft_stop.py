@@ -324,9 +324,17 @@ def restore(engine: QueryEngine) -> None:
 
     The wind-down state travels in the snapshot; the notice travels in history
     only while the run drives (see :func:`leave`). A run resumed from a snapshot
-    taken after its end is still bound — its surface is empty — and the model
+    taken while it was winding down is still bound — its surface is empty — and the model
     must read why, or it meets an empty surface with no explanation.
+
+    A snapshot of a run that already ended is not wound down in that sense: the
+    run is over, :func:`leave` took the notice out when it settled, and its next
+    turn (after :meth:`~protocore.runtime.query_engine.QueryEngine.rearm`) has
+    every tool back. Restoring the notice there would make "your tools are gone"
+    that turn's last instruction.
     """
+    if engine.is_terminal:
+        return
     if is_armed(engine) and not _has_notice(engine):
         _append_notice(engine, cause_name=cause(engine) or "")
 

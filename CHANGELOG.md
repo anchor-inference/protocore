@@ -6,6 +6,15 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A settled wound-down run resumed from its snapshot no longer gets the
+  wind-down notice back.** `resume_from_snapshot` restored the notice for every
+  snapshot whose wind-down state was armed, a finished run's included, and
+  `rearm` kept it, so the next turn opened with "your tools are gone" although
+  every tool was back. The notice is now restored only for a run that is not
+  terminal, and `rearm` removes any notice left in history.
+
 ## [2.0.0a23] - 2026-09-27
 
 ### Changed

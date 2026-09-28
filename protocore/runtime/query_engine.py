@@ -2329,6 +2329,13 @@ class QueryEngine:
         # shed, which units the summariser cannot handle — but its retry
         # budgets are allowances sized for one question, like the rest.
         self.compaction_state.reset_retries()
+        # The wind-down notice speaks to the run that was wound down; the next
+        # turn has its tools back. A settled drive already took it out, but a
+        # history that reached this engine another way (a snapshot, a host
+        # splice) may still carry one, and it would be the new turn's last word.
+        from protocore.runtime import soft_stop as _soft_stop
+
+        _soft_stop.leave(self)
 
     def transition_to(self, new_state: LoopState) -> None:
         """Validate then apply a state transition.
