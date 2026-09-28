@@ -639,7 +639,23 @@ class LoopConstants(BaseModel):
     compaction_keep_recent_turns: int = Field(
         default=4,
         gt=0,
-        description="Last-N turns kept verbatim across compaction.",
+        description=(
+            "Last-N messages kept verbatim across compaction, as long as they fit "
+            "compaction_keep_recent_max_ratio of the trigger."
+        ),
+    )
+    compaction_keep_recent_max_ratio: float = Field(
+        default=0.25,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Share of the compaction trigger the kept tail may hold. The last "
+            "compaction_keep_recent_turns messages are kept while they fit it, and "
+            "no fewer than compaction_force_keep_recent_turns: recent messages that "
+            "carry large tool results are not protected past this bound, so the "
+            "part of the prompt a pass cannot change stays below the trigger. The "
+            "batch of results just produced is protected on its own."
+        ),
     )
     compaction_force_keep_recent_turns: int = Field(
         default=1,

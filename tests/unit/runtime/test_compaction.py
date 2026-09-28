@@ -118,9 +118,11 @@ async def test_tier1_skips_small_tool_results() -> None:
 
 @pytest.mark.asyncio
 async def test_tier1_respects_recent_turn_anchor() -> None:
-    rc = LoopConstants(model_context_window=4_096)
+    # The kept tail is allowed the whole trigger here, so the anchor alone
+    # decides what is protected.
+    rc = LoopConstants(model_context_window=4_096, compaction_keep_recent_max_ratio=1.0)
     blobs = InMemoryBlobStore()
-    big = "Y" * 6000
+    big = "Y" * 4000  # over the masking threshold, within the kept-tail bound
     history = [
         Message(role=MessageRole.tool, content_blocks=[
             ToolResultBlock(tool_call_id="t1", content=big),

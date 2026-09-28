@@ -628,16 +628,46 @@ def _effective_eligible_upper(
     history: list[Message],
     keep: int,
     protect_tail_from_index: int | None,
+    rc: LoopConstants,
 ) -> int:
     """Compute ``eligible_upper`` honouring keep-window + current-batch guard.
 
     The base is ``max(0, len(history) - keep)`` (the trailing keep-window is
-    never eligible). When ``protect_tail_from_index`` is set (per-iteration
+    never eligible), narrowed to the messages that fit
+    ``compaction_keep_recent_max_ratio`` of the trigger: a keep window counted
+    in messages alone protects whatever they weigh, and recent messages that
+    carry large results then hold the unchangeable part of the prompt above the
+    trigger. At least ``compaction_force_keep_recent_turns`` of them are kept
+    whatever they weigh. When ``protect_tail_from_index`` is set (per-iteration
     gate), the eligible region is additionally clamped so that
     NO message at or after that index is eligible — protecting the current
     just-executed tool-result batch on top of the keep window.
     """
-    eligible_upper = max(0, len(history) - keep)
+    from protocore.runtime.context.budgets import derive_budgets
+
+    cap = int(derive_budgets(rc).compaction_trigger_tokens * rc.compaction_keep_recent_max_ratio)
+    # A batch of results the model has not read yet is never given up to the
+    # bound, nor is the message that asked for it: shedding it would hand the
+    # model placeholders for answers it has not seen.
+    unread = 0
+    while unread < len(history) and history[len(history) - 1 - unread].role is MessageRole.tool:
+        unread += 1
+    if unread and unread < len(history):
+        asking = history[len(history) - 1 - unread]
+        if asking.role is MessageRole.assistant and any(
+            isinstance(block, ToolUseBlock) for block in asking.content_blocks
+        ):
+            unread += 1
+    always = min(keep, max(rc.compaction_force_keep_recent_turns, unread))
+    kept = 0
+    held = 0
+    while kept < keep and kept < len(history):
+        weight = estimate_message_tokens(history[len(history) - 1 - kept], rc)
+        if kept >= always and held + weight > cap:
+            break
+        held += weight
+        kept += 1
+    eligible_upper = max(0, len(history) - kept)
     if protect_tail_from_index is not None:
         eligible_upper = min(eligible_upper, max(0, protect_tail_from_index))
     return eligible_upper
@@ -763,7 +793,7 @@ def tier1_has_work(
     if not history:
         return False
     keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
-    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index)
+    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index, rc)
     for message in history[:eligible_upper]:
         if _tier1_sheds_reasoning(message, rc) and estimate_tokens(
             message.reasoning_content or "", rc
@@ -918,7 +948,7 @@ async def run_tier1_truncation(
         return Tier1Result(tokens_freed=0, blob_refs_created=(), messages_modified=0)
 
     keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
-    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index)
+    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index, rc)
     preview_cap = rc.compaction_placeholder_preview_chars
 
     # Hoisted out of the loop: naming the tool behind a shed result per block
@@ -1789,7 +1819,7 @@ def _plan_tier2(
     the keep window leaves nothing eligible at all.
     """
     keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
-    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index)
+    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index, rc)
     if eligible_upper == 0:
         return None
 
@@ -2485,7 +2515,7 @@ def tier3_has_work(
     if not history or not rc.compaction_fold_enabled or rc.compaction_fold_max_spans_per_pass < 1:
         return False
     keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
-    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index)
+    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index, rc)
     if eligible_upper == 0:
         return False
     return bool(
@@ -2543,7 +2573,7 @@ async def run_tier3_fold(
     if not history or not rc.compaction_fold_enabled:
         return Tier3Result(spans_folded=0, messages_folded=0, tokens_freed=0)
     keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
-    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index)
+    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index, rc)
     if eligible_upper == 0:
         return Tier3Result(spans_folded=0, messages_folded=0, tokens_freed=0)
     spans = [
@@ -2647,7 +2677,7 @@ def _floor_units(
     closed pairing component, exactly as for Tier 2.
     """
     keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
-    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index)
+    eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index, rc)
     if eligible_upper == 0:
         return []
     protected: set[int] = set(_compaction_reference_indices(history))

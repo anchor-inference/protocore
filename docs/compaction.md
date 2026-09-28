@@ -182,8 +182,12 @@ second copy.
 
 The first user turn of the run (the task), the ledger, frozen reference blocks
 (they may be blobbed by masking), the `compaction_keep_recent_turns` trailing
-messages (one after a provider refusal), and the batch of tool results the
-model has not read yet. Outside reactive recovery, turns seeded from an
+messages (one after a provider refusal) as long as they fit
+`compaction_keep_recent_max_ratio` of the trigger, and the batch of tool
+results the model has not read yet with the message that asked for it. When
+this fixed part is still at or over the trigger, a routine pass runs only the
+model-free tiers: the summariser cannot bring the prompt under the trigger
+then, and is not called for nothing on every iteration. Outside reactive recovery, turns seeded from an
 earlier run are untouched; reactive recovery may compact them, never in one
 span with this run's turns, and every replacement keeps the seed tag. An
 operator's turn is never summarised; a fold or the floor may take it only
@@ -324,7 +328,8 @@ nothing or keep nothing; point the same code at a real provider to measure it.
 | `compaction_trigger_turn_headroom_ratio` | 0.15 | one turn's room below the acceptance ceiling |
 | `compaction_target_ratio` | 0.6 | where a pass aims, below the trigger |
 | `compaction_emergency_ratio` | 0.95 | the proactive emergency line |
-| `compaction_keep_recent_turns` | 4 | trailing messages kept verbatim |
+| `compaction_keep_recent_turns` | 4 | trailing messages kept verbatim, while they fit the bound below |
+| `compaction_keep_recent_max_ratio` | 0.25 | share of the trigger the kept tail may hold; at least `compaction_force_keep_recent_turns` messages and the unread batch are kept whatever they weigh |
 | `compaction_force_keep_recent_turns` | 1 | the same after a provider refusal |
 | `tool_result_truncation_ratio` | 0.10 | the most one tool result may take: a larger fresh result is cut to its head where it enters (the whole value stored, its reference named), and an older output this size is masked whatever its age |
 | `compaction_mask_keep_recent_results` | 8 | outputs never masked for age |

@@ -6,6 +6,11 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `LoopConstants.compaction_keep_recent_max_ratio` (default 0.25): the share of
+  the compaction trigger the kept tail may hold.
+
 ### Fixed
 
 - **A tool result larger than the per-result limit is cut where it enters the
@@ -18,6 +23,17 @@ All notable changes to this project are recorded here. The format follows
   its head within the limit and a line naming the stored reference, and the
   reference becomes the result's `canonical_ref`. The result's metadata carries
   `protocore.tool_result_cut_on_entry` (`TOOL_RESULT_CUT_ON_ENTRY_METADATA_KEY`).
+- **The kept tail is bounded in tokens, and a pass that cannot reach the
+  trigger calls no summariser.** The routine keep window protected the last
+  `compaction_keep_recent_turns` messages whatever they weighed, so recent
+  messages carrying large tool results held the part of the prompt a pass
+  cannot change above the trigger: every pass ended at the floor and the
+  summariser was called on every iteration for nothing. The tail now keeps
+  those messages only while they fit `compaction_keep_recent_max_ratio` (new,
+  0.25) of the trigger — never fewer than `compaction_force_keep_recent_turns`,
+  and never the unread batch of results or the message that asked for it. When
+  the fixed part is still at or over the trigger, a routine pass runs only the
+  model-free tiers; a forced or reactive pass keeps its model tiers.
 
 ## [2.0.0a24] - 2026-09-28
 

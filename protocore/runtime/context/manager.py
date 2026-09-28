@@ -596,6 +596,21 @@ class ContextManager:
         )
         ceiling = min(trigger, tokens_before + overhead)
         target = max(1, fixed + int(max(0, ceiling - fixed) * rc.compaction_target_ratio))
+        # A fixed part at or over the trigger cannot be brought under it by
+        # anything the model tiers do: they only reach the removable history,
+        # and the prompt stays over the trigger whatever they write. For the
+        # routine gate, calling the summariser then buys nothing, and the gate
+        # would call it again on the next iteration; the model-free tiers still
+        # run. A forced or reactive pass is answering a request that does not
+        # fit the window rather than the trigger, and keeps its model tiers.
+        model_tiers = llm_tiers and (forced or reactive or fixed < trigger)
+        if llm_tiers and not model_tiers:
+            _logger.warning(
+                "DIAG compaction.summariser_skipped fixed=%d trigger=%d — the part "
+                "of the prompt a pass cannot change is at or over the trigger",
+                fixed,
+                trigger,
+            )
         attempt = CompactionAttempt(
             tokens_before=tokens_before,
             prompt_before=tokens_before + overhead,
@@ -635,7 +650,7 @@ class ContextManager:
             tier_error = exc
             attempt.tier1 = Tier1Result(tokens_freed=0, blob_refs_created=(), messages_modified=0)
 
-        if llm_tiers and self._compaction_llm is not None and need() > 0:
+        if model_tiers and self._compaction_llm is not None and need() > 0:
             try:
                 attempt.tier2 = await run_tier2_summarisation(
                     history=history,
@@ -664,7 +679,7 @@ class ContextManager:
                 tier_error = tier_error or exc
                 attempt.tier2 = Tier2Result(turns_summarised=0, tokens_freed=0)
 
-        if llm_tiers and need() > 0:
+        if model_tiers and need() > 0:
             attempt.tier3 = await self._fold(
                 history,
                 compaction_state,
