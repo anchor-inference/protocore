@@ -26,6 +26,12 @@ All notable changes to this project are recorded here. The format follows
   a `subagent_tool_allowlist` was shown groups every load of which came back
   empty and every call of which the gate refused. The would-be surface is now
   narrowed to the declared set first, as dispatch narrows it.
+- **The deferral decision is made again when the execution profile changes.**
+  It was keyed on the host's policy but not on the profile, which reshapes the
+  same surface: planned under a plan profile that admitted none of a server's
+  tools, it held nothing back, and when the profile ended mid-run the whole
+  server landed on the surface instead of in the catalogue. The profile and
+  the child's declared tool set are part of the key now.
 
 ## [2.0.0a23] - 2026-09-27
 

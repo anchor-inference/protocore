@@ -564,8 +564,12 @@ def _catalogue_key(engine: QueryEngine) -> tuple[Any, ...]:
     mid-run replaces the policy and registers nothing, when the tools were
     already registered for another session; keyed on the catalogue alone, the
     decision went stale and those tools reached the surface whole, however
-    many there were. The pins the run adds for the tools it loaded are left
-    out: loading a tool must not reopen the decision.
+    many there were. So is the execution profile, which reshapes the policy
+    the candidates come from in the same way: planned under a plan profile
+    that admitted none of a server's tools, the decision held nothing back,
+    and when the profile ended mid-run the server landed on the surface
+    whole. The pins the run adds for the tools it loaded are left out:
+    loading a tool must not reopen the decision.
     """
     policy = engine.config.tool_visibility_policy
     return (
@@ -578,6 +582,8 @@ def _catalogue_key(engine: QueryEngine) -> tuple[Any, ...]:
         frozenset(policy.blocked),
         frozenset(policy.pinned),
         policy.forced_pinned,
+        engine.config.execution_profile,
+        frozenset(engine.config.subagent_tool_allowlist),
     )
 
 

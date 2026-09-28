@@ -379,11 +379,15 @@ deferral decision is keyed on.
 ### When groups are held back
 
 `tool_deferral_mode` is `"auto"` by default and `"off"` turns it off. In `auto`,
-once per run — and again only if the registry's catalogue or groups, or the
-host's visibility policy, change — the loop measures the surface it would
-otherwise send. The policy counts because a host may switch tools on mid-run by
-replacing it, registering nothing; the pins the run adds for tools it loaded do
-not, so loading a tool never reopens the decision:
+once per run — and again only if the registry's catalogue or groups, the
+host's visibility policy, the execution profile or the child's declared tool set
+change — the loop measures the surface it would otherwise send. The policy
+counts because a host may switch tools on mid-run by replacing it, registering
+nothing; the profile counts because it reshapes the same surface — planned
+under a plan profile that admitted none of a server's tools, a decision that
+held nothing back would otherwise stand when the profile ended, and the server
+would land on the surface whole; the pins the run adds for tools it loaded do
+not count, so loading a tool never reopens the decision:
 
 1. every **lazy** group is held back, largest first, when a discovery tool is
    admitted;

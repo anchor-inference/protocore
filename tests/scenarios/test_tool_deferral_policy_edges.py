@@ -282,13 +282,6 @@ class _LeavePlan(ScriptedTool):
         return await super().invoke(context, arguments)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "_catalogue_key carries the host's visibility policy but not the execution "
-        "profile, which also reshapes the effective policy the decision is planned from"
-    ),
-)
 async def test_a_dynamic_group_a_profile_change_admits_is_held_back(
     scenario: ScenarioFactory,
 ) -> None:
