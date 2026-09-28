@@ -1,16 +1,14 @@
 """A long Russian message must not lose the words that name the tool.
 
-Past 25 distinct terms the query keeps the terms with the highest catalogue
-idf. A Russian word reaches an English catalogue only through the lexicon, so
-its own idf is 0, every Russian term ties, and the tie is broken by the term
-itself: the 25 alphabetically first stems survive. Which Russian words decide
-the ranking then depends on the alphabet, not on the words.
+Past 25 distinct terms the query keeps the terms that can add the most to a
+score. A Russian word reaches an English catalogue only through the lexicon, so
+its own idf is 0; ranked by that alone, every Russian term ties and the 25
+alphabetically first stems survive, whichever words named the tool. A term is
+therefore worth the idf of its rarest expansion, at the expansion weight.
 """
 # ruff: noqa: RUF001 — Russian queries are the point of this file
 
 from __future__ import annotations
-
-import pytest
 
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_retrieval import RetrievalSettings, ToolDocument
@@ -32,13 +30,6 @@ _CONTEXT = (
 )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the query-term cap ranks terms by catalogue idf only; lexicon-bridged "
-        "Russian terms all score 0 and are cut alphabetically"
-    ),
-)
 def test_the_request_at_the_end_of_a_long_russian_message_is_kept() -> None:
     index = ToolIndex(
         AnalyzedCatalogue(_CATALOGUE),
@@ -48,3 +39,25 @@ def test_the_request_at_the_end_of_a_long_russian_message_is_kept() -> None:
     request = "Сделай скриншот страницы."
     assert index.rank(request, 1) == ["BrowserScreenshot"]
     assert index.rank(_CONTEXT + request, 1) == ["BrowserScreenshot"]
+
+
+def _index(lexicon: Lexicon | None) -> ToolIndex:
+    return ToolIndex(
+        AnalyzedCatalogue(_CATALOGUE),
+        RetrievalSettings.from_constants(LoopConstants()),
+        lexicon,
+    )
+
+
+def test_terms_that_can_add_nothing_are_dropped_before_the_cap() -> None:
+    weights = _index(Lexicon.bundled()).weighted_query(_CONTEXT + "Сделай скриншот страницы.")
+    assert "скриншот" in weights
+    # Words with no catalogue term and no expansion are not kept at all.
+    assert "бухгалтер" not in weights
+    assert "screenshot" in weights
+
+
+def test_without_a_lexicon_the_cap_keeps_the_rarest_catalogue_terms() -> None:
+    filler = " ".join(f"word{index}" for index in range(40))
+    weights = _index(None).weighted_query(f"{filler} screenshot container")
+    assert set(weights) == {"screenshot", "contain"}

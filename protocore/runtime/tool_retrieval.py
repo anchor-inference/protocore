@@ -53,8 +53,8 @@ BUNDLED_LEXICON_RESOURCE: Final[str] = "tool_retrieval_lexicon.json"
 
 # A pasted log or a long message can carry hundreds of distinct words; scoring
 # all of them costs time and lets common words drown the few that name a tool.
-# Past this many distinct terms, only the rarest (highest idf) are kept — the
-# approach of Elasticsearch's more_like_this. Not a tunable: it bounds cost
+# Past this many distinct terms, only the rarest (highest idf, counting the idf
+# a term reaches through the lexicon) are kept. Not a tunable: it bounds cost
 # rather than shaping relevance, and ordinary queries never reach it.
 _MAX_QUERY_TERMS: Final[int] = 25
 
@@ -396,7 +396,16 @@ class ToolIndex:
         terms = self._catalogue.query_terms(query)
         distinct = set(terms)
         if len(distinct) > _MAX_QUERY_TERMS:
-            keep = set(sorted(distinct, key=lambda term: (-self._idf.get(term, 0.0), term))[:_MAX_QUERY_TERMS])
+            # A term's worth is what it can add to a score: its own idf, or,
+            # for a word that reaches the catalogue only through the lexicon
+            # (every Russian word against English tools), the idf of its
+            # rarest expansion at the expansion weight. Ranking by the term's
+            # own idf alone gave every Russian word 0, and the tie-break by
+            # spelling then decided which words of a long message were heard.
+            # Terms that can add nothing are dropped before the cap.
+            worth = {term: self._effective_idf(term) for term in distinct}
+            ranked = sorted((term for term in distinct if worth[term] > 0), key=lambda term: (-worth[term], term))
+            keep = set(ranked[:_MAX_QUERY_TERMS])
             terms = [term for term in terms if term in keep]
         weights: dict[str, float] = {}
         for term in terms:
@@ -407,6 +416,15 @@ class ToolIndex:
                 for target in self._lexicon.expand(term):
                     weights[target] = weights.get(target, 0.0) + expansion_weight
         return weights
+
+    def _effective_idf(self, term: str) -> float:
+        """The largest idf ``term`` brings into a score, directly or through the lexicon."""
+        worth = self._idf.get(term, 0.0)
+        if self._lexicon is not None:
+            weight = self._settings.lexicon_weight
+            for target in self._lexicon.expand(term):
+                worth = max(worth, weight * self._idf.get(target, 0.0))
+        return worth
 
     def scores(self, query: str) -> dict[int, float]:
         """Document position -> BM25F score, for documents that score at all."""

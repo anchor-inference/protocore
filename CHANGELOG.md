@@ -16,6 +16,13 @@ All notable changes to this project are recorded here. The format follows
   stems of its imperatives, and `Lexicon.expand` looks a stem it does not know
   up once more without a perfective prefix. The bundled lexicon gains
   "искать"/"поискать", "compare" and "translate".
+- **A long Russian message keeps the words that name the tool.** Past 25
+  distinct terms a query keeps the rarest, and rarity was the term's own idf in
+  the catalogue — 0 for every Russian word against English tools, so the 25
+  alphabetically first stems survived and a request at the end of a long
+  message could be cut. A term is now worth the larger of its own idf and its
+  rarest lexicon expansion's idf at `tool_retrieval_lexicon_weight`, and terms
+  that can add nothing to a score are dropped before the cap.
 
 ## [2.0.0a23] - 2026-09-27
 
