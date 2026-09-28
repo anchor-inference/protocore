@@ -87,6 +87,15 @@ ToolGroupLoad = Literal["eager", "auto", "lazy"]
 
 TOOL_GROUP_LOADS: Final[tuple[str, ...]] = ("eager", "auto", "lazy")
 
+#: The most characters a group's :attr:`ToolGroup.instructions` may run to.
+#: Rules go into the system prompt beside a group on the surface and into the
+#: result that loads one, and they are counted against the tool-definition
+#: budget like the definitions; but a group that cannot be held back (pinned or
+#: eager) puts them into every request whatever the budget says, so their
+#: length is bounded where the group is declared. Two pages of rules, roughly:
+#: rules longer than that belong in a skill the model loads when it needs it.
+TOOL_GROUP_INSTRUCTIONS_MAX_CHARS: Final[int] = 8_000
+
 
 class ToolVisibilityPolicy(BaseModel):
     """Per-tenant tool-visibility policy.
@@ -196,7 +205,9 @@ class ToolGroup(BaseModel):
     Written into the prompt beside the tools only when they are in front of
     the model: a rule about tools the run never loads is tokens spent on
     nothing, and a rule next to a tool list the model cannot see yet is
-    easily taken for a rule about something else.
+    easily taken for a rule about something else. Counted against the
+    tool-definition budget with the group's definitions, and at most
+    :data:`TOOL_GROUP_INSTRUCTIONS_MAX_CHARS` long.
     """
 
 
@@ -211,8 +222,10 @@ def make_tool_group(
 ) -> ToolGroup:
     """The :class:`ToolGroup` a ``declare_group`` call describes, checked.
 
-    One place for every registry to build it, so an unknown load mode is
-    refused with the same message whichever registry a host wired.
+    One place for every registry to build it, so an unknown load mode, or
+    rules over :data:`TOOL_GROUP_INSTRUCTIONS_MAX_CHARS`, are refused with the
+    same message whichever registry a host wired — at the declaration, where
+    the host can fix them, rather than at a run's first request.
     """
     if not name:
         raise ValueError("a tool group needs a name")
@@ -220,13 +233,19 @@ def make_tool_group(
         raise ValueError(
             f"tool group {name!r}: load must be one of {TOOL_GROUP_LOADS!r}, got {load!r}"
         )
+    rules = instructions.strip()
+    if len(rules) > TOOL_GROUP_INSTRUCTIONS_MAX_CHARS:
+        raise ValueError(
+            f"tool group {name!r}: instructions run to {len(rules)} characters, "
+            f"over the {TOOL_GROUP_INSTRUCTIONS_MAX_CHARS} allowed"
+        )
     return ToolGroup(
         name=name,
         description=description,
         dynamic=dynamic,
         prefix=prefix or "",
         load=cast(ToolGroupLoad, load),
-        instructions=instructions.strip(),
+        instructions=rules,
     )
 
 
@@ -383,6 +402,7 @@ __all__ = [
     "TOOLS_LOADED_METADATA_KEY",
     "TOOL_ALLOWLIST_METADATA_KEY",
     "TOOL_GROUPS_LOADED_METADATA_KEY",
+    "TOOL_GROUP_INSTRUCTIONS_MAX_CHARS",
     "TOOL_GROUP_LOADS",
     "TOOL_GROUP_RULES_GIVEN_METADATA_KEY",
     "TOOL_GROUP_RULES_MARK_METADATA_KEY",

@@ -367,8 +367,21 @@ def _choose_deferred(
     load = {name: _load_of(name, declared, overrides) for name in members}
 
     tokens_of = {tool.name: _definition_tokens(tool.definition, rc) for tool in tools}
+    # A group on the surface costs its rules too: they go into the catalogue
+    # beside it on every request. Counted with the definitions, so a group
+    # whose rules alone are over the budget is held back and gives them once,
+    # in the result that loads it, instead of filling the window before the
+    # first request.
+    rules_tokens = {
+        name: (
+            estimate_tokens(group_rules_text(name, declared[name].instructions), rc)
+            if name in declared and declared[name].instructions
+            else 0
+        )
+        for name in members
+    }
     group_tokens = {
-        name: sum(tokens_of[tool.name] for tool in grouped)
+        name: sum(tokens_of[tool.name] for tool in grouped) + rules_tokens[name]
         for name, grouped in members.items()
     }
 
@@ -379,7 +392,7 @@ def _choose_deferred(
     discovery_count = sum(1 for tool in tools if tool.name in discovery_names)
     # The surface as it goes out when nothing is held back carries no
     # discovery tool, so that is the one measured against the limits.
-    plain_tokens = sum(tokens_of.values()) - discovery_tokens
+    plain_tokens = sum(tokens_of.values()) - discovery_tokens + sum(rules_tokens.values())
     plain_count = len(tools) - discovery_count
     # The same budget the context layers are sized with; until this module it
     # was computed and never held to anything.

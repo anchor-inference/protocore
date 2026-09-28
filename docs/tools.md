@@ -330,8 +330,10 @@ registry.register(ToolSearchTool(registry))
 `contracts/tool_registry.py`, and `IToolRegistry` gains `declare_group` and
 `tool_groups`. `declare_group(name, description, *, dynamic=False, prefix=None,
 load="auto", instructions="")` refuses a load mode outside
-`TOOL_GROUP_LOADS`; redeclaring a group replaces its description, load mode and
-instructions, and the loop decides again on its next request. An explicit `tool_group` wins over a prefix; among prefixes the
+`TOOL_GROUP_LOADS` and instructions over `TOOL_GROUP_INSTRUCTIONS_MAX_CHARS`
+(8 000 characters, about two pages); redeclaring a group replaces its
+description, load mode and instructions, and the loop decides again on its
+next request. An explicit `tool_group` wins over a prefix; among prefixes the
 longest wins. Membership never reaches the wire and is not part of the surface
 digest. A **dynamic** group is one whose membership is not the host's own code —
 an MCP server's proxies.
@@ -467,9 +469,16 @@ prompt is exactly what it would be without groups.
 ### Group rules
 
 A group may carry `instructions`: rules for using its tools — which browser to
-drive, what to ask before acting. They are given once per run, where the
-group's tools first come in front of the model, and never for a group the run
-does not touch:
+drive, what to ask before acting. They weigh what they weigh: a group on the
+surface costs its rules on every request, so the deferral counts them with the
+group's definitions against `tool_definitions_ratio`, and a group whose rules
+alone are over the budget is held back and gives them once, in the result that
+loads it. A group that cannot be held back — pinned, or `eager` — puts its rules
+into every request whatever the budget says, which is why their length is
+bounded at the declaration (`TOOL_GROUP_INSTRUCTIONS_MAX_CHARS`): rules longer
+than two pages belong in a skill the model loads when it needs it. They are
+given once per run, where the group's tools first come in front of the model,
+and never for a group the run does not touch:
 
 - **In the catalogue**, for tools there from the start: a group left on the
   surface, and a held-back group some of whose tools the run begins with loaded

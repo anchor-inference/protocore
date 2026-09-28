@@ -40,6 +40,14 @@ All notable changes to this project are recorded here. The format follows
   text). It is now an HMAC of the tenant id under a key the host passes as
   `QueryEngineConfig.tool_rules_mark_key` (`tool_rules_mark(scope, key="")`);
   with no key it is derived from the tenant id alone.
+- **A group's rules count against the tool budget, and their length is
+  capped.** The rules of a group on the surface go into the system prompt on
+  every request but were never measured, so a group whose definitions fit
+  stayed on the surface with rules of any length, and a run could fail on the
+  context window before its first request. The deferral now counts
+  `group_rules_text` with the group's definitions against
+  `tool_definitions_ratio`, and `declare_group` refuses instructions over
+  `TOOL_GROUP_INSTRUCTIONS_MAX_CHARS` (8 000 characters).
 
 ## [2.0.0a23] - 2026-09-27
 

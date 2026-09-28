@@ -160,6 +160,31 @@ def test_over_the_token_budget_the_largest_groups_go_first_until_it_fits() -> No
     assert reasons == ("tokens",)
 
 
+def test_a_groups_rules_weigh_with_its_definitions() -> None:
+    # Two small groups whose definitions fit together with room to spare; one
+    # of them carries rules that alone are over the 1k budget. It is the one
+    # held back, for its size with the rules, and its rules are not written
+    # into the catalogue, since it is not on the surface.
+    tools = [
+        _search(),
+        *(_padded(f"Quiet{i}", words=10, group="quiet") for i in range(2)),
+        *(_padded(f"Ruled{i}", words=10, group="ruled") for i in range(2)),
+    ]
+    groups = [
+        ToolGroup(name="quiet"),
+        ToolGroup(name="ruled", instructions="Check the page before acting. " * 200),
+    ]
+    rc = LoopConstants(model_context_window=4_096)
+    deferred, names, catalogue, reasons = _plan(tools, groups, rc=rc)
+    assert deferred == ("ruled",)
+    assert names == {"Ruled0", "Ruled1"}
+    assert reasons == ("tokens",)
+    assert "Check the page" not in catalogue
+    # Without the rules the same groups fit and nothing is held back.
+    deferred, _, _, _ = _plan(tools, [ToolGroup(name="quiet"), ToolGroup(name="ruled")], rc=rc)
+    assert deferred == ()
+
+
 def test_dynamic_groups_go_before_any_other_group() -> None:
     tools = [
         _search(),

@@ -16,6 +16,7 @@ from protocore.runtime.context.budgets import derive_budgets
 from protocore.runtime.token_counting import estimate_tokens
 from protocore.runtime.tool_deferral import tool_rules_mark
 from protocore.runtime.tool_surface import forget_tool_surfaces
+from protocore.tests_support.adapters import InMemoryToolRegistry
 from protocore.tools import ToolSearchTool
 
 from .conftest import Scenario, ScenarioFactory, ScriptedTool, default_rc
@@ -83,18 +84,10 @@ async def test_a_group_loaded_whole_stays_whole_under_the_provider_tool_limit(
     assert loaded in ([], [f"Browser{i:02d}" for i in range(6)])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "a group's rules are written into the system prompt but never counted against "
-        "tool_definitions_ratio: a group whose definitions fit stays on the surface and "
-        "its rules land in every request, however long they are"
-    ),
-)
 async def test_rules_of_a_group_on_the_surface_count_against_the_tool_budget(
     scenario: ScenarioFactory,
 ) -> None:
-    rules = "Always double-check the page before acting on it. " * 400  # ~20 000 chars
+    rules = "Always double-check the page before acting on it. " * 150  # 7 500 chars
     run = scenario(
         tools=[
             ScriptedTool(tool_name="Note", description="record a note"),
@@ -110,13 +103,25 @@ async def test_rules_of_a_group_on_the_surface_count_against_the_tool_budget(
     await run.run("hello")
 
     # The 1 024-token budget for tools (a quarter of the window) is exceeded
-    # five times over by the rules alone, so the group should be held back and
-    # its rules given only when it is loaded. Today the rules go into the
-    # system prompt and the first request is refused as over the window
-    # (LLMContextWindowExceeded) before it is sent.
+    # by the rules alone (about 1 900 tokens), so the group is held back and
+    # its rules are given only when it is loaded. Counted as definitions only,
+    # the group stayed on the surface, the rules went into the system prompt,
+    # and the first request was refused as over the window before it was sent.
     assert run.requests, "no request was sent: the rules filled the context window"
     assert "Always double-check the page" not in _system_text(run, 0)
     assert "BrowserOpen" not in run.advertised_tool_names(0)
+    assert "- browser: Drive a web browser. Tools: BrowserOpen" in _system_text(run, 0)
+
+
+def test_rules_longer_than_the_cap_are_refused_at_the_declaration() -> None:
+    """Rules of a group that cannot be held back go into every request, so
+    their length is bounded where the host declares them, not discovered at
+    a run's first request."""
+    registry = InMemoryToolRegistry()
+    registry.declare_group("browser", "Drive a web browser", instructions="x" * 8_000)
+    with pytest.raises(ValueError, match="instructions run to 8001 characters"):
+        registry.declare_group("browser", "Drive a web browser", instructions="x" * 8_001)
+    assert len(registry.tool_groups()[0].instructions) == 8_000
 
 
 _MARK_IN_A_FRESH_PROCESS = (
