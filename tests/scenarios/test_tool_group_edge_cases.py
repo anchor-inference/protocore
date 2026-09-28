@@ -116,3 +116,48 @@ async def test_rules_of_a_group_on_the_surface_count_against_the_tool_budget(
     assert run.requests, "no request was sent: the rules filled the context window"
     assert "Always double-check the page" not in _system_text(run, 0)
     assert "BrowserOpen" not in run.advertised_tool_names(0)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "a blind call of one tool of a group with rules loads every tool of the group, "
+        "with no check against tool_definitions_ratio: a large group loaded whole "
+        "puts the request's definitions far over the budget the deferral was enforcing"
+    ),
+)
+async def test_a_blind_call_does_not_load_past_the_tool_budget(
+    scenario: ScenarioFactory,
+) -> None:
+    long = "performs one specific browser action and reports what happened on the page. " * 3
+    run = scenario(
+        tools=[
+            ScriptedTool(tool_name="Note", description="record a note"),
+            *[
+                ScriptedTool(tool_name=f"Browser{index:02d}", description=f"{long} ({index})")
+                for index in range(30)
+            ],
+        ],
+        rc=default_rc(model_context_window=8_192),
+    )
+    run.tools.register(ToolSearchTool(run.tools))
+    run.tools.declare_group(
+        "browser",
+        "Drive a web browser",
+        prefix="Browser",
+        load="lazy",
+        instructions="Ask before submitting a form.",
+    )
+    run.llm.queue_tool_call_response(
+        tool_call_id="c-1", tool_name="Browser00", tool_input={"v": "x"}
+    )
+    run.llm.queue_response(text="read the rules")
+    await run.run("open a page")
+
+    rc = run.engine.config.rc
+    budget = derive_budgets(rc).tool_definitions_budget_tokens
+    sent = sum(
+        estimate_tokens(definition.model_dump_json(), rc)
+        for definition in run.requests[-1].tools
+    )
+    assert sent <= budget
