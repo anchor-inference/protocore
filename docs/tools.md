@@ -603,7 +603,12 @@ be without it: a model offered a search it does not need spends turns on it.
   `max_advertised_tools` and under the tool-definition budget
   (`group_load_overflow`): loaded past either, it would be cut on the next
   request or refused with it, and a large group loaded whole undoes what
-  holding it back had saved. A group that would not fit is not loaded; the
+  holding it back had saved. "Already in the list" counts what the next
+  request will carry: the groups taken earlier in the same call and the tools
+  loaded by earlier calls of the same model message
+  (`TOOLS_LOADED_THIS_STEP_METADATA_KEY`) as well as the advertised ones, so
+  two groups that each fit on their own but not together are not both
+  reported loaded. A group that would not fit is not loaded; the
   result says which wall it hit and lists its tools (up to
   `tool_search_max_results`) for the model to load the ones it needs with
   `select:`.

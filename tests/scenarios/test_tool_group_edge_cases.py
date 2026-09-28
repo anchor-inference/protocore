@@ -393,3 +393,116 @@ async def test_a_blind_call_beside_a_search_of_its_group_is_pointed_at_the_searc
         "browser tools are in another result of this step."
     )
     assert sum("Ask the user before submitting a form." in r.content for r in (searched, held)) == 1
+
+
+def _two_groups_of_three(scenario: ScenarioFactory, *, rules: str = "") -> Scenario:
+    """Note and ToolSearch, and two lazy groups of three under a limit of six:
+    either group fits beside the base, and the two together do not."""
+    run = scenario(
+        tools=[
+            ScriptedTool(tool_name="Note", description="record a note"),
+            *[
+                ScriptedTool(tool_name=f"{prefix}{index:02d}", description=f"{prefix} action {index}")
+                for prefix in ("Alpha", "Beta")
+                for index in range(3)
+            ],
+        ],
+        rc=default_rc(max_advertised_tools=6, pinned_tool_max_count=4),
+    )
+    run.tools.register(ToolSearchTool(run.tools))
+    for name, prefix in (("alpha", "Alpha"), ("beta", "Beta")):
+        run.tools.declare_group(
+            name, f"The {name} tools", prefix=prefix, load="lazy", instructions=rules
+        )
+    return run
+
+
+def _assert_alpha_loaded_and_beta_refused(run: Scenario, beta_result: str) -> None:
+    assert "The beta group (3 tools) is not loaded" in beta_result
+    assert "over the provider's limit on the number of tools" in beta_result
+    advertised = run.advertised_tool_names(1)
+    assert advertised == ["Note", "ToolSearch", "Alpha00", "Alpha01", "Alpha02"]
+    assert run.engine.context_manager.loaded_tool_group_names() == ("alpha",)
+
+
+async def test_two_groups_loaded_by_one_call_must_fit_together(
+    scenario: ScenarioFactory,
+) -> None:
+    """Each group of a call is judged beside the ones the call already took:
+    the model is never told a group is loaded that the next list cuts."""
+    run = _two_groups_of_three(scenario)
+    run.llm.queue_tool_call_response(
+        tool_call_id="s-1", tool_name="ToolSearch", tool_input={"select": "group:alpha,group:beta"}
+    )
+    run.llm.queue_response(text="loaded")
+    await run.run("load both")
+
+    (result,) = run.tool_results()
+    assert result.content.startswith(
+        "Loaded, and callable from your next step: Alpha00, Alpha01, Alpha02."
+    )
+    assert "Beta00, Beta01, Beta02." not in result.content.split("\n")[0]
+    _assert_alpha_loaded_and_beta_refused(run, result.content)
+
+
+async def test_two_group_loads_in_one_message_must_fit_together(
+    scenario: ScenarioFactory,
+) -> None:
+    """The second call of a message sees what the first one loaded, though
+    the list the model was given does not show it yet."""
+    run = _two_groups_of_three(scenario)
+    run.llm.queue_multi_tool_call_response(
+        tool_calls=[
+            ("s-1", "ToolSearch", {"group": "alpha"}),
+            ("s-2", "ToolSearch", {"group": "beta"}),
+        ]
+    )
+    run.llm.queue_response(text="loaded")
+    await run.run("load both")
+
+    first, second = run.tool_results()
+    assert first.content.startswith("Loaded, and callable from your next step: Alpha00")
+    assert second.content.startswith("Nothing was loaded.")
+    _assert_alpha_loaded_and_beta_refused(run, second.content)
+
+
+async def test_two_blind_calls_of_two_groups_in_one_message_must_fit_together(
+    scenario: ScenarioFactory,
+) -> None:
+    """A call held for its group's rules loads the group whole only beside
+    what an earlier held call of the same message loaded; otherwise it loads
+    the called tool alone."""
+    run = _two_groups_of_three(scenario, rules="Ask before acting.")
+    run.llm.queue_multi_tool_call_response(
+        tool_calls=[("c-1", "Alpha00", {}), ("c-2", "Beta00", {})]
+    )
+    run.llm.queue_response(text="read the rules")
+    await run.run("act with both")
+
+    first, second = run.tool_results()
+    assert "The whole alpha group is loaded now" in first.content
+    assert "The rest of the beta group (2 tools) is not loaded" in second.content
+    assert run.advertised_tool_names(1) == [
+        "Note", "ToolSearch", "Alpha00", "Alpha01", "Alpha02", "Beta00"
+    ]
+    assert run.engine.context_manager.loaded_tool_group_names() == ("alpha",)
+
+
+async def test_a_group_a_second_call_asks_for_again_is_not_counted_twice(
+    scenario: ScenarioFactory,
+) -> None:
+    """A group an earlier call of the message loaded is no new load: asking
+    for it again does not count it against the room a second time."""
+    run = _two_groups_of_three(scenario)
+    run.llm.queue_multi_tool_call_response(
+        tool_calls=[
+            ("s-1", "ToolSearch", {"group": "alpha"}),
+            ("s-2", "ToolSearch", {"group": "alpha"}),
+        ]
+    )
+    run.llm.queue_response(text="loaded")
+    await run.run("load it twice")
+
+    _, second = run.tool_results()
+    assert "is not loaded" not in second.content
+    assert run.advertised_tool_names(1)[-3:] == ["Alpha00", "Alpha01", "Alpha02"]

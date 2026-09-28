@@ -149,7 +149,10 @@ All notable changes to this project are recorded here. The format follows
   next request's definitions far over the budget the deferral had enforced.
   Both are judged by `group_load_overflow` now: a held call loads the called
   tool alone and says how many more there are and how to load them, and
-  `ToolSearch` lists a group that would not fit instead of loading it.
+  `ToolSearch` lists a group that would not fit instead of loading it. Each
+  group is judged beside what the next request will carry: the groups taken
+  earlier in the same call, and the tools loaded by earlier calls of the same
+  model message, which the loop stamps as `TOOLS_LOADED_THIS_STEP_METADATA_KEY`.
 - **A loaded tail over `max_advertised_tools` is trimmed by whole entries.**
   It was trimmed one tool at a time by recency, so a group loaded whole was
   left half on the list while the model had been told all of it was loaded.

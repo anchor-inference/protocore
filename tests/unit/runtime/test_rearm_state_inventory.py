@@ -47,10 +47,12 @@ from ._tool_fixtures import MockTool
 # "I thought about it" the thing that fails, not the thing that is assumed.
 _RESET_ON_REARM: frozenset[str] = frozenset(
     {
-        # What the last request advertised, and the calls of the last message
-        # past the per-message cap. Both describe one request of one turn; the
-        # next turn's first request states its own.
+        # What the last request advertised, the loaded tools as they stood
+        # when it was built, and the calls of the last message past the
+        # per-message cap. All describe one request of one turn; the next
+        # turn's first request states its own.
         "_advertised_tool_names",
+        "_discovered_when_advertised",
         "_over_cap_tool_call_ids",
         # The blind calls of the last message answered with their group's
         # rules; the next message decides its own.

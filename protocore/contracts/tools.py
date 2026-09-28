@@ -68,6 +68,7 @@ CORE_TOOL_CONTEXT_METADATA_KEYS: Final[frozenset[str]] = frozenset(
         "protocore.tool_visibility_policy",
         "protocore.tool_allowlist",
         "protocore.advertised_tools",
+        "protocore.tools_loaded_this_step",
         "protocore.tool_group_rules_given",
         "protocore.tool_group_rules_mark",
     }
@@ -83,6 +84,7 @@ CORE_STAMPED_TOOL_CONTEXT_METADATA_KEYS: Final[frozenset[str]] = frozenset(
         "protocore.tool_visibility_policy",
         "protocore.tool_allowlist",
         "protocore.advertised_tools",
+        "protocore.tools_loaded_this_step",
         "protocore.tool_group_rules_given",
         "protocore.tool_group_rules_mark",
         "protocore.subagent_dispatch_order",

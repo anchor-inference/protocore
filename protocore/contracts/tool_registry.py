@@ -52,6 +52,17 @@ TOOLS_LOADED_METADATA_KEY: Final[str] = "protocore.tools_loaded"
 #: advertised".
 ADVERTISED_TOOLS_METADATA_KEY: Final[str] = "protocore.advertised_tools"
 
+#: ``ToolContext.metadata`` key under which the loop stamps, beside
+#: :data:`ADVERTISED_TOOLS_METADATA_KEY`, the names loaded since the current
+#: request was built — by an earlier call of the same model message — as a
+#: frozenset. They are not in the list the model sees yet, but the next request
+#: carries them, so a discovery tool that loads a group whole must judge
+#: whether it fits beside them too: judged against the advertised names alone,
+#: two groups loaded in one message that each fit on their own went over the
+#: limit together, and one of them was cut from the next request after the
+#: model had been told it was loaded. Absent outside a loop.
+TOOLS_LOADED_THIS_STEP_METADATA_KEY: Final[str] = "protocore.tools_loaded_this_step"
+
 #: ``ToolContext.metadata`` key under which the loop stamps the names of the
 #: tool groups whose rules (:attr:`ToolGroup.instructions`) the run has already
 #: been given, as a frozenset. A discovery tool gives a group's rules with the
@@ -401,6 +412,7 @@ class IToolRegistry(Protocol):
 __all__ = [
     "ADVERTISED_TOOLS_METADATA_KEY",
     "TOOLS_LOADED_METADATA_KEY",
+    "TOOLS_LOADED_THIS_STEP_METADATA_KEY",
     "TOOL_ALLOWLIST_METADATA_KEY",
     "TOOL_GROUPS_LOADED_METADATA_KEY",
     "TOOL_GROUP_INSTRUCTIONS_MAX_CHARS",

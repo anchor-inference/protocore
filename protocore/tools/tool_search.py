@@ -33,6 +33,7 @@ from protocore.contracts.tool_registry import (
     TOOL_GROUPS_LOADED_METADATA_KEY,
     TOOL_VISIBILITY_POLICY_METADATA_KEY,
     TOOLS_LOADED_METADATA_KEY,
+    TOOLS_LOADED_THIS_STEP_METADATA_KEY,
     IToolRegistry,
     ToolVisibilityPolicy,
     group_rules_text,
@@ -183,6 +184,8 @@ class ToolSearchTool(Tool):
         )
         rc = context.run_state.rc if context.run_state is not None else None
         advertised = _advertised(read_metadata(context, ADVERTISED_TOOLS_METADATA_KEY))
+        # Loaded by an earlier call of this message: on the next list, not this one.
+        pending = _advertised(read_metadata(context, TOOLS_LOADED_THIS_STEP_METADATA_KEY))
         # Outside a loop nothing says what was given (``None``).
         given = _advertised(read_metadata(context, TOOL_GROUP_RULES_GIVEN_METADATA_KEY))
         raw_mark = read_metadata(context, TOOL_GROUP_RULES_MARK_METADATA_KEY, "")
@@ -202,7 +205,9 @@ class ToolSearchTool(Tool):
         if names or groups:
             # Names win over a description sent beside them: the model already
             # knows what it wants, and a search would load other tools too.
-            return self._select(call_id, names, groups, policy, rc, advertised, given, mark)
+            return self._select(
+                call_id, names, groups, policy, rc, advertised, given, mark, pending or frozenset()
+            )
         return self._search(call_id, query, policy, rc, advertised, given, mark)
 
     # ------------------------------------------------------------------
@@ -303,6 +308,7 @@ class ToolSearchTool(Tool):
         advertised: frozenset[str] | None,
         given: frozenset[str] | None,
         mark: str,
+        pending: frozenset[str] = frozenset(),
     ) -> ToolResult:
         admitted = self._admitted(policy)
         by_folded = {name.casefold(): name for name in admitted}
@@ -325,13 +331,20 @@ class ToolSearchTool(Tool):
                     continue
                 # A group is loaded whole only while the whole of it fits the
                 # tool list: loaded past the budget or the provider's count,
-                # it would be cut on the next request, or refused with it.
+                # it would be cut on the next request, or refused with it. The
+                # next list carries what this call and earlier calls of the
+                # same message already loaded, so the group must fit beside
+                # those as well: two groups that each fit on their own were
+                # both reported loaded, and one of them was then cut.
+                surface = (
+                    None if advertised is None else advertised | pending | frozenset(loaded)
+                )
                 adding = [
                     admitted[name]
                     for name in members[group]
-                    if advertised is None or name not in advertised
+                    if surface is None or name not in surface
                 ]
-                reason = self._overflow(rc, advertised, adding)
+                reason = self._overflow(rc, surface, adding)
                 if reason:
                     too_large.append((group, members[group], reason))
                     continue

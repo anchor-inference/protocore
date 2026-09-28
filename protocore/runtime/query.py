@@ -99,6 +99,7 @@ from protocore.contracts.tool_registry import (
     ADVERTISED_TOOLS_METADATA_KEY,
     TOOL_GROUP_RULES_GIVEN_METADATA_KEY,
     TOOL_GROUP_RULES_MARK_METADATA_KEY,
+    TOOLS_LOADED_THIS_STEP_METADATA_KEY,
 )
 from protocore.contracts.tool_roles import (
     WORKSPACE_INSPECTION_ROLES,
@@ -240,6 +241,7 @@ from protocore.runtime.tool_deferral import (
     seed_group_events,
     tool_catalogue_block,
     tool_group_states,
+    tools_loaded_this_step,
 )
 from protocore.runtime.tool_dispatch import (
     DISPATCH_POST_TOOL_OUTPUT_MODIFIED_METADATA_KEY,
@@ -4875,6 +4877,9 @@ async def _drive_one_stream(
     # offered: a call of anything else is a call of a tool the model was not
     # shown (see ``observe_dispatched_tool``).
     engine._advertised_tool_names = frozenset(t.name for t in context.tools)
+    engine._discovered_when_advertised = frozenset(
+        engine.context_manager.discovered_tool_names()
+    )
     for seed_event in seed_group_events(engine):
         yield seed_event
     advert = _tool_surface_advertised_payload(engine, context)
@@ -10302,6 +10307,7 @@ def _stamp_advertised_tools(metadata: dict[str, Any], engine: QueryEngine) -> No
     advertised = engine._advertised_tool_names
     if advertised is not None:
         metadata[ADVERTISED_TOOLS_METADATA_KEY] = advertised
+        metadata[TOOLS_LOADED_THIS_STEP_METADATA_KEY] = tools_loaded_this_step(engine)
     # Stamped whether or not any were given, so a search inside a loop never
     # reads the key's absence as "outside a loop".
     metadata[TOOL_GROUP_RULES_GIVEN_METADATA_KEY] = frozenset(engine._tool_group_rules_given)

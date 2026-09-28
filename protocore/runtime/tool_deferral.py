@@ -98,6 +98,7 @@ __all__ = [
     "tool_catalogue_block",
     "tool_group_states",
     "tool_rules_mark",
+    "tools_loaded_this_step",
 ]
 
 #: The sentence under the catalogue. A model that cannot see a tool reaches for
@@ -233,6 +234,26 @@ def group_load_overflow(
     if tokens > budget:
         return "tokens"
     return ""
+
+
+def tools_loaded_this_step(engine: QueryEngine) -> frozenset[str]:
+    """The tools loaded since the current request was built, which the next one carries.
+
+    An earlier call of the same model message loaded them — a ``ToolSearch``
+    or a blind call held for its group's rules — so they are not among the
+    names the request advertised, and a later load in the message that is
+    judged against those names alone does not leave room for them. Only
+    names the run may still call count: the next surface leaves the rest out.
+    """
+    if engine._advertised_tool_names is None:
+        return frozenset()
+    before = engine._discovered_when_advertised
+    admitted = _admits(engine)
+    return frozenset(
+        name
+        for name in engine.context_manager.discovered_tool_names()
+        if name not in before and name not in engine._advertised_tool_names and admitted(name)
+    )
 
 
 def _load_of(
@@ -1178,6 +1199,9 @@ def hold_call_for_rules(
     first = group not in engine._tool_group_rules_given
     admitted = _admits(engine)
     advertised = engine._advertised_tool_names or frozenset()
+    # What an earlier call of the same message loaded is on the next request
+    # too, so the group must fit beside it as well as beside the advertised.
+    on_surface = advertised | tools_loaded_this_step(engine)
     already = manager.discovered_tool_last_used()
     members = sorted(
         tool.name
@@ -1189,10 +1213,10 @@ def hold_call_for_rules(
     if call.name not in members:
         members = sorted((*members, call.name))
     unloaded: list[str] = []
-    adding = [name for name in members if name not in advertised]
+    adding = [name for name in members if name not in on_surface]
     if group_load_overflow(
         engine.config.rc,
-        [t.definition for n in advertised if (t := registry.get(n)) is not None],
+        [t.definition for n in sorted(on_surface) if (t := registry.get(n)) is not None],
         [t.definition for n in adding if (t := registry.get(n)) is not None],
     ):
         unloaded = [name for name in members if name != call.name]

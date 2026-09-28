@@ -1632,6 +1632,11 @@ class QueryEngine:
         # The tool names the last request advertised, so a call of a tool it
         # did not advertise can be recognised; ``None`` before any request.
         self._advertised_tool_names: frozenset[str] | None = None
+        # The loaded tools as they stood when that request was built. What
+        # was loaded since, by an earlier call of the same model message, is
+        # not in the list the model sees yet but will be in the next one, and
+        # a later load in the message must leave room for it.
+        self._discovered_when_advertised: frozenset[str] = frozenset()
         # Calls of the current model message past ``max_tool_calls_per_turn``:
         # answered with an error each instead of being dispatched.
         self._over_cap_tool_call_ids: set[str] = set()
