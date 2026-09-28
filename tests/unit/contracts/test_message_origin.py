@@ -82,7 +82,10 @@ async def test_everything_a_pass_writes_into_history_is_marked_and_rides_the_sna
             )
         )
     history.append(_user("Now write the report."))
-    originals = {id(m) for m in history}
+    # Held, not just their ids: a message the pass removes is freed, and a
+    # record it writes may be given the freed message's id.
+    kept = list(history)
+    originals = {id(m) for m in kept}
 
     rc = LoopConstants(model_context_window=32_768, compaction_keep_recent_turns=2)
     manager = ContextManager(rc=rc, blob_store=InMemoryBlobStore(), compaction_llm=None)
