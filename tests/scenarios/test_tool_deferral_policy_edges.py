@@ -19,7 +19,7 @@ from protocore.contracts.types import ToolResult
 from protocore.runtime.tool_surface import forget_tool_surfaces
 from protocore.tools import ToolSearchTool
 
-from .conftest import Scenario, ScenarioFactory, ScriptedTool
+from .conftest import Scenario, ScenarioFactory, ScriptedTool, default_rc
 
 
 @pytest.fixture(autouse=True)
@@ -122,3 +122,23 @@ async def test_a_loaded_tool_the_whitelist_later_drops_is_no_longer_callable(
     assert "Mcp_Github_create_issue" not in run.advertised_tool_names(2)
     by_id = {block.tool_call_id: block for block in run.tool_results()}
     assert by_id["c-1"].is_error, by_id["c-1"].content
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "build_tool_surface hides every discovers_tools tool while no group is held "
+        "back, including when the per-message clip left tools off the surface"
+    ),
+)
+async def test_a_clipped_surface_keeps_its_search_tool(scenario: ScenarioFactory) -> None:
+    """With the per-message clip on, the tools it leaves off can only be found
+    by a search; the search tool is always-load for exactly that reason."""
+    run = scenario(tools=_tools(), rc=default_rc(tool_retrieval_top_k=1))
+    run.tools.register(ToolSearchTool(run.tools))
+    run.llm.queue_response(text="done")
+    await run.run("note this down")
+
+    advertised = run.advertised_tool_names(0)
+    assert len(advertised) < len(_tools()) + 1  # the clip did leave tools off
+    assert "ToolSearch" in advertised
