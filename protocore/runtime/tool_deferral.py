@@ -870,15 +870,23 @@ def _clip_left_tools_off(engine: QueryEngine, present: set[str]) -> bool:
     """Whether an admitted tool is missing from ``present`` for the clip alone.
 
     Measured against the surface the same policy gives with no clip and the
-    loaded tools already counted: what is missing then is exactly what a
-    search could find and load.
+    loaded tools already counted, narrowed to a child's declared tool set as
+    dispatch narrows it: what is missing then is exactly what a search could
+    find and load. A tool outside that set is no reason to keep the search,
+    which could never load it. Called only while the clip is on: with it off
+    nothing is left off for the clip, and the second surface is not built.
     """
     unclipped = engine.tools.compute_effective_surface(
-        tenant_id=engine.config.tenant_id, policy=_unpinned_policy(engine, engine.effective_tool_policy), top_k=None
+        tenant_id=engine.config.tenant_id,
+        policy=_unpinned_policy(engine, engine.effective_tool_policy),
+        top_k=None,
     )
     loaded = set(engine.context_manager.discovered_tool_names())
+    allowlist = engine.effective_subagent_tool_allowlist
     return any(
-        definition.name not in present and definition.name not in loaded
+        definition.name not in present
+        and definition.name not in loaded
+        and (allowlist is None or definition.name in allowlist)
         for definition in unclipped
     )
 

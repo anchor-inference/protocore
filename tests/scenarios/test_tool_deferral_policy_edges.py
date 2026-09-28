@@ -222,6 +222,61 @@ async def test_a_clip_that_leaves_nothing_off_hides_the_search_tool(
     assert sorted(advertised) == sorted(tool.name for tool in _tools())
 
 
+async def test_a_clip_that_leaves_off_only_tools_outside_the_declared_set_hides_the_search(
+    scenario: ScenarioFactory,
+) -> None:
+    """A child declared to use Note alone has all of it on a clipped surface;
+    the tools the clip left off are not the child's to load, so a search
+    could find nothing and is not advertised."""
+    run = scenario(
+        tools=_tools(),
+        rc=default_rc(tool_retrieval_top_k=1),
+        subagent_tool_allowlist=("Note", "ToolSearch"),
+    )
+    run.tools.register(ToolSearchTool(run.tools))
+    run.llm.queue_response(text="done")
+    await run.run("note this down")
+
+    assert run.advertised_tool_names(0) == ["Note"]
+
+
+async def test_with_the_clip_off_the_surface_is_built_once_per_request(
+    scenario: ScenarioFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing is left off for a clip that is off, so no unclipped surface is
+    built beside the one advertised to see what it left off."""
+    run = scenario(tools=_tools())
+    run.tools.register(ToolSearchTool(run.tools))
+    calls: list[int | None] = []
+    compute = run.tools.compute_effective_surface
+
+    def counted(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs.get("top_k"))
+        return compute(*args, **kwargs)
+
+    monkeypatch.setattr(run.tools, "compute_effective_surface", counted)
+    run.llm.queue_response(text="done")
+    await run.run("note this down")
+
+    assert "ToolSearch" not in run.advertised_tool_names(0)
+    assert calls and all(top_k is None for top_k in calls)
+    clipped = scenario(tools=_tools(), rc=default_rc(tool_retrieval_top_k=1))
+    clipped.tools.register(ToolSearchTool(clipped.tools))
+    clipped_calls: list[int | None] = []
+    clipped_compute = clipped.tools.compute_effective_surface
+
+    def clipped_counted(*args: Any, **kwargs: Any) -> Any:
+        clipped_calls.append(kwargs.get("top_k"))
+        return clipped_compute(*args, **kwargs)
+
+    monkeypatch.setattr(clipped.tools, "compute_effective_surface", clipped_counted)
+    clipped.llm.queue_response(text="done")
+    await clipped.run("note this down")
+    # Built with the clip, and once more without it to see what it left off.
+    assert 1 in clipped_calls and None in clipped_calls
+    assert len(clipped_calls) > len(calls)
+
+
 async def test_the_catalogue_names_no_group_the_declared_tool_set_cannot_reach(
     scenario: ScenarioFactory,
 ) -> None:

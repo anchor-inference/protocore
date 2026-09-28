@@ -588,7 +588,9 @@ each result in before the next call is stamped with the groups whose rules are
 given, and a local ranking costs nothing to serialise.
 The loop advertises it **only while it has something to find**: a group held
 back, or — with `tool_retrieval_top_k` on — admitted tools the per-message clip
-left off the surface, which a search finds and loads like any other. With the
+left off the surface, which a search finds and loads like any other. Admitted
+means what dispatch admits: a tool outside a child run's declared tool set is
+no reason to keep a search that could never load it. With the
 whole catalogue on the surface it is left off, and the prompt is what it would
 be without it: a model offered a search it does not need spends turns on it.
 

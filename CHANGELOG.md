@@ -114,7 +114,8 @@ All notable changes to this project are recorded here. The format follows
   off.** It was hidden whenever no group was held back, so with
   `tool_retrieval_top_k` on the tools the clip left off could not be found.
   The discovery tool is hidden only when every admitted tool is on the
-  surface.
+  surface; a tool outside a child's declared tool set does not count, since
+  the search could never load it.
 - **The catalogue names no group a child's declared tool set cannot reach.**
   The deferral was planned from the policy's surface alone, so a child run with
   a `subagent_tool_allowlist` was shown groups every load of which came back
