@@ -398,6 +398,13 @@ Never held back: the forced floor (`forced_pinned`), explicitly pinned tools,
 `always_load` tools, the discovery tool itself, and any tool in no group. A host
 that wants a tool deferrable says so by grouping it.
 
+The surface measured is the one the run may call: the policy's, narrowed to a
+child run's declared tool set (`subagent_tool_allowlist`) as dispatch narrows
+it. A tool the declaration leaves out is not a candidate, so a child is never
+shown a catalogue line for a group it cannot load — a group none of whose tools
+it may call is not named at all, and a group it may call one tool of is named
+with that tool alone.
+
 Without a discovery tool (role `discovers_tools`) registered and admitted, the
 only way back for a held-back tool is a call by its exact name, so groups are
 held back only when the surface is over `max_advertised_tools` — a provider

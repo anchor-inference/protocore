@@ -222,13 +222,6 @@ async def test_a_clip_that_leaves_nothing_off_hides_the_search_tool(
     assert sorted(advertised) == sorted(tool.name for tool in _tools())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ensure_tool_deferral plans from the policy's surface alone; the run's "
-        "declared tool set, which ToolSearch and the gate both honour, is not applied"
-    ),
-)
 async def test_the_catalogue_names_no_group_the_declared_tool_set_cannot_reach(
     scenario: ScenarioFactory,
 ) -> None:
@@ -241,6 +234,28 @@ async def test_the_catalogue_names_no_group_the_declared_tool_set_cannot_reach(
     await run.run("hello")
 
     assert "Mcp_Github_" not in _system_text(run)
+    # Nothing is held back, so there is nothing for a search to find either.
+    assert "ToolSearch" not in run.advertised_tool_names(0)
+
+
+async def test_the_catalogue_lists_only_the_tools_of_a_group_the_declared_set_reaches(
+    scenario: ScenarioFactory,
+) -> None:
+    """A child declared to use one github tool has the group held back with
+    that tool alone in its line: the other is not the child's to load."""
+    run = _with_search(
+        scenario(
+            tools=_tools(),
+            subagent_tool_allowlist=("Note", "ToolSearch", "Mcp_Github_list_issues"),
+        )
+    )
+    run.llm.queue_response(text="done")
+    await run.run("hello")
+
+    text = _system_text(run)
+    assert "Mcp_Github_list_issues" in text
+    assert "Mcp_Github_create_issue" not in text
+    assert "ToolSearch" in run.advertised_tool_names(0)
 
 
 def _system_text(run: Scenario) -> str:

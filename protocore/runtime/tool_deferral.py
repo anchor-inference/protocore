@@ -622,10 +622,18 @@ def ensure_tool_deferral(
         policy = engine.effective_tool_policy
     base = _unpinned_policy(engine, policy)
     registry = engine.tools
+    # The would-be surface is what the run may call: the policy's surface,
+    # narrowed to a child's declared tool set as dispatch narrows it. Planned
+    # from the policy alone, a child declared to use two tools was shown a
+    # catalogue of groups every load of which came back empty and every call
+    # of which was refused.
+    allowlist = engine.effective_subagent_tool_allowlist
     candidates: list[Tool] = []
     for definition in registry.compute_effective_surface(
         tenant_id=engine.config.tenant_id, policy=base, top_k=None
     ):
+        if allowlist is not None and definition.name not in allowlist:
+            continue
         tool = registry.get(definition.name)
         if tool is not None:
             candidates.append(tool)
