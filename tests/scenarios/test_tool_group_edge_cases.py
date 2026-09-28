@@ -118,6 +118,69 @@ async def test_rules_of_a_group_on_the_surface_count_against_the_tool_budget(
     assert "BrowserOpen" not in run.advertised_tool_names(0)
 
 
+_MARK_IN_A_FRESH_PROCESS = (
+    "from protocore.runtime.tool_deferral import tool_rules_mark;"
+    "print(tool_rules_mark('session-1'))"
+)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "the rules mark is keyed by a per-process random key, so the same session's "
+        "system prompt differs between worker processes and after every restart, and "
+        "a prefix cache misses at the catalogue on the first request of a run that "
+        "lands on another process"
+    ),
+)
+def test_the_rules_mark_of_a_session_is_the_same_in_every_process() -> None:
+    marks = {
+        subprocess.run(
+            [sys.executable, "-c", _MARK_IN_A_FRESH_PROCESS],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        for _ in range(2)
+    }
+    assert len(marks) == 1
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "the rules mark differs per session, so two sessions of one tenant with the "
+        "same tools and prompt no longer share the system prompt past the catalogue; "
+        "templates that render tools after the system text (Qwen, many vLLM chat "
+        "templates) lose the shared cache of every tool definition too"
+    ),
+)
+async def test_two_sessions_with_the_same_setup_send_the_same_system_prompt(
+    scenario: ScenarioFactory,
+) -> None:
+    prompts = []
+    for session in ("session-a", "session-b"):
+        run = scenario(
+            session_id=session,
+            tools=[
+                ScriptedTool(tool_name="Note", description="record a note"),
+                ScriptedTool(tool_name="BrowserOpen", description="open a page"),
+            ],
+        )
+        run.tools.register(ToolSearchTool(run.tools))
+        run.tools.declare_group(
+            "browser",
+            "Drive a web browser",
+            prefix="Browser",
+            load="lazy",
+            instructions="Ask before submitting a form.",
+        )
+        run.llm.queue_response(text="done")
+        await run.run("hello")
+        prompts.append(_system_text(run, 0))
+    assert prompts[0] == prompts[1]
+
+
 @pytest.mark.xfail(
     strict=True,
     reason=(
