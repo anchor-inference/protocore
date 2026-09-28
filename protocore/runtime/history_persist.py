@@ -34,6 +34,14 @@ attaches to the engine:
   ``delta.appended``, unless ``delta.rewritten`` says the sequence itself
   changed and ``delta.history`` replaces what the store holds.
 
+Either way the store is handed :class:`~protocore.contracts.types.Message`
+objects, and some of them are not the conversation's: compaction writes its
+ledger, summaries and floor digest into history as user-role messages, and
+their :attr:`~protocore.contracts.types.Message.origin` is
+:attr:`~protocore.contracts.types.MessageOrigin.compaction`. A store that keeps
+a transcript for people to read, or seeds a later run from it, must not record
+them as the user's turn.
+
 A store with only the first is called exactly as it was before. A store that
 subclasses :class:`HistoryPersister` and overrides nothing inherits the same
 behaviour through the default below.

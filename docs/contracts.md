@@ -174,6 +174,11 @@ Every conversation primitive flows as one of these Pydantic models (the
 - **`Message`** — the sole conversation primitive (role-scoped). Assistant turns
   carry `content_blocks` (text + tool_use + thinking interleaved).
 - **`MessageRole`** (`StrEnum`) — `system` · `user` · `assistant` · `tool`.
+- **`MessageOrigin`** (`StrEnum`) — `conversation` · `compaction`; read as
+  `Message.origin`. Compaction's records (ledger, summaries, floor digest) are
+  user-role but `compaction` in origin, so a host that persists or shows
+  history does not take them for the user's turn (see
+  [compaction](compaction.md#13-its-records-are-marked-as-its-own)).
 - **`ContentBlock`** — a **union type**, not a class:
   `TextBlock | ThinkingBlock | ImageRefBlock | ToolUseBlock | ToolResultBlock`.
 - **`ContentBlockKind`** (`StrEnum`) — the discriminant: `text` · `thinking` ·

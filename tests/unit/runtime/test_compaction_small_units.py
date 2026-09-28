@@ -191,7 +191,7 @@ async def test_the_proactive_pass_makes_progress_where_it_used_to_exhaust() -> N
     )
 
     assert attempt.tokens_after < attempt.tokens_before
-    assert attempt.tier2 is not None and attempt.tier2.turns_summarised > 0
+    assert attempt.outcome == "below_target"
     assert state.retry_count == 0
 
 

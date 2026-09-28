@@ -95,9 +95,11 @@ class LoopConstants(BaseModel):
         gt=0.0,
         lt=1.0,
         description=(
-            "Where a compaction pass aims, as a fraction of the compaction "
-            "trigger: a pass that fires keeps compacting until the whole prompt "
-            "is at or below trigger x this ratio. The gap between the two is "
+            "Where a compaction pass aims, as a fraction of the room it can "
+            "work in: the pass keeps compacting until the whole prompt is at or "
+            "below F + (trigger - F) x this ratio, where F is what no tier can "
+            "remove (system prompt, tools and the protected history). The gap "
+            "between the target and the trigger is "
             "the hysteresis that keeps the gate from firing again on the next "
             "iteration: one pass buys room for many turns rather than one."
         ),

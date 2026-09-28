@@ -177,6 +177,9 @@ class CompactionAttempt:
     prompt_after: int = 0
     trigger_tokens: int = 0
     target_tokens: int = 0
+    fixed_tokens: int = 0
+    """What no tier could remove: the overhead plus the protected history. The
+    target leaves ``compaction_target_ratio`` of the room above it."""
     ledger_tokens: int = 0
     outcome: str = ""
     """``below_target``, ``below_trigger``, ``floor`` (the floor removed spans
@@ -2677,6 +2680,34 @@ def _floor_units(
     return units
 
 
+def removable_indices(
+    history: list[Message],
+    rc: LoopConstants,
+    *,
+    keep_recent_turns: int | None = None,
+    protect_tail_from_index: int | None = None,
+    compact_seeded_history: bool = False,
+) -> frozenset[int]:
+    """The history positions a pass may take out of the window at all.
+
+    The floor's reach, which is the widest of the tiers': everything outside
+    the protected set. The rest — the task, the ledger, reference blocks, the
+    kept tail and the unread batch, and seeded turns outside reactive recovery —
+    stays whatever the pass does, and is as fixed a cost as the system prompt.
+    """
+    return frozenset(
+        idx
+        for unit in _floor_units(
+            history,
+            rc,
+            keep_recent_turns=keep_recent_turns,
+            protect_tail_from_index=protect_tail_from_index,
+            compact_seeded_history=compact_seeded_history,
+        )
+        for idx in unit
+    )
+
+
 def floor_has_work(
     history: list[Message],
     rc: LoopConstants,
@@ -2909,6 +2940,7 @@ def compaction_event_payload(attempt: CompactionAttempt, *, reason: str) -> dict
         "prompt_after": attempt.prompt_after,
         "trigger_threshold": attempt.trigger_tokens,
         "target_tokens": attempt.target_tokens,
+        "fixed_tokens": attempt.fixed_tokens,
         "tier1_freed": tier1.tokens_freed if tier1 else 0,
         "tier1_masked_by_age": tier1.masked_by_age if tier1 else 0,
         "tier2_summarised": tier2.turns_summarised if tier2 else 0,
@@ -2938,6 +2970,7 @@ __all__ = [
     "compaction_event_payload",
     "floor_has_work",
     "place_ledger",
+    "removable_indices",
     "render_span_for_summary",
     "run_floor",
     "run_tier1_truncation",

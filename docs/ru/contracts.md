@@ -178,6 +178,11 @@ value-объекты.
 - **`Message`** — единственный примитив диалога (с привязкой к роли). Ходы
   ассистента несут `content_blocks` (text + tool_use + thinking вперемешку).
 - **`MessageRole`** (`StrEnum`) — `system` · `user` · `assistant` · `tool`.
+- **`MessageOrigin`** (`StrEnum`) — `conversation` · `compaction`; читается
+  как `Message.origin`. Записи компакции (реестр, выжимки, сводка пола) имеют
+  роль user, но происхождение `compaction`, поэтому хост, который сохраняет
+  или показывает историю, не принимает их за реплику пользователя (см.
+  [компакцию](compaction.md#13-её-записи-помечены-как-её-собственные)).
 - **`ContentBlock`** — это **union-тип**, а не класс:
   `TextBlock | ThinkingBlock | ImageRefBlock | ToolUseBlock | ToolResultBlock`.
 - **`ContentBlockKind`** (`StrEnum`) — дискриминант: `text` · `thinking` ·

@@ -242,11 +242,15 @@ class ProviderFailurePolicy:
             # request. The first two pass on a retry and the third costs one
             # more call against a cached prompt, so the bounded retry comes
             # before the wind-down here too — unless the adapter, which had the
-            # response in front of it, said the failure is permanent. Then the
-            # wind-down is skipped as well: its one turn is a request to the
-            # endpoint that has just refused the run, with the same history and
-            # one more message, and it is refused the same way. The chain is the
-            # only recovery left, and otherwise the run fails on the provider's
+            # response in front of it, said the failure is permanent. A
+            # permanent refusal still winds down when its cause could lie in
+            # the tool surface: the wind-down's request carries the same
+            # history but only the finalizing tool, so a tool definition the
+            # endpoint rejects, or a request too large with every tool on it,
+            # is served there. Refusals the surface cannot cause (credentials,
+            # billing, an unknown model, a content policy, the history itself)
+            # are refused the same way a turn later, so for those the chain is
+            # the only recovery and otherwise the run fails on the provider's
             # own words.
             retryable = _says_retryable(exc)
             async for event in self._recover(
@@ -254,7 +258,7 @@ class ProviderFailurePolicy:
                 exc,
                 kind="llm_provider_error",
                 retryable=retryable,
-                wind_down_when_stuck=retryable,
+                wind_down_when_stuck=retryable or _wind_down_may_help(exc),
             ):
                 yield event
             return
@@ -475,6 +479,31 @@ _PERMANENT_FAILURE_REASONS: Final[frozenset[str]] = frozenset(
         "thinking_signature",
     }
 )
+
+
+#: Classified reasons of a permanent refusal that the wind-down's request would
+#: meet again. The wind-down keeps the history and the endpoint and changes only
+#: the tool surface (down to the finalizing tool), so a refusal about the
+#: account, the model, a content policy or something already in the history is
+#: not rescued by it. Any other permanent reason — a malformed or rejected tool
+#: schema, a request or grammar the full surface made too large — may be.
+_SURFACE_INDEPENDENT_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        "auth",
+        "auth_permanent",
+        "billing",
+        "image_too_large",
+        "model_not_found",
+        "oauth_long_context_beta_forbidden",
+        "provider_policy_blocked",
+        "thinking_signature",
+    }
+)
+
+
+def _wind_down_may_help(exc: BaseException) -> bool:
+    """Whether a permanent refusal could be caused by the tool surface the wind-down removes."""
+    return _classified_reason(exc) not in _SURFACE_INDEPENDENT_REASONS
 
 
 def _classified_reason(exc: BaseException) -> str:

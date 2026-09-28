@@ -519,6 +519,9 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/context/compaction.py::floor_has_work": _whole(
         "asks, without removing anything, whether the floor has a span to remove"
     ),
+    "protocore/runtime/context/compaction.py::removable_indices": _whole(
+        "names the positions of the whole transcript a pass could remove, to size the part it cannot"
+    ),
     "protocore/runtime/context/compaction.py::run_floor": _whole(
         "removes the oldest spans of the whole transcript"
     ),

@@ -552,7 +552,7 @@ crashes. The shared assistant loop is **not** a single immutable path:
   `runtime/context/ledger.py` — the compaction cascade, specified in full in
   [The compaction contract](compaction.md). A pass opens when the whole prompt
   (history plus system prompt and tools) passes the trigger and aims at
-  `compaction_target_ratio` of it. **Masking** replaces old or oversized tool
+  `compaction_target_ratio` of the room above what it cannot remove. **Masking** replaces old or oversized tool
   outputs with a placeholder that names the tool, keeps the lines the output
   said only once and points at the original in the blob store. **Summarising**
   replaces the oldest spans — adjacent tool-pairing units joined up to

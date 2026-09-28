@@ -6,6 +6,54 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`Message.origin` tells compaction's records from the conversation.** The
+  ledger, the turn and fold summaries and the floor digest are user-role
+  messages, because a provider accepts no system message past the first, and a
+  host that persisted history by role stored them as the user's own turns and
+  seeded them into the next run as such. Every message now answers
+  `Message.origin` with `MessageOrigin.conversation` or
+  `MessageOrigin.compaction`; the value is derived from the tags compaction
+  already sets (`protocore.compaction_summary`, and `protocore.compaction_ledger`,
+  now also exported as `COMPACTION_LEDGER_METADATA_KEY`), is serialised with the
+  message in snapshots, and is never sent to a provider. The request-only
+  checkpoint summary is tagged too. See `docs/compaction.md`, invariant 13.
+
+### Fixed
+
+- **A compaction pass no longer drains the history when the fixed part of the
+  prompt sits above its target.** The target was `compaction_target_ratio ×
+  min(T, P)` on the whole prompt; when the system prompt, the tool definitions
+  and the protected history (the task, the ledger, the kept tail, seeded turns)
+  alone were above it, it was unreachable, and every tier and the floor ran to
+  exhaustion, leaving the task and the last messages. The target is now
+  `F + compaction_target_ratio × (min(T, P) − F)`, where `F` is what no tier
+  can remove; with nothing fixed it is unchanged. `compaction_completed`
+  carries `fixed_tokens`, and `removable_indices` names what a pass may remove.
+- **A compaction record no longer starts a new round of the run.** The ledger,
+  summaries and floor digest are user-role, and the round boundary took them
+  for a caller's message. After a reactive pass put the ledger before the
+  runtime's continue prompt, the run read as having produced nothing: a
+  provider failure then failed it instead of winding it down, and an answer
+  written before the ledger was no longer preserved. They are now skipped as
+  boundaries, and a summary inside the round counts as the round's output.
+- **A permanent provider refusal the tool surface could have caused is wound
+  down again.** Since 2.0.0a22 every refusal the adapter classified as final
+  skipped the wind-down, on the premise that its request only adds one message.
+  It also narrows the tool surface to the finalizing tool, so a rejected tool
+  schema or a request made too large by the surface is served there and the run
+  reports what it found. Only refusals the surface cannot cause (`auth`,
+  `auth_permanent`, `billing`, `model_not_found`,
+  `oauth_long_context_beta_forbidden`, `provider_policy_blocked`,
+  `thinking_signature`, `image_too_large`) still skip it.
+- **A settled wound-down run resumed from its snapshot no longer gets the
+  wind-down notice back.** `resume_from_snapshot` restored the notice for every
+  snapshot whose wind-down state was armed, a finished run's included, and
+  `rearm` kept it, so the next turn opened with "your tools are gone" although
+  every tool was back. The notice is now restored only for a run that is not
+  terminal, and `rearm` removes any notice left in history.
+
 ## [2.0.0a23] - 2026-09-27
 
 ### Changed

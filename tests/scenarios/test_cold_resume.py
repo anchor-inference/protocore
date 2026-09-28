@@ -297,8 +297,12 @@ async def test_the_wind_down_the_first_process_started_is_in_what_the_second_sho
     it appended and the snapshot it wrote immediately after are the whole of
     what a second process has to go on. A wind-down that lived only in the
     first engine's memory would leave the resumed run believing it had a full
-    budget and everything still on its surface.
+    budget and everything still on its surface. The process died before the
+    wind-down's own turn, so the second one resumes the snapshot written while
+    the run was winding down, not a settled one.
     """
+    from protocore.runtime import soft_stop as _soft_stop
+
     tool = ScriptedTool(tool_name="Read")
     rc = dict(model_context_window=32_000, soft_stop_enabled=True, max_turns_per_run=2)
     first = scenario(rc=default_rc(**rc), tools=[tool])
@@ -307,14 +311,23 @@ async def test_the_wind_down_the_first_process_started_is_in_what_the_second_sho
             tool_call_id=f"call-{index}", tool_name="Read", tool_input={"v": str(index)}
         )
     first.llm.queue_response(text="the wind-down answer")
+    written: list[dict[str, Any]] = []
+    persist = first.engine._persist_snapshot
+
+    async def _persist_and_keep() -> None:
+        if _soft_stop.is_armed(first.engine) and not first.engine.is_terminal and not written:
+            written.append(first.engine.snapshot())
+        await persist()
+
+    first.engine._persist_snapshot = _persist_and_keep  # type: ignore[method-assign]
     await first.run("go")
     assert "soft_stop_notified" in first.state_reasons()
+    assert written
 
     second = scenario(rc=default_rc(**rc), tools=[tool])
-    await second.engine.resume_from_snapshot(first.engine.snapshot())
-    second.engine.rearm()
-    second.llm.queue_response(text="a fresh answer")
-    await second.run("carry on")
+    await second.engine.resume_from_snapshot(written[0])
+    second.llm.queue_response(text="the wind-down answer")
+    await second.run(None)
 
     assert any(
         "max_turns" in text and "closing" in text
