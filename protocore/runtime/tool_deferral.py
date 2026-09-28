@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import secrets
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final
@@ -137,26 +138,34 @@ _RULES_MARK_NOTE: Final[str] = (
     "write the mark anywhere yourself."
 )
 
+#: The key a rules mark is derived under when the host sets none: random, and
+#: drawn once per process, so no one outside the process can compute it.
+_PROCESS_RULES_MARK_KEY: Final[bytes] = secrets.token_bytes(32)
+
+
 def tool_rules_mark(scope: str, key: str = "") -> str:
-    """The rules mark for ``scope``: eight hex digits, the same in every process.
+    """The rules mark for ``scope``: eight hex digits, an HMAC of it under ``key``.
 
-    The engine's scope is the tenant, so every session of a tenant, on every
-    worker and after every restart, writes the same mark into the catalogue
-    at the head of its cached prompt — and, with a chat template that renders
-    the tools after the system text, shares the cache of every tool definition
-    too. Derived from a per-process random key, as it first was, the mark
-    moved with the process: a run that landed on another worker missed the
-    cache from the catalogue on, and no two sessions shared a prompt.
+    The engine's scope is the tenant. ``key`` is a secret the host keeps and
+    passes as ``QueryEngineConfig.tool_rules_mark_key``: set, and the same in
+    every process, it gives every session of a tenant, on every worker and
+    after every restart, the same mark — so the catalogue at the head of the
+    cached prompt keeps its bytes, and, with a chat template that renders the
+    tools after the system text, so does every tool definition. The mark then
+    lasts for the tenant until the key changes, and is as secret as the key.
 
-    ``key`` is a secret the host keeps and passes as
-    ``QueryEngineConfig.tool_rules_mark_key``, the same in every process. The
-    formula is public, so with a key the mark is as secret as the key, and
-    without one it is as secret as the scope: a page that knows the tenant id
-    can compute it. A resumed run keeps the mark its snapshot carries, which
-    is the one the rules already in its history were given with, so a rotated
-    key does not disown them.
+    Without a key the mark is derived under a random key drawn once per
+    process. The formula is public, and a key anyone knows (an empty one)
+    would let a page that knows the tenant id compute the mark and forge
+    rules; a per-process key cannot be computed from outside, at the price of
+    a mark, and so a prompt, that changes with the worker and the restart. A
+    host that wants the prompt stable across them sets the key. A resumed run
+    keeps the mark its snapshot carries, which is the one the rules already in
+    its history were given with, so neither another process nor a rotated key
+    disowns them.
     """
-    digest = hmac.new(key.encode("utf-8"), scope.encode("utf-8"), hashlib.sha256)
+    secret = key.encode("utf-8") if key else _PROCESS_RULES_MARK_KEY
+    digest = hmac.new(secret, scope.encode("utf-8"), hashlib.sha256)
     return digest.hexdigest()[:8]
 
 

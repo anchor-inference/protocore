@@ -126,14 +126,18 @@ All notable changes to this project are recorded here. The format follows
   tools, it held nothing back, and when the profile ended mid-run the whole
   server landed on the surface instead of in the catalogue. The profile and
   the child's declared tool set are part of the key now.
-- **The rules mark is stable across processes and sessions.** It was an HMAC
-  of the session id under a key drawn anew in every process, so it sat in the
-  system prompt as a value that changed with every worker, every restart and
-  every session, and the prefix cache missed from the catalogue on (and on
+- **The rules mark can be stable across processes and sessions.** It was an
+  HMAC of the session id under a key drawn anew in every process, so it sat in
+  the system prompt as a value that changed with every worker, every restart
+  and every session, and the prefix cache missed from the catalogue on (and on
   every tool definition, with a template that renders tools after the system
-  text). It is now an HMAC of the tenant id under a key the host passes as
-  `QueryEngineConfig.tool_rules_mark_key` (`tool_rules_mark(scope, key="")`);
-  with no key it is derived from the tenant id alone.
+  text). It is now an HMAC of the tenant id. A host that wants the prompt
+  stable across workers and restarts sets `QueryEngineConfig.tool_rules_mark_key`,
+  a secret it keeps the same in every worker; the mark then lasts for the
+  tenant until the key is rotated. Without a key it is derived under a random
+  key drawn once per process, so it cannot be computed from the tenant id.
+  The key is left out of the config's `repr`, and the mark is handed to the
+  discovery tool alone rather than to every tool's metadata.
 - **A group's rules count against the tool budget, and their length is
   capped.** The rules of a group on the surface go into the system prompt on
   every request but were never measured, so a group whose definitions fit

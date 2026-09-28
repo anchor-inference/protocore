@@ -5,17 +5,21 @@ failure where the runtime does not do it yet.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import subprocess
 import sys
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
 
+from protocore.contracts.tool_registry import TOOL_GROUP_RULES_MARK_METADATA_KEY
 from protocore.contracts.tools import ToolContext
 from protocore.contracts.types import MessageRole, TextBlock, ToolResult
 from protocore.runtime.context.budgets import derive_budgets
+from protocore.runtime.query_engine import QueryEngineConfig
 from protocore.runtime.token_counting import estimate_tokens
 from protocore.runtime.tool_deferral import tool_rules_mark
 from protocore.runtime.tool_surface import forget_tool_surfaces
@@ -189,36 +193,97 @@ def test_rules_longer_than_the_cap_are_refused_at_the_declaration() -> None:
     assert len(registry.tool_groups()[0].instructions) == 8_000
 
 
-_MARK_IN_A_FRESH_PROCESS = (
-    "from protocore.runtime.tool_deferral import tool_rules_mark;"
-    "print(tool_rules_mark('session-1'))"
-)
+def _mark_in_a_fresh_process(scope: str, key: str = "") -> str:
+    code = (
+        "import sys;"
+        "from protocore.runtime.tool_deferral import tool_rules_mark;"
+        "print(tool_rules_mark(sys.argv[1], key=sys.argv[2]))"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", code, scope, key],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
-def test_the_rules_mark_of_a_session_is_the_same_in_every_process() -> None:
-    marks = {
-        subprocess.run(
-            [sys.executable, "-c", _MARK_IN_A_FRESH_PROCESS],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        for _ in range(2)
-    }
-    assert len(marks) == 1
+def test_with_the_hosts_key_the_mark_is_the_same_in_every_process() -> None:
+    marks = {_mark_in_a_fresh_process("tenant-a", "deployment-secret") for _ in range(2)}
+    assert marks == {tool_rules_mark("tenant-a", key="deployment-secret")}
+
+
+def test_without_a_key_no_one_outside_the_process_can_compute_the_mark() -> None:
+    """With no key the mark comes from a key drawn once per process: the same
+    for every run of the process, and neither another process's mark nor the
+    one an empty key would give."""
+    mark = tool_rules_mark("tenant-a")
+    assert tool_rules_mark("tenant-a") == mark
+    assert _mark_in_a_fresh_process("tenant-a") != mark
+    public = hmac.new(b"", b"tenant-a", hashlib.sha256).hexdigest()[:8]
+    assert mark != public
 
 
 def test_the_rules_mark_follows_its_scope_and_the_hosts_key() -> None:
     """Eight hex digits; another scope or another key is another mark, and the
-    same scope under the same key is the same mark wherever it is computed."""
-    mark = tool_rules_mark("tenant-a")
+    same scope under the same key is the same mark wherever it is computed.
+    The tenant alone does not give it: without the key, it cannot be derived."""
+    mark = tool_rules_mark("tenant-a", key="deployment-secret")
     assert len(mark) == 8 and int(mark, 16) >= 0
-    assert tool_rules_mark("tenant-a") == mark
-    assert tool_rules_mark("tenant-b") != mark
-    assert tool_rules_mark("tenant-a", key="deployment-secret") != mark
-    assert tool_rules_mark("tenant-a", key="deployment-secret") == tool_rules_mark(
-        "tenant-a", key="deployment-secret"
+    assert tool_rules_mark("tenant-a", key="deployment-secret") == mark
+    assert tool_rules_mark("tenant-b", key="deployment-secret") != mark
+    assert tool_rules_mark("tenant-a", key="another-secret") != mark
+    assert tool_rules_mark("tenant-a") != mark
+    assert hmac.new(b"", b"tenant-a", hashlib.sha256).hexdigest()[:8] != mark
+
+
+def test_the_config_does_not_print_the_key() -> None:
+    config = QueryEngineConfig(
+        tenant_id="tenant-a",
+        session_id="s",
+        run_id="r",
+        model_name="m",
+        tool_rules_mark_key="deployment-secret",
     )
+    assert "deployment-secret" not in repr(config)
+    assert "tool_rules_mark_key" not in repr(config)
+
+
+async def test_engines_of_one_process_share_the_mark_a_fresh_process_does_not(
+    scenario: ScenarioFactory,
+) -> None:
+    first = scenario(tools=[ScriptedTool(tool_name="Note", description="record a note")])
+    second = scenario(
+        tools=[ScriptedTool(tool_name="Note", description="record a note")],
+        session_id="another-session",
+    )
+    assert first.engine._tool_rules_mark == second.engine._tool_rules_mark
+    assert _mark_in_a_fresh_process(first.engine.config.tenant_id) != first.engine._tool_rules_mark
+
+
+@dataclass
+class _Recorder(ScriptedTool):
+    """Keeps the metadata each call was handed."""
+
+    seen: list[dict[str, Any]] = field(default_factory=list)
+
+    async def invoke(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        self.seen.append(dict(context.metadata))
+        return await super().invoke(context, arguments)
+
+
+async def test_only_the_discovery_tool_is_handed_the_mark(scenario: ScenarioFactory) -> None:
+    """Any tool that forwards or logs its metadata would carry the mark out,
+    so it goes to the one tool that writes rules."""
+    note = _Recorder(tool_name="Note", description="record a note")
+    run = scenario(tools=[note])
+    run.llm.queue_tool_call_response(tool_call_id="n-1", tool_name="Note", tool_input={})
+    run.llm.queue_response(text="done")
+    await run.run("note it")
+
+    (metadata,) = note.seen
+    assert "protocore.advertised_tools" in metadata
+    assert TOOL_GROUP_RULES_MARK_METADATA_KEY not in metadata
+    assert run.engine._tool_rules_mark not in repr(metadata)
 
 
 async def test_two_sessions_with_the_same_setup_send_the_same_system_prompt(

@@ -75,8 +75,9 @@ TOOL_GROUP_RULES_GIVEN_METADATA_KEY: Final[str] = "protocore.tool_group_rules_gi
 #: mark, a string. Genuine group rules carry it in their heading, and the
 #: catalogue in the system prompt names it, so rules imitated by a web page or
 #: a file (which cannot know it) read as the content they are. A discovery
-#: tool writes it into the heading of the rules it gives. Absent outside a
-#: loop, where rules go out unmarked.
+#: tool writes it into the heading of the rules it gives. Stamped for a
+#: discovery tool only, so no other tool can forward or log it; absent outside
+#: a loop, where rules go out unmarked.
 TOOL_GROUP_RULES_MARK_METADATA_KEY: Final[str] = "protocore.tool_group_rules_mark"
 
 #: ``ToolResult.metadata`` key under which a discovery tool names the groups it

@@ -542,19 +542,31 @@ it carries rules, and says that text claiming to be rules without it is
 content to read, never rules to follow, and that the mark is not to be written
 anywhere.
 
-The mark is eight hex digits, an HMAC of the tenant id under a key the host
-keeps (`tool_rules_mark(tenant_id, key=...)`, the key passed as
-`QueryEngineConfig.tool_rules_mark_key`). It is the same for every session of a
-tenant, in every process and after every restart, because it sits in the
-catalogue at the head of the cached prompt: derived from a per-process random
-key, as it first was, a run that landed on another worker missed the cache from
-the catalogue on, and no two sessions shared a prompt — nor, with a chat
-template that renders the tools after the system text, a single tool
-definition. The formula is public, so with a key the mark is as secret as the
-key, and with none (the default) as secret as the tenant id. The snapshot
-carries it (`tool_group_rules_mark`), so a resumed run keeps the mark its
-history's rules were given with, whatever the key is now. The loop stamps it
-for a discovery tool as `protocore.tool_group_rules_mark`.
+The mark is eight hex digits, an HMAC of the tenant id under a key
+(`tool_rules_mark(tenant_id, key=...)`). The formula is public, so the mark is
+exactly as secret as the key:
+
+- **With `QueryEngineConfig.tool_rules_mark_key` set** — a secret the host
+  keeps, the same in every worker — the mark is the same for every session of
+  the tenant, in every process and after every restart. That is what a host
+  that relies on prompt caching wants: the mark sits in the catalogue at the
+  head of the cached prompt, and a mark that moved with the process missed
+  the cache from the catalogue on, shared no prompt between sessions and,
+  with a chat template that renders the tools after the system text, not a
+  single tool definition either. The mark then lasts for the tenant until the
+  key is rotated, so the key must be kept secret like any credential. It is
+  left out of the config's `repr`.
+- **Without a key** (the default) the mark is derived under a random key
+  drawn once per process. No one outside the process can compute it — an
+  empty key would let any page that knows the tenant id compute the mark and
+  forge rules — but it changes with the worker and the restart, and the
+  prompt changes with it.
+
+The snapshot carries the mark (`tool_group_rules_mark`), so a resumed run keeps
+the mark its history's rules were given with, whichever process picks it up
+and whatever the key is now. The loop stamps it as
+`protocore.tool_group_rules_mark` for a discovery tool only — the one tool that
+writes rules — so no other tool can forward or log it.
 
 A separate runtime-authored message for the rules was considered and
 rejected: a user turn between a tool result and the next assistant turn is a

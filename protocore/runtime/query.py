@@ -235,6 +235,7 @@ from protocore.runtime.tool_arguments import argument_names, string_argument
 from protocore.runtime.tool_deferral import (
     build_tool_surface,
     calls_held_for_rules,
+    discovery_tool_names,
     hold_call_for_rules,
     note_prompt_prefix_restarted,
     observe_dispatched_tool,
@@ -6497,7 +6498,7 @@ async def _drain_dispatch_tool_deferred(
     # cannot shadow ``tool_call_id`` / ``protocore.*`` on the parallel-dispatch
     # path either.
     _merge_run_metadata_into(metadata, engine.run_state)
-    _stamp_advertised_tools(metadata, engine)
+    _stamp_advertised_tools(metadata, engine, tool_call.name)
     # Carry the child's LLM-requested batch position + its fan-out group id so
     # the host runner can declare its deliverables into the parent ledger in
     # batch order (not gather completion order), scoped per group so a later
@@ -10179,7 +10180,7 @@ def _replay_dispatch_state(
         work_scope=engine.config.work_session_id,
         evidence=ToolEvidenceContext(origin=engine._engine_evidence_origin()),
         run_state=engine.run_state,
-        metadata=_build_replay_metadata(engine),
+        metadata=_build_replay_metadata(engine, tool_call.name),
     )
 
     # Cumulative tool-call soft cap — count THIS executed tool call in
@@ -10279,7 +10280,7 @@ def _merge_run_metadata_into(
         metadata[key] = value
 
 
-def _build_replay_metadata(engine: QueryEngine) -> dict[str, Any]:
+def _build_replay_metadata(engine: QueryEngine, tool_name: str) -> dict[str, Any]:
     """Build the ``ToolContext.metadata`` dict the replay's context carries.
 
     Mirrors the metadata construction in
@@ -10293,16 +10294,22 @@ def _build_replay_metadata(engine: QueryEngine) -> dict[str, Any]:
     _rehydrate_satisfied_from_history(engine)
     metadata: dict[str, Any] = {}
     _merge_run_metadata_into(metadata, engine.run_state)
-    _stamp_advertised_tools(metadata, engine)
+    _stamp_advertised_tools(metadata, engine, tool_name)
     return metadata
 
 
-def _stamp_advertised_tools(metadata: dict[str, Any], engine: QueryEngine) -> None:
+def _stamp_advertised_tools(
+    metadata: dict[str, Any], engine: QueryEngine, tool_name: str
+) -> None:
     """Tell the tool which names the request that called it advertised.
 
     Set after the run-metadata merge, which skips ``protocore.*`` names, so an
     operator's envelope cannot claim a tool was on the surface. Nothing is set
     before the first request, when no surface has been advertised yet.
+
+    The rules mark goes to a discovery tool alone, the only tool that writes
+    rules: any other tool that forwarded or logged its metadata would carry
+    the mark out, and a mark that lasts for the tenant is good for as long.
     """
     advertised = engine._advertised_tool_names
     if advertised is not None:
@@ -10311,7 +10318,9 @@ def _stamp_advertised_tools(metadata: dict[str, Any], engine: QueryEngine) -> No
     # Stamped whether or not any were given, so a search inside a loop never
     # reads the key's absence as "outside a loop".
     metadata[TOOL_GROUP_RULES_GIVEN_METADATA_KEY] = frozenset(engine._tool_group_rules_given)
-    metadata[TOOL_GROUP_RULES_MARK_METADATA_KEY] = engine._tool_rules_mark
+    tool = engine.tools.get(tool_name)
+    if tool is not None and discovery_tool_names([tool], engine.config.tool_roles):
+        metadata[TOOL_GROUP_RULES_MARK_METADATA_KEY] = engine._tool_rules_mark
 
 
 def _rehydrate_satisfied_from_history(engine: QueryEngine) -> None:
@@ -11419,7 +11428,7 @@ async def _dispatch_tool(
     # authoritative ``tool_call_id`` is then set by the dispatcher from the real
     # ``tool_call.id``.
     _merge_run_metadata_into(metadata, engine.run_state)
-    _stamp_advertised_tools(metadata, engine)
+    _stamp_advertised_tools(metadata, engine, tool_call.name)
     # Flag the SYNTHETIC dispatch so a backend MAY default a required terminal
     # field (e.g. ``outcome``) ONLY for the runtime-synthesised last-resort
     # guaranteed-terminal answer, never for a model-emitted one.

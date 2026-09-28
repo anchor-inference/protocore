@@ -597,16 +597,20 @@ class QueryEngineConfig:
     ``ContextManager.loaded_tool_group_names()``.
     """
 
-    tool_rules_mark_key: str = ""
+    tool_rules_mark_key: str = field(default="", repr=False)
     """A secret the run's rules mark is derived with; the same in every process.
 
     Genuine tool-group rules carry a mark in their heading
     (:func:`~protocore.runtime.tool_deferral.tool_rules_mark`), and the
     catalogue names it, so rules a web page imitates read as content. The
-    mark is an HMAC of the tenant id under this key. The formula is public:
-    with a key the mark is as secret as the key, and with none — the default —
-    it is as secret as the tenant id. A host that rotates the key changes the
-    mark of every new run; resumed runs keep the mark their snapshot carries.
+    mark is an HMAC of the tenant id under this key, so it lasts for the
+    tenant and is as secret as the key: a host that wants the prompt stable
+    across workers and restarts, for the provider's prompt cache, sets it,
+    keeps it secret, and rotates it to change the mark of every new run.
+    Left empty, the mark is derived under a random key drawn once per process
+    instead — unguessable, but different on every worker and after every
+    restart. Resumed runs keep the mark their snapshot carries. Left out of
+    the config's ``repr`` so a logged config does not print it.
     """
 
     tool_group_loads: Mapping[str, str] = field(default_factory=dict)
