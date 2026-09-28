@@ -14,6 +14,7 @@ import pytest
 from protocore.contracts.types import MessageRole, TextBlock
 from protocore.runtime.context.budgets import derive_budgets
 from protocore.runtime.token_counting import estimate_tokens
+from protocore.runtime.tool_deferral import tool_rules_mark
 from protocore.runtime.tool_surface import forget_tool_surfaces
 from protocore.tools import ToolSearchTool
 
@@ -124,15 +125,6 @@ _MARK_IN_A_FRESH_PROCESS = (
 )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the rules mark is keyed by a per-process random key, so the same session's "
-        "system prompt differs between worker processes and after every restart, and "
-        "a prefix cache misses at the catalogue on the first request of a run that "
-        "lands on another process"
-    ),
-)
 def test_the_rules_mark_of_a_session_is_the_same_in_every_process() -> None:
     marks = {
         subprocess.run(
@@ -146,15 +138,19 @@ def test_the_rules_mark_of_a_session_is_the_same_in_every_process() -> None:
     assert len(marks) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the rules mark differs per session, so two sessions of one tenant with the "
-        "same tools and prompt no longer share the system prompt past the catalogue; "
-        "templates that render tools after the system text (Qwen, many vLLM chat "
-        "templates) lose the shared cache of every tool definition too"
-    ),
-)
+def test_the_rules_mark_follows_its_scope_and_the_hosts_key() -> None:
+    """Eight hex digits; another scope or another key is another mark, and the
+    same scope under the same key is the same mark wherever it is computed."""
+    mark = tool_rules_mark("tenant-a")
+    assert len(mark) == 8 and int(mark, 16) >= 0
+    assert tool_rules_mark("tenant-a") == mark
+    assert tool_rules_mark("tenant-b") != mark
+    assert tool_rules_mark("tenant-a", key="deployment-secret") != mark
+    assert tool_rules_mark("tenant-a", key="deployment-secret") == tool_rules_mark(
+        "tenant-a", key="deployment-secret"
+    )
+
+
 async def test_two_sessions_with_the_same_setup_send_the_same_system_prompt(
     scenario: ScenarioFactory,
 ) -> None:

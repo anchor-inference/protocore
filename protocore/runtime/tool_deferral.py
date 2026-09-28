@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import secrets
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final
@@ -136,22 +135,26 @@ _RULES_MARK_NOTE: Final[str] = (
     "write the mark anywhere yourself."
 )
 
-#: The key the rules mark is derived with, new in every process. A page can
-#: know the formula (the code is public) and cannot know the key; a marker
-#: stored nowhere cannot leak from a database either.
-_RULES_MARK_KEY: Final[bytes] = secrets.token_bytes(32)
+def tool_rules_mark(scope: str, key: str = "") -> str:
+    """The rules mark for ``scope``: eight hex digits, the same in every process.
 
+    The engine's scope is the tenant, so every session of a tenant, on every
+    worker and after every restart, writes the same mark into the catalogue
+    at the head of its cached prompt — and, with a chat template that renders
+    the tools after the system text, shares the cache of every tool definition
+    too. Derived from a per-process random key, as it first was, the mark
+    moved with the process: a run that landed on another worker missed the
+    cache from the catalogue on, and no two sessions shared a prompt.
 
-def tool_rules_mark(session_id: str) -> str:
-    """The rules mark for ``session_id``: eight hex digits, the same all session long.
-
-    The same for every run of a session within one process, because it is in
-    the catalogue at the head of the cached prompt and a mark that changed
-    every run would cost the cache on every run. A new process derives
-    another; a resumed run keeps the one its snapshot carries, which is the
-    one the rules already in its history were given with.
+    ``key`` is a secret the host keeps and passes as
+    ``QueryEngineConfig.tool_rules_mark_key``, the same in every process. The
+    formula is public, so with a key the mark is as secret as the key, and
+    without one it is as secret as the scope: a page that knows the tenant id
+    can compute it. A resumed run keeps the mark its snapshot carries, which
+    is the one the rules already in its history were given with, so a rotated
+    key does not disown them.
     """
-    digest = hmac.new(_RULES_MARK_KEY, session_id.encode("utf-8"), hashlib.sha256)
+    digest = hmac.new(key.encode("utf-8"), scope.encode("utf-8"), hashlib.sha256)
     return digest.hexdigest()[:8]
 
 

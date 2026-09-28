@@ -32,6 +32,14 @@ All notable changes to this project are recorded here. The format follows
   tools, it held nothing back, and when the profile ended mid-run the whole
   server landed on the surface instead of in the catalogue. The profile and
   the child's declared tool set are part of the key now.
+- **The rules mark is stable across processes and sessions.** It was an HMAC
+  of the session id under a key drawn anew in every process, so it sat in the
+  system prompt as a value that changed with every worker, every restart and
+  every session, and the prefix cache missed from the catalogue on (and on
+  every tool definition, with a template that renders tools after the system
+  text). It is now an HMAC of the tenant id under a key the host passes as
+  `QueryEngineConfig.tool_rules_mark_key` (`tool_rules_mark(scope, key="")`);
+  with no key it is derived from the tenant id alone.
 
 ## [2.0.0a23] - 2026-09-27
 

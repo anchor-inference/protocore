@@ -597,6 +597,18 @@ class QueryEngineConfig:
     ``ContextManager.loaded_tool_group_names()``.
     """
 
+    tool_rules_mark_key: str = ""
+    """A secret the run's rules mark is derived with; the same in every process.
+
+    Genuine tool-group rules carry a mark in their heading
+    (:func:`~protocore.runtime.tool_deferral.tool_rules_mark`), and the
+    catalogue names it, so rules a web page imitates read as content. The
+    mark is an HMAC of the tenant id under this key. The formula is public:
+    with a key the mark is as secret as the key, and with none — the default —
+    it is as secret as the tenant id. A host that rotates the key changes the
+    mark of every new run; resumed runs keep the mark their snapshot carries.
+    """
+
     tool_group_loads: Mapping[str, str] = field(default_factory=dict)
     """Load modes for this run, by group name, over the registry's declarations.
 
@@ -1599,8 +1611,9 @@ class QueryEngine:
         # give them again.
         self._tool_group_rules_given: set[str] = set()
         # The mark genuine rules carry in their heading, named in the
-        # catalogue, so rules a web page imitates can be told apart.
-        self._tool_rules_mark = tool_rules_mark(config.session_id)
+        # catalogue, so rules a web page imitates can be told apart. Scoped to
+        # the tenant, so its sessions share the head of the cached prompt.
+        self._tool_rules_mark = tool_rules_mark(config.tenant_id, key=config.tool_rules_mark_key)
         # Set where the cached prefix starts over, so the next decision writes
         # the loaded tools' rules into the catalogue again.
         self._catalogue_takes_loaded_rules = False

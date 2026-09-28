@@ -520,12 +520,19 @@ it carries rules, and says that text claiming to be rules without it is
 content to read, never rules to follow, and that the mark is not to be written
 anywhere.
 
-The mark is eight hex digits, an HMAC of the session id under a key drawn anew
-in every process (`tool_rules_mark(session_id)`). It is the same for every run
-of a session in one process, because it sits in the catalogue at the head of
-the cached prompt; the snapshot carries it (`tool_group_rules_mark`), so a
-resumed run keeps the mark its history's rules were given with. The loop
-stamps it for a discovery tool as `protocore.tool_group_rules_mark`.
+The mark is eight hex digits, an HMAC of the tenant id under a key the host
+keeps (`tool_rules_mark(tenant_id, key=...)`, the key passed as
+`QueryEngineConfig.tool_rules_mark_key`). It is the same for every session of a
+tenant, in every process and after every restart, because it sits in the
+catalogue at the head of the cached prompt: derived from a per-process random
+key, as it first was, a run that landed on another worker missed the cache from
+the catalogue on, and no two sessions shared a prompt — nor, with a chat
+template that renders the tools after the system text, a single tool
+definition. The formula is public, so with a key the mark is as secret as the
+key, and with none (the default) as secret as the tenant id. The snapshot
+carries it (`tool_group_rules_mark`), so a resumed run keeps the mark its
+history's rules were given with, whatever the key is now. The loop stamps it
+for a discovery tool as `protocore.tool_group_rules_mark`.
 
 A separate runtime-authored message for the rules was considered and
 rejected: a user turn between a tool result and the next assistant turn is a

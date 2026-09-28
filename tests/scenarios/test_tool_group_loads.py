@@ -727,12 +727,18 @@ async def test_no_mark_is_named_where_no_group_has_rules(scenario: ScenarioFacto
     assert "come from the runtime alone" not in _system_text(run, 0)
 
 
-async def test_another_session_has_another_mark_and_a_resume_keeps_its_own(
+async def test_another_tenant_has_another_mark_and_a_resume_keeps_its_own(
     scenario: ScenarioFactory,
 ) -> None:
     first = _lazy(scenario(tools=_tools()))
-    other = _lazy(scenario(tools=_tools(), session_id="another-session"))
+    other = _lazy(scenario(tools=_tools(), tenant_id="another-tenant"))
     assert first.engine._tool_rules_mark != other.engine._tool_rules_mark
+    # Another session of the same tenant shares the mark, and a host's key
+    # changes it for every run of the tenant.
+    sibling = _lazy(scenario(tools=_tools(), session_id="another-session"))
+    assert sibling.engine._tool_rules_mark == first.engine._tool_rules_mark
+    keyed = _lazy(scenario(tools=_tools(), tool_rules_mark_key="deployment-secret"))
+    assert keyed.engine._tool_rules_mark != first.engine._tool_rules_mark
 
     first.llm.queue_tool_call_response(
         tool_call_id="s-1", tool_name="ToolSearch", tool_input={"group": "browser"}
