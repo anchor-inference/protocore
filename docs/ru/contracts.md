@@ -183,6 +183,9 @@ value-объекты.
   роль user, но происхождение `compaction`, поэтому хост, который сохраняет
   или показывает историю, не принимает их за реплику пользователя (см.
   [компакцию](compaction.md#13-её-записи-помечены-как-её-собственные)).
+  Происхождение выводится из меток сообщения и не задаётся:
+  `Message(origin=...)` принимается и игнорируется. Ставьте метку
+  (`COMPACTION_SUMMARY_METADATA_KEY: True` в `metadata`).
 - **`ContentBlock`** — это **union-тип**, а не класс:
   `TextBlock | ThinkingBlock | ImageRefBlock | ToolUseBlock | ToolResultBlock`.
 - **`ContentBlockKind`** (`StrEnum`) — дискриминант: `text` · `thinking` ·

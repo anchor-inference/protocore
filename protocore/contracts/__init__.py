@@ -149,6 +149,8 @@ from protocore.contracts.tools import (
     ToolPolicyDenied,
 )
 from protocore.contracts.types import (
+    COMPACTION_LEDGER_METADATA_KEY,
+    COMPACTION_SUMMARY_METADATA_KEY,
     PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY,
     AgentEnvelope,
     BlobMetadata,
@@ -205,6 +207,8 @@ from protocore.contracts.workspace import (
 )
 
 __all__ = [
+    "COMPACTION_LEDGER_METADATA_KEY",
+    "COMPACTION_SUMMARY_METADATA_KEY",
     "DEFAULT_RECALL_SCOPES",
     "DEFAULT_WORKSPACE_LIFECYCLE",
     "MEMORY_KINDS",

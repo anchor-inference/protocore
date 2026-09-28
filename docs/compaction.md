@@ -211,7 +211,10 @@ store or show it as one. Every such message answers `Message.origin` with
 already sets (`protocore.compaction_summary`, `protocore.compaction_ledger`), is
 serialised with the message — each entry of a snapshot's `history` carries
 `"origin"` — and is never sent to a provider, so what the model reads is
-unchanged.
+unchanged. It is not a field one sets: `Message(origin=...)` is ignored, and a
+message is marked as compaction's by its tag. Both tags are exported from
+`protocore.contracts` as `COMPACTION_SUMMARY_METADATA_KEY` and
+`COMPACTION_LEDGER_METADATA_KEY`.
 
 A host that persists history (`persist_history_delta`, `persist_session_history`,
 or its own reading of `engine.history`) filters on it: a compaction record

@@ -225,7 +225,10 @@
 которые компакция и так ставит (`protocore.compaction_summary`,
 `protocore.compaction_ledger`), сериализуется вместе с сообщением — у каждой
 записи `history` в снимке есть `"origin"` — и никогда не уходит провайдеру,
-так что то, что читает модель, не меняется.
+так что то, что читает модель, не меняется. Это не поле, которое задают:
+`Message(origin=...)` игнорируется, а сообщение помечается как запись
+компакции своей меткой. Обе метки экспортируются из `protocore.contracts` как
+`COMPACTION_SUMMARY_METADATA_KEY` и `COMPACTION_LEDGER_METADATA_KEY`.
 
 Хост, который сохраняет историю (`persist_history_delta`,
 `persist_session_history` или собственное чтение `engine.history`), фильтрует

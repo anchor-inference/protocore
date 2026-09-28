@@ -862,6 +862,11 @@ class Message(BaseModel):
         field existed reads the same. Serialised with the message — a snapshot's
         history carries ``"origin"`` on every entry — and ignored on the way
         back in. Never sent to a provider.
+
+        It cannot be set: ``Message(origin=...)`` validates with the argument
+        silently ignored. To mark a message as compaction's, set the tag
+        (:data:`COMPACTION_SUMMARY_METADATA_KEY` ``= True``) in its
+        ``metadata`` instead.
         """
         metadata = self.metadata
         if (
@@ -1604,6 +1609,8 @@ class SubagentTask(BaseModel):
 
 
 __all__ = [
+    "COMPACTION_LEDGER_METADATA_KEY",
+    "COMPACTION_SUMMARY_METADATA_KEY",
     "TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY",
     "TERMINAL_TOOL_METADATA_KEY",
     "TERMINAL_TOOL_STATUS_COMPLETED",

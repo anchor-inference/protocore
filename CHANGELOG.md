@@ -15,10 +15,29 @@ All notable changes to this project are recorded here. The format follows
   seeded them into the next run as such. Every message now answers
   `Message.origin` with `MessageOrigin.conversation` or
   `MessageOrigin.compaction`; the value is derived from the tags compaction
-  already sets (`protocore.compaction_summary`, and `protocore.compaction_ledger`,
-  now also exported as `COMPACTION_LEDGER_METADATA_KEY`), is serialised with the
-  message in snapshots, and is never sent to a provider. The request-only
-  checkpoint summary is tagged too. See `docs/compaction.md`, invariant 13.
+  already sets (`protocore.compaction_summary` and `protocore.compaction_ledger`),
+  is serialised with the message in snapshots, and is never sent to a provider.
+  It is derived and cannot be set: `Message(origin=...)` is accepted and
+  ignored, and a host marks a message as compaction's by setting the tag. The
+  request-only checkpoint summary is tagged too. See `docs/compaction.md`,
+  invariant 13.
+- **`COMPACTION_SUMMARY_METADATA_KEY` and `COMPACTION_LEDGER_METADATA_KEY` are
+  exported** from `protocore.contracts` (and `protocore.contracts.types`), for
+  a host that tells compaction's records apart or tags a message itself.
+- **`group_load_overflow(rc, advertised, adding)`** in
+  `protocore.runtime.tool_deferral` says whether loading a group whole beside
+  a surface would go over `max_advertised_tools` (`"count"`) or the
+  tool-definition budget (`"tokens"`).
+- **`removable_indices`** in `protocore.runtime.context.compaction` names the
+  history entries a compaction pass may remove, and `compaction_completed`
+  carries `fixed_tokens`, the part of the prompt no tier can remove.
+- **`TOOL_GROUP_INSTRUCTIONS_MAX_CHARS`** (8 000) in
+  `protocore.contracts.tool_registry`, the longest a group's rules may be.
+- **`QueryEngineConfig.tool_rules_mark_key`**, the host's secret the rules mark
+  is derived with (see Fixed).
+- **`TOOLS_LOADED_THIS_STEP_METADATA_KEY`** (`protocore.tools_loaded_this_step`),
+  stamped beside `ADVERTISED_TOOLS_METADATA_KEY`: the tools loaded by earlier
+  calls of the same model message, which the next request carries.
 
 ### Changed
 
@@ -27,9 +46,22 @@ All notable changes to this project are recorded here. The format follows
   reading a couple of dozen files at once, while 64 let a single runaway
   message come close to the per-run tool-call soft caps
   (`subagent_tool_call_soft_cap` is 40) before any call was refused.
-- **`tool_retrieval_top_k` stays `0`**, the per-message clip off. A host that
-  passes the constant to `compute_effective_surface` as it is now gets the
-  same unclipped surface the loop advertises (see Fixed).
+- **Breaking: `declare_group` raises `ValueError` for rules over
+  `TOOL_GROUP_INSTRUCTIONS_MAX_CHARS`** (8 000 characters) at declaration.
+  Rules of a group that cannot be held back go into every request, so their
+  length is bounded where they are declared. A host that takes a group's
+  instructions from operators should validate or shorten them before
+  declaring the group.
+- **`tool_rules_mark(session_id)` is now `tool_rules_mark(scope, key="")`**,
+  and the engine passes the tenant id as the scope, so the mark is the same
+  for every session of a tenant (see Fixed).
+- **`ToolSearchTool.is_concurrent_safe` is `False`.** Several `ToolSearch`
+  calls in one model message are dispatched one at a time, so each is stamped
+  with what the ones before it loaded and which rules they gave. A message
+  such as `[Read, Read, ToolSearch, Read]` is dispatched in three batches.
+- **`Message.model_dump()` carries an `"origin"` key on every message** (see
+  Added). A host that stores dumps under a strict schema, or compares them
+  byte for byte, sees the new key; it is ignored when a message is read back.
 
 ### Fixed
 
@@ -64,7 +96,6 @@ All notable changes to this project are recorded here. The format follows
   `rearm` kept it, so the next turn opened with "your tools are gone" although
   every tool was back. The notice is now restored only for a run that is not
   terminal, and `rearm` removes any notice left in history.
-
 - **Russian imperatives reach the tools their infinitives reach.** The bundled
   lexicon lists verbs as infinitives, and the stemmer keeps "отредактируй",
   "найди" and "скопируй" apart from "редактировать", "найти" and
@@ -84,7 +115,9 @@ All notable changes to this project are recorded here. The format follows
   `tool_retrieval_top_k` documents `0` as "no clip" and defaults to it, but the
   registry read `0` as "retrieve no tool", so a host passing the constant
   straight through advertised the pinned tools alone. `ToolRegistry` and
-  `InMemoryToolRegistry` now read `0` like `None`.
+  `InMemoryToolRegistry` now read `0` like `None`, and a host that passes the
+  constant straight through gets the same unclipped surface the loop
+  advertises.
 - **The bare name of a namespaced tool ranks that tool first.** `get_issue`
   ranked `mcp__github__add_issue_comment` above `mcp__github__get_issue`: the
   index kept an identifier's parts and its whole joined form, "get" is a
@@ -101,7 +134,6 @@ All notable changes to this project are recorded here. The format follows
   words skip identifier splitting; and the fallback matcher is built only when
   a query needs it. At 500 tools a rebuild over known tools takes about 15 ms
   and a first build about 90 ms, against about 250 ms before.
-
 - **A loaded tool is admitted like any other tool.** Loaded names were folded
   into `pinned` unconditionally, and `pinned` is admitted past a `visible`
   whitelist, so a tool seeded through `QueryEngineConfig.discovered_tools`,
@@ -145,8 +177,8 @@ All notable changes to this project are recorded here. The format follows
   stayed on the surface with rules of any length, and a run could fail on the
   context window before its first request. The deferral now counts
   `group_rules_text` with the group's definitions against
-  `tool_definitions_ratio`, and `declare_group` refuses instructions over
-  `TOOL_GROUP_INSTRUCTIONS_MAX_CHARS` (8 000 characters).
+  `tool_definitions_ratio`, and their length is capped at declaration (see
+  Changed).
 - **A group is loaded whole only while the whole of it fits.** A blind call
   held for its group's rules, and `ToolSearch(group=...)`, loaded every tool
   of the group with no check against `max_advertised_tools` or the
@@ -166,10 +198,9 @@ All notable changes to this project are recorded here. The format follows
 - **A group's rules are given once even when one message loads it twice.**
   `ToolSearch` was concurrent-safe, so two calls in one message were both
   stamped with the groups given before the message ran and both carried the
-  full rules. It is dispatched one call at a time now; each result is folded
-  in before the next call is stamped, and a blind call beside a search of its
+  full rules. It is dispatched one call at a time now (see Changed); each
+  result is folded in before the next call is stamped, and a blind call beside a search of its
   group is pointed at the search's rules instead of repeating them.
-
 
 ## [2.0.0a23] - 2026-09-27
 

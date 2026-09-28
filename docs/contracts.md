@@ -178,7 +178,10 @@ Every conversation primitive flows as one of these Pydantic models (the
   `Message.origin`. Compaction's records (ledger, summaries, floor digest) are
   user-role but `compaction` in origin, so a host that persists or shows
   history does not take them for the user's turn (see
-  [compaction](compaction.md#13-its-records-are-marked-as-its-own)).
+  [compaction](compaction.md#13-its-records-are-marked-as-its-own)). The
+  origin is derived from the message's tags and cannot be set:
+  `Message(origin=...)` is accepted and ignored. Set the tag instead
+  (`COMPACTION_SUMMARY_METADATA_KEY: True` in `metadata`).
 - **`ContentBlock`** — a **union type**, not a class:
   `TextBlock | ThinkingBlock | ImageRefBlock | ToolUseBlock | ToolResultBlock`.
 - **`ContentBlockKind`** (`StrEnum`) — the discriminant: `text` · `thinking` ·
