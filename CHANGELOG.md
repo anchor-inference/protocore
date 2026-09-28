@@ -102,6 +102,66 @@ All notable changes to this project are recorded here. The format follows
   a query needs it. At 500 tools a rebuild over known tools takes about 15 ms
   and a first build about 90 ms, against about 250 ms before.
 
+- **A loaded tool is admitted like any other tool.** Loaded names were folded
+  into `pinned` unconditionally, and `pinned` is admitted past a `visible`
+  whitelist, so a tool seeded through `QueryEngineConfig.discovered_tools`,
+  restored from a snapshot, or loaded before the host narrowed its policy was
+  advertised and callable although the whitelist excluded it. Only names the
+  host's policy admits on its own are pinned now, checked on every request, and
+  the surface appends a loaded tool only when dispatch would admit it — a
+  child's declared tool set included.
+- **`ToolSearch` stays advertised while the per-message clip leaves tools
+  off.** It was hidden whenever no group was held back, so with
+  `tool_retrieval_top_k` on the tools the clip left off could not be found.
+  The discovery tool is hidden only when every admitted tool is on the
+  surface.
+- **The catalogue names no group a child's declared tool set cannot reach.**
+  The deferral was planned from the policy's surface alone, so a child run with
+  a `subagent_tool_allowlist` was shown groups every load of which came back
+  empty and every call of which the gate refused. The would-be surface is now
+  narrowed to the declared set first, as dispatch narrows it.
+- **The deferral decision is made again when the execution profile changes.**
+  It was keyed on the host's policy but not on the profile, which reshapes the
+  same surface: planned under a plan profile that admitted none of a server's
+  tools, it held nothing back, and when the profile ended mid-run the whole
+  server landed on the surface instead of in the catalogue. The profile and
+  the child's declared tool set are part of the key now.
+- **The rules mark is stable across processes and sessions.** It was an HMAC
+  of the session id under a key drawn anew in every process, so it sat in the
+  system prompt as a value that changed with every worker, every restart and
+  every session, and the prefix cache missed from the catalogue on (and on
+  every tool definition, with a template that renders tools after the system
+  text). It is now an HMAC of the tenant id under a key the host passes as
+  `QueryEngineConfig.tool_rules_mark_key` (`tool_rules_mark(scope, key="")`);
+  with no key it is derived from the tenant id alone.
+- **A group's rules count against the tool budget, and their length is
+  capped.** The rules of a group on the surface go into the system prompt on
+  every request but were never measured, so a group whose definitions fit
+  stayed on the surface with rules of any length, and a run could fail on the
+  context window before its first request. The deferral now counts
+  `group_rules_text` with the group's definitions against
+  `tool_definitions_ratio`, and `declare_group` refuses instructions over
+  `TOOL_GROUP_INSTRUCTIONS_MAX_CHARS` (8 000 characters).
+- **A group is loaded whole only while the whole of it fits.** A blind call
+  held for its group's rules, and `ToolSearch(group=...)`, loaded every tool
+  of the group with no check against `max_advertised_tools` or the
+  tool-definition budget, so one blind call of a large server's tool put the
+  next request's definitions far over the budget the deferral had enforced.
+  Both are judged by `group_load_overflow` now: a held call loads the called
+  tool alone and says how many more there are and how to load them, and
+  `ToolSearch` lists a group that would not fit instead of loading it.
+- **A loaded tail over `max_advertised_tools` is trimmed by whole entries.**
+  It was trimmed one tool at a time by recency, so a group loaded whole was
+  left half on the list while the model had been told all of it was loaded.
+  A group now leaves the request whole, as it leaves the cap, and a smaller
+  older entry may take its place.
+- **A group's rules are given once even when one message loads it twice.**
+  `ToolSearch` was concurrent-safe, so two calls in one message were both
+  stamped with the groups given before the message ran and both carried the
+  full rules. It is dispatched one call at a time now; each result is folded
+  in before the next call is stamped, and a blind call beside a search of its
+  group is pointed at the search's rules instead of repeating them.
+
 
 ## [2.0.0a23] - 2026-09-27
 

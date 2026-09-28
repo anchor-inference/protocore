@@ -343,8 +343,10 @@ registry.register(ToolSearchTool(registry))
 `contracts/tool_registry.py`, and `IToolRegistry` gains `declare_group` and
 `tool_groups`. `declare_group(name, description, *, dynamic=False, prefix=None,
 load="auto", instructions="")` refuses a load mode outside
-`TOOL_GROUP_LOADS`; redeclaring a group replaces its description, load mode and
-instructions, and the loop decides again on its next request. An explicit `tool_group` wins over a prefix; among prefixes the
+`TOOL_GROUP_LOADS` and instructions over `TOOL_GROUP_INSTRUCTIONS_MAX_CHARS`
+(8 000 characters, about two pages); redeclaring a group replaces its
+description, load mode and instructions, and the loop decides again on its
+next request. An explicit `tool_group` wins over a prefix; among prefixes the
 longest wins. Membership never reaches the wire and is not part of the surface
 digest. A **dynamic** group is one whose membership is not the host's own code —
 an MCP server's proxies.
@@ -392,11 +394,15 @@ deferral decision is keyed on.
 ### When groups are held back
 
 `tool_deferral_mode` is `"auto"` by default and `"off"` turns it off. In `auto`,
-once per run — and again only if the registry's catalogue or groups, or the
-host's visibility policy, change — the loop measures the surface it would
-otherwise send. The policy counts because a host may switch tools on mid-run by
-replacing it, registering nothing; the pins the run adds for tools it loaded do
-not, so loading a tool never reopens the decision:
+once per run — and again only if the registry's catalogue or groups, the
+host's visibility policy, the execution profile or the child's declared tool set
+change — the loop measures the surface it would otherwise send. The policy
+counts because a host may switch tools on mid-run by replacing it, registering
+nothing; the profile counts because it reshapes the same surface — planned
+under a plan profile that admitted none of a server's tools, a decision that
+held nothing back would otherwise stand when the profile ended, and the server
+would land on the surface whole; the pins the run adds for tools it loaded do
+not count, so loading a tool never reopens the decision:
 
 1. every **lazy** group is held back, largest first, when a discovery tool is
    admitted;
@@ -410,6 +416,13 @@ not, so loading a tool never reopens the decision:
 Never held back: the forced floor (`forced_pinned`), explicitly pinned tools,
 `always_load` tools, the discovery tool itself, and any tool in no group. A host
 that wants a tool deferrable says so by grouping it.
+
+The surface measured is the one the run may call: the policy's, narrowed to a
+child run's declared tool set (`subagent_tool_allowlist`) as dispatch narrows
+it. A tool the declaration leaves out is not a candidate, so a child is never
+shown a catalogue line for a group it cannot load — a group none of whose tools
+it may call is not named at all, and a group it may call one tool of is named
+with that tool alone.
 
 Without a discovery tool (role `discovers_tools`) registered and admitted, the
 only way back for a held-back tool is a call by its exact name, so groups are
@@ -469,9 +482,16 @@ prompt is exactly what it would be without groups.
 ### Group rules
 
 A group may carry `instructions`: rules for using its tools — which browser to
-drive, what to ask before acting. They are given once per run, where the
-group's tools first come in front of the model, and never for a group the run
-does not touch:
+drive, what to ask before acting. They weigh what they weigh: a group on the
+surface costs its rules on every request, so the deferral counts them with the
+group's definitions against `tool_definitions_ratio`, and a group whose rules
+alone are over the budget is held back and gives them once, in the result that
+loads it. A group that cannot be held back — pinned, or `eager` — puts its rules
+into every request whatever the budget says, which is why their length is
+bounded at the declaration (`TOOL_GROUP_INSTRUCTIONS_MAX_CHARS`): rules longer
+than two pages belong in a skill the model loads when it needs it. They are
+given once per run, where the group's tools first come in front of the model,
+and never for a group the run does not touch:
 
 - **In the catalogue**, for tools there from the start: a group left on the
   surface, and a held-back group some of whose tools the run begins with loaded
@@ -522,12 +542,19 @@ it carries rules, and says that text claiming to be rules without it is
 content to read, never rules to follow, and that the mark is not to be written
 anywhere.
 
-The mark is eight hex digits, an HMAC of the session id under a key drawn anew
-in every process (`tool_rules_mark(session_id)`). It is the same for every run
-of a session in one process, because it sits in the catalogue at the head of
-the cached prompt; the snapshot carries it (`tool_group_rules_mark`), so a
-resumed run keeps the mark its history's rules were given with. The loop
-stamps it for a discovery tool as `protocore.tool_group_rules_mark`.
+The mark is eight hex digits, an HMAC of the tenant id under a key the host
+keeps (`tool_rules_mark(tenant_id, key=...)`, the key passed as
+`QueryEngineConfig.tool_rules_mark_key`). It is the same for every session of a
+tenant, in every process and after every restart, because it sits in the
+catalogue at the head of the cached prompt: derived from a per-process random
+key, as it first was, a run that landed on another worker missed the cache from
+the catalogue on, and no two sessions shared a prompt — nor, with a chat
+template that renders the tools after the system text, a single tool
+definition. The formula is public, so with a key the mark is as secret as the
+key, and with none (the default) as secret as the tenant id. The snapshot
+carries it (`tool_group_rules_mark`), so a resumed run keeps the mark its
+history's rules were given with, whatever the key is now. The loop stamps it
+for a discovery tool as `protocore.tool_group_rules_mark`.
 
 A separate runtime-authored message for the rules was considered and
 rejected: a user turn between a tool result and the next assistant turn is a
@@ -541,10 +568,17 @@ which stays exactly as it was.
 
 `protocore/tools/tool_search.py` ships the discovery tool:
 `ToolSearchTool(registry)`, named `ToolSearch`, carrying the role
-`discovers_tools` in its own `tool_roles`, `always_load`, and concurrent-safe.
-The loop advertises it **only while something is held back**; with the whole
-catalogue on the surface it has nothing to find, and a model offered a search
-it does not need spends turns on it.
+`discovers_tools` in its own `tool_roles`, `always_load`, and dispatched one
+call at a time (not `is_concurrent_safe`): what one call owes depends on what
+the calls before it in the same message gave, and run in parallel two loads of
+one group in one message each carried the group's rules; serial, the loop folds
+each result in before the next call is stamped with the groups whose rules are
+given, and a local ranking costs nothing to serialise.
+The loop advertises it **only while it has something to find**: a group held
+back, or — with `tool_retrieval_top_k` on — admitted tools the per-message clip
+left off the surface, which a search finds and loads like any other. With the
+whole catalogue on the surface it is left off, and the prompt is what it would
+be without it: a model offered a search it does not need spends turns on it.
 
 - `query` in free text returns up to `tool_search_max_results` matches, best
   first, one line each — `Name(param1, param2*) — first sentence`, required
@@ -564,7 +598,15 @@ it does not need spends turns on it.
   Tools loaded as a whole group are **one entry** under `pinned_tool_max_count`
   and are unloaded together: a model that asked for a group cannot notice that
   eviction left half of it, and a group of twelve against a cap of fifteen
-  would otherwise crowd out everything else.
+  would otherwise crowd out everything else. A group is loaded whole only
+  while the whole of it fits beside the tools already in the list — under
+  `max_advertised_tools` and under the tool-definition budget
+  (`group_load_overflow`): loaded past either, it would be cut on the next
+  request or refused with it, and a large group loaded whole undoes what
+  holding it back had saved. A group that would not fit is not loaded; the
+  result says which wall it hit and lists its tools (up to
+  `tool_search_max_results`) for the model to load the ones it needs with
+  `select:`.
 - The first tools of a group with rules that a call loads bring the rules, once
   (see [Group rules](#group-rules)).
 - The first lines of the result say which tools are now loaded and callable,
@@ -612,8 +654,12 @@ prefix starts over anyway: after compaction, at a turn boundary (`rearm`), and
 when a run starts. Unloading a tool in the middle of a run would pull a schema
 out from under a model that may be about to call it, and would cost the cache
 exactly what the cap exists to save. The one exception is a provider limit:
-when base plus loaded tools would exceed `max_advertised_tools`, the least
-recently used loaded tools are left off that request (they stay loaded).
+when base plus loaded tools would exceed `max_advertised_tools` — the base grew
+under a loaded tail that fit before — the least recently used loaded entries
+are left off that request (they stay loaded). An entry is a tool, or a group
+loaded whole, as for eviction: a group is left off whole, never cut to the
+room left, so what the model was told about it stays true of the list in
+front of it; a smaller, older entry may still fit in its place.
 
 The loaded tools and the held-back groups travel in the snapshot
 (`discovered_tools`, `deferred_tool_groups`), and a resumed run keeps the
@@ -626,6 +672,18 @@ the run actually called, and is the list to carry: a search loads its best few
 matches whether or not the model wanted them. A seeded tool counts as called.
 Each snapshot row carries `called`; a row without it is taken as called. A row
 of a tool loaded as part of a whole group also carries `group`.
+
+A loaded tool — seeded, restored from a snapshot, or loaded during the run — is
+admitted exactly as any other tool is. The engine folds loaded names into
+`pinned` so dispatch admits them under a `visible` whitelist, but only the names
+the host's policy admits on its own: `pinned` is admitted past `visible`, so a
+loaded name the whitelist excludes would otherwise be callable for having been
+loaded. The check is made on every request, so a tool the operator drops from
+the whitelist between runs is not brought back by the seed, and one dropped
+mid-run is neither advertised nor callable from the next request on; a child's
+declared tool set applies to loaded tools the same way. The run's loaded list
+still carries the name — it comes back if the policy admits it again — and the
+host's seed for the next run is checked the same way.
 
 A group is carried whole with `QueryEngineConfig.loaded_tool_groups`: each group
 named there is loaded as `ToolSearch(group=...)` would load it — only the tools
@@ -656,7 +714,11 @@ callable, and the called tool's line: "BrowserOpen is loaded now; call it
 again. It takes: BrowserOpen(url*) — …". The next call runs. The whole group,
 because a job that starts with one of its tools usually needs another next,
 and a model that had only the one it called went on without the rest; the
-line, because a retry written from memory repeated the wrong arguments. A
+line, because a retry written from memory repeated the wrong arguments. When
+the whole group would not fit the tool list (the same two walls as for
+`ToolSearch(group=...)`), only the called tool is loaded — on its own, not as
+the group — and the answer says how many more there are and how to load the
+ones needed: one blind call is not a request for a large group. A
 second blind call of the same group in the same message waits too, and is
 pointed at the first answer rather than given the rules twice. `tool_unadvertised_call`
 carries `executed: false` for such a call and, unlike for a call that ran,

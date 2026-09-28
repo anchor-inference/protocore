@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import secrets
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final
@@ -87,6 +86,7 @@ __all__ = [
     "calls_held_for_rules",
     "discovery_tool_names",
     "ensure_tool_deferral",
+    "group_load_overflow",
     "held_call_text",
     "hold_call_for_rules",
     "note_prompt_prefix_restarted",
@@ -136,22 +136,26 @@ _RULES_MARK_NOTE: Final[str] = (
     "write the mark anywhere yourself."
 )
 
-#: The key the rules mark is derived with, new in every process. A page can
-#: know the formula (the code is public) and cannot know the key; a marker
-#: stored nowhere cannot leak from a database either.
-_RULES_MARK_KEY: Final[bytes] = secrets.token_bytes(32)
+def tool_rules_mark(scope: str, key: str = "") -> str:
+    """The rules mark for ``scope``: eight hex digits, the same in every process.
 
+    The engine's scope is the tenant, so every session of a tenant, on every
+    worker and after every restart, writes the same mark into the catalogue
+    at the head of its cached prompt — and, with a chat template that renders
+    the tools after the system text, shares the cache of every tool definition
+    too. Derived from a per-process random key, as it first was, the mark
+    moved with the process: a run that landed on another worker missed the
+    cache from the catalogue on, and no two sessions shared a prompt.
 
-def tool_rules_mark(session_id: str) -> str:
-    """The rules mark for ``session_id``: eight hex digits, the same all session long.
-
-    The same for every run of a session within one process, because it is in
-    the catalogue at the head of the cached prompt and a mark that changed
-    every run would cost the cache on every run. A new process derives
-    another; a resumed run keeps the one its snapshot carries, which is the
-    one the rules already in its history were given with.
+    ``key`` is a secret the host keeps and passes as
+    ``QueryEngineConfig.tool_rules_mark_key``, the same in every process. The
+    formula is public, so with a key the mark is as secret as the key, and
+    without one it is as secret as the scope: a page that knows the tenant id
+    can compute it. A resumed run keeps the mark its snapshot carries, which
+    is the one the rules already in its history were given with, so a rotated
+    key does not disown them.
     """
-    digest = hmac.new(_RULES_MARK_KEY, session_id.encode("utf-8"), hashlib.sha256)
+    digest = hmac.new(key.encode("utf-8"), scope.encode("utf-8"), hashlib.sha256)
     return digest.hexdigest()[:8]
 
 
@@ -201,6 +205,34 @@ def discovery_tool_names(tools: Iterable[Tool], roles: ToolRoleMap) -> frozenset
 
 def _definition_tokens(definition: ToolDefinition, rc: LoopConstants) -> int:
     return estimate_tokens(definition.model_dump_json(), rc)
+
+
+def group_load_overflow(
+    rc: LoopConstants,
+    advertised: Iterable[ToolDefinition],
+    adding: Iterable[ToolDefinition],
+) -> str:
+    """Why loading ``adding`` whole onto a surface of ``advertised`` would not fit.
+
+    ``"count"`` when the two together are over ``max_advertised_tools``,
+    ``"tokens"`` when their definitions are over the tool-definition budget
+    (``tool_definitions_ratio`` of the window), and ``""`` when the load fits.
+    The budget the deferral holds groups back for is enforced here too, at
+    the two places a group is loaded whole — ``ToolSearch(group=...)`` and a
+    blind call held for the group's rules — because a group loaded whole past
+    it undoes at one stroke what holding it back had saved, and a provider's
+    count limit would then cut the group, or refuse the request.
+    """
+    advertised = list(advertised)
+    adding = list(adding)
+    limit = rc.max_advertised_tools
+    if limit > 0 and len(advertised) + len(adding) > limit:
+        return "count"
+    budget = derive_budgets(rc).tool_definitions_budget_tokens
+    tokens = sum(_definition_tokens(definition, rc) for definition in (*advertised, *adding))
+    if tokens > budget:
+        return "tokens"
+    return ""
 
 
 def _load_of(
@@ -364,8 +396,21 @@ def _choose_deferred(
     load = {name: _load_of(name, declared, overrides) for name in members}
 
     tokens_of = {tool.name: _definition_tokens(tool.definition, rc) for tool in tools}
+    # A group on the surface costs its rules too: they go into the catalogue
+    # beside it on every request. Counted with the definitions, so a group
+    # whose rules alone are over the budget is held back and gives them once,
+    # in the result that loads it, instead of filling the window before the
+    # first request.
+    rules_tokens = {
+        name: (
+            estimate_tokens(group_rules_text(name, declared[name].instructions), rc)
+            if name in declared and declared[name].instructions
+            else 0
+        )
+        for name in members
+    }
     group_tokens = {
-        name: sum(tokens_of[tool.name] for tool in grouped)
+        name: sum(tokens_of[tool.name] for tool in grouped) + rules_tokens[name]
         for name, grouped in members.items()
     }
 
@@ -376,7 +421,7 @@ def _choose_deferred(
     discovery_count = sum(1 for tool in tools if tool.name in discovery_names)
     # The surface as it goes out when nothing is held back carries no
     # discovery tool, so that is the one measured against the limits.
-    plain_tokens = sum(tokens_of.values()) - discovery_tokens
+    plain_tokens = sum(tokens_of.values()) - discovery_tokens + sum(rules_tokens.values())
     plain_count = len(tools) - discovery_count
     # The same budget the context layers are sized with; until this module it
     # was computed and never held to anything.
@@ -564,8 +609,12 @@ def _catalogue_key(engine: QueryEngine) -> tuple[Any, ...]:
     mid-run replaces the policy and registers nothing, when the tools were
     already registered for another session; keyed on the catalogue alone, the
     decision went stale and those tools reached the surface whole, however
-    many there were. The pins the run adds for the tools it loaded are left
-    out: loading a tool must not reopen the decision.
+    many there were. So is the execution profile, which reshapes the policy
+    the candidates come from in the same way: planned under a plan profile
+    that admitted none of a server's tools, the decision held nothing back,
+    and when the profile ended mid-run the server landed on the surface
+    whole. The pins the run adds for the tools it loaded are left out:
+    loading a tool must not reopen the decision.
     """
     policy = engine.config.tool_visibility_policy
     return (
@@ -578,6 +627,8 @@ def _catalogue_key(engine: QueryEngine) -> tuple[Any, ...]:
         frozenset(policy.blocked),
         frozenset(policy.pinned),
         policy.forced_pinned,
+        engine.config.execution_profile,
+        frozenset(engine.config.subagent_tool_allowlist),
     )
 
 
@@ -622,10 +673,18 @@ def ensure_tool_deferral(
         policy = engine.effective_tool_policy
     base = _unpinned_policy(engine, policy)
     registry = engine.tools
+    # The would-be surface is what the run may call: the policy's surface,
+    # narrowed to a child's declared tool set as dispatch narrows it. Planned
+    # from the policy alone, a child declared to use two tools was shown a
+    # catalogue of groups every load of which came back empty and every call
+    # of which was refused.
+    allowlist = engine.effective_subagent_tool_allowlist
     candidates: list[Tool] = []
     for definition in registry.compute_effective_surface(
         tenant_id=engine.config.tenant_id, policy=base, top_k=None
     ):
+        if allowlist is not None and definition.name not in allowlist:
+            continue
         tool = registry.get(definition.name)
         if tool is not None:
             candidates.append(tool)
@@ -719,8 +778,8 @@ def build_tool_surface(engine: QueryEngine) -> list[ToolDefinition]:
     """The tool definitions the next request advertises.
 
     The base surface is the registry's, in name order, minus held-back groups
-    and — while nothing is held back — minus the discovery tool, which has
-    nothing to find then. Discovered tools follow in discovery order. The
+    and — while every admitted tool is on it — minus the discovery tool, which
+    has nothing to find then. Discovered tools follow in discovery order. The
     order is the cache contract: the base does not move when a tool is loaded,
     and a loaded tool does not move when another one is.
     """
@@ -732,29 +791,39 @@ def build_tool_surface(engine: QueryEngine) -> list[ToolDefinition]:
     rc = engine.config.rc
     discovery = discovery_tool_names(registry.list_all(), engine.config.tool_roles)
     hidden = set(decision.deferred_names)
-    if not decision.deferred_groups:
-        explicit = set(policy.forced_pinned) | set(engine.config.tool_visibility_policy.pinned)
-        hidden |= discovery - explicit
     surface_policy = _unpinned_policy(engine, policy)
     if hidden - set(surface_policy.blocked):
         surface_policy = surface_policy.model_copy(
             update={"blocked": set(surface_policy.blocked) | hidden}
         )
+    top_k = rc.tool_retrieval_top_k or None
     base = list(
         registry.compute_effective_surface(
             tenant_id=engine.config.tenant_id,
             policy=surface_policy,
             query=engine.latest_user_message.text if engine.latest_user_message else "",
-            top_k=rc.tool_retrieval_top_k or None,
+            top_k=top_k,
             retrieval=RetrievalSettings.from_constants(rc),
         )
     )
     present = {definition.name for definition in base}
+    if not decision.deferred_groups:
+        # Nothing held back: the discovery tool has something to find only if
+        # the per-message clip left admitted tools off this surface. With the
+        # whole catalogue on it, a search tool would only cost the model turns.
+        explicit = set(policy.forced_pinned) | set(engine.config.tool_visibility_policy.pinned)
+        superfluous = (discovery & present) - explicit
+        if superfluous and not (top_k is not None and _clip_left_tools_off(engine, present)):
+            base = [definition for definition in base if definition.name not in superfluous]
+            present -= superfluous
     appended: list[ToolDefinition] = []
+    # The same two stages dispatch applies: a loaded tool the host's policy
+    # no longer admits, or that a child's declared tool set never did, is not
+    # advertised, so the model is never handed a schema every call of which
+    # the gate refuses. Loading a tool is not a way past either stage.
+    admitted = _admits(engine)
     for name in engine.context_manager.discovered_tool_names():
-        # ``pinned`` is where the engine admits a discovered tool, and where a
-        # wind-down or an execution profile withdraws it again.
-        if name in present or name not in policy.pinned or name in policy.blocked:
+        if name in present or not admitted(name):
             continue
         tool = registry.get(name)
         if tool is None:
@@ -767,20 +836,56 @@ def build_tool_surface(engine: QueryEngine) -> list[ToolDefinition]:
     return base + appended
 
 
+def _clip_left_tools_off(engine: QueryEngine, present: set[str]) -> bool:
+    """Whether an admitted tool is missing from ``present`` for the clip alone.
+
+    Measured against the surface the same policy gives with no clip and the
+    loaded tools already counted: what is missing then is exactly what a
+    search could find and load.
+    """
+    unclipped = engine.tools.compute_effective_surface(
+        tenant_id=engine.config.tenant_id, policy=_unpinned_policy(engine, engine.effective_tool_policy), top_k=None
+    )
+    loaded = set(engine.context_manager.discovered_tool_names())
+    return any(
+        definition.name not in present and definition.name not in loaded
+        for definition in unclipped
+    )
+
+
 def _fit_loaded(
     engine: QueryEngine, appended: list[ToolDefinition], room: int
 ) -> list[ToolDefinition]:
-    """Keep the ``room`` most recently used loaded tools, in discovery order.
+    """Keep the most recently used loaded entries that fit in ``room``, in discovery order.
+
+    An entry is one tool, or every tool of a group loaded whole, as it is for
+    eviction: a group the model asked for as a unit is carried whole or not at
+    all. Trimmed tool by tool, the list carried half of a group the model had
+    been told was loaded, and what it had been told was no longer true of the
+    list in front of it. An entry too large for the room left is passed over
+    and a smaller, older one may still fit.
 
     Only reached when a provider's tool limit would otherwise refuse the
     request. Dropping from the middle of the loaded tail costs the cache
     everything after it, which is still better than a request that fails.
     """
-    recency = engine.context_manager.discovered_tool_last_used()
-    keep = {
-        definition.name
-        for definition in sorted(appended, key=lambda d: recency.get(d.name, 0), reverse=True)[:room]
-    }
+    manager = engine.context_manager
+    recency = manager.discovered_tool_last_used()
+    groups = manager.discovered_tool_groups()
+    entries: dict[str, list[ToolDefinition]] = {}
+    for definition in appended:
+        group = groups.get(definition.name)
+        key = f"group:{group}" if group else f"tool:{definition.name}"
+        entries.setdefault(key, []).append(definition)
+    keep: set[str] = set()
+    for members in sorted(
+        entries.values(),
+        key=lambda members: max(recency.get(member.name, 0) for member in members),
+        reverse=True,
+    ):
+        if len(members) <= room:
+            keep.update(member.name for member in members)
+            room -= len(members)
     return [definition for definition in appended if definition.name in keep]
 
 
@@ -989,6 +1094,8 @@ def held_call_text(
     loaded: Sequence[str],
     first: bool,
     mark: str = "",
+    unloaded: Sequence[str] = (),
+    discovery_tool: str = "",
 ) -> str:
     """The answer to a blind call held for its group's rules.
 
@@ -999,7 +1106,10 @@ def held_call_text(
     written without the schema, and a retry from memory repeated the same
     wrong arguments; the other names are there because a model told only
     that its one tool was loaded went on to treat the rest of the group as
-    missing, and did their jobs by other means.
+    missing, and did their jobs by other means. ``unloaded`` are the group's
+    other tools the call did not load, because the whole group would not fit
+    the tool list; the answer says so and how to load the ones it needs, with
+    ``discovery_tool`` when the run has one.
     """
     others = [other for other in loaded if other != name]
     if first and rules:
@@ -1028,6 +1138,16 @@ def held_call_text(
             f"The whole {group} group is loaded now, so these are callable too: "
             f"{', '.join(others)}."
         )
+    elif unloaded:
+        how = (
+            f"load the ones you need with {discovery_tool} ('select:' and their exact names)"
+            if discovery_tool
+            else "call the one you need by its exact name"
+        )
+        lines.append(
+            f"The rest of the {group} group ({len(unloaded)} tools) is not loaded: "
+            f"the whole group would not fit your tool list, so {how}."
+        )
     lines.append(f"{name} is loaded now; call it again. It takes: {signature}")
     return "\n".join(lines)
 
@@ -1044,7 +1164,12 @@ def hold_call_for_rules(
     The whole group is loaded, as ``ToolSearch(group=...)`` would, and not the
     one tool: the rules are the group's, and a job that starts with one of its
     tools usually needs another of them next — which a model that had only
-    the called tool loaded could not see, and did without.
+    the called tool loaded could not see, and did without. Unless the whole
+    group would not fit the tool list (:func:`group_load_overflow`): then only
+    the called tool is loaded, as before groups were, and the answer names how
+    many more there are and how to load the ones the model needs. One blind
+    call is not a request for the group, and a large group loaded whole past
+    the budget undoes what holding it back had saved.
     """
     manager = engine.context_manager
     registry = engine.tools
@@ -1063,7 +1188,19 @@ def hold_call_for_rules(
     )
     if call.name not in members:
         members = sorted((*members, call.name))
-    newly = [name for name in members if manager.discover_tool(name, group=group)]
+    unloaded: list[str] = []
+    adding = [name for name in members if name not in advertised]
+    if group_load_overflow(
+        engine.config.rc,
+        [t.definition for n in advertised if (t := registry.get(n)) is not None],
+        [t.definition for n in adding if (t := registry.get(n)) is not None],
+    ):
+        unloaded = [name for name in members if name != call.name]
+        members = [call.name]
+    # Loaded as a group only when the group came whole: one tool of it is one
+    # entry, evicted on its own, and not a group the cap must keep together.
+    as_group = group if not unloaded else ""
+    newly = [name for name in members if manager.discover_tool(name, group=as_group)]
     # Not a use: the call did not run. Counted as one, a group the model
     # called once blind and then let go was carried into the session's next
     # run as though it had been used.
@@ -1071,6 +1208,8 @@ def hold_call_for_rules(
     if first and rules:
         engine._tool_group_rules_given.add(group)
     tool = registry.get(call.name)
+    discovery = discovery_tool_names(registry.list_all(), engine.config.tool_roles)
+    listed_discovery = {name for name in discovery if admitted(name)}
     content = held_call_text(
         call.name,
         group,
@@ -1079,6 +1218,8 @@ def hold_call_for_rules(
         loaded=members,
         first=first,
         mark=engine._tool_rules_mark,
+        unloaded=unloaded,
+        discovery_tool=min(listed_discovery) if listed_discovery else "",
     )
     events = [
         TurnEvent(
@@ -1147,7 +1288,12 @@ def seed_group_events(engine: QueryEngine) -> list[TurnEvent]:
     engine._seeded_tool_names = ()
     if not seeded:
         return []
-    present = set(engine.context_manager.discovered_tool_names())
+    # A seeded name the run may not call was not loaded for it, whatever the
+    # seed said, and is not announced as loaded either.
+    admitted = _admits(engine)
+    present = {
+        name for name in engine.context_manager.discovered_tool_names() if admitted(name)
+    }
     by_group: dict[str, tuple[str, list[str]]] = {}
     for name in seeded:
         group = _group_of(engine, name) if name in present else ""
