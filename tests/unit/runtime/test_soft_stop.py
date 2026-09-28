@@ -1045,17 +1045,18 @@ async def test_a_provider_failure_takes_the_wind_down() -> None:
 async def test_a_permanent_refusal_after_work_is_not_wound_down() -> None:
     """The wind-down's turn goes to the endpoint that has just refused the run for good.
 
-    It carries the same history and one more message, so it is refused the same
-    way: the run fails a turn later, and a host that reads the notice's cause
-    reports a wind-down where the provider had refused the request. A refusal
-    the adapter classified as final ends the run on the provider's own words.
+    For a refusal the tool surface cannot cause it carries nothing that would
+    change the answer, so it is refused the same way: the run fails a turn
+    later, and a host that reads the notice's cause reports a wind-down where
+    the provider had refused the request. Such a refusal ends the run on the
+    provider's own words.
     """
 
     class _Verdict:
-        reason = "format_error"
+        reason = "model_not_found"
         retryable = False
 
-    refusal = LLMProviderError("HTTP 400: this client version is no longer supported")
+    refusal = LLMProviderError("HTTP 404: this model is no longer supported")
     object.__setattr__(refusal, "classified", _Verdict())
     rc = LoopConstants(model_context_window=4_096)
     llm = _FailsOnLLM(

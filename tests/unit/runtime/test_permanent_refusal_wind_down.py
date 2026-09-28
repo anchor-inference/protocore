@@ -11,14 +11,14 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
-import pytest
-
 from protocore.contracts.llm import LLMProviderError, LLMRequest, LLMStreamEvent
 from protocore.contracts.runtime_constants import LoopConstants
+from protocore.runtime.events import EventType
 from protocore.runtime.loop_state import LoopState
 from tests.unit.runtime.test_soft_stop import (
     TERMINAL_TOOL,
     _build_engine,
+    _FailsOnLLM,
     _FinalizeTool,
     _NamedTool,
     _ScriptedLLM,
@@ -55,10 +55,6 @@ class _RefusesTheWideSurface:
         return max(1, len(text) // 4)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a non-retryable provider error skips the wind-down even when the wind-down's narrowed request would be served",
-)
 async def test_a_refusal_of_the_tool_surface_is_rescued_by_the_wind_down() -> None:
     llm = _RefusesTheWideSurface()
     engine = _build_engine(rc=LoopConstants(model_context_window=4_096), llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
@@ -67,3 +63,20 @@ async def test_a_refusal_of_the_tool_surface_is_rescued_by_the_wind_down() -> No
         pass
 
     assert engine.state is LoopState.COMPLETED
+
+
+async def test_a_surface_refusal_the_wind_down_meets_again_still_fails_on_the_providers_words() -> None:
+    """The wind-down is tried; when its narrowed request is refused too, the refusal is the outcome."""
+    refusal = LLMProviderError("HTTP 400: request rejected by the upstream validator")
+    object.__setattr__(refusal, "classified", _Verdict())
+    llm = _FailsOnLLM([{"tool": "Read", "args": {"x": "a"}}, {"text": "unused"}], refusal, fail_on={2, 3, 4})
+    engine = _build_engine(rc=LoopConstants(model_context_window=4_096), llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
+
+    events = [evt async for evt in engine.run(_user())]
+
+    reasons = [e.payload.get("reason") for e in events if e.type is EventType.STATE_CHANGED]
+    assert "soft_stop_notified" in reasons
+    assert "transient_llm_error_retry" not in reasons
+    assert engine.state is LoopState.FAILED
+    errors = [e.payload for e in events if e.type is EventType.ERROR]
+    assert errors and "upstream validator" in str(errors[-1].get("message"))

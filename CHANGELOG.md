@@ -8,6 +8,15 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **A permanent provider refusal the tool surface could have caused is wound
+  down again.** Since 2.0.0a22 every refusal the adapter classified as final
+  skipped the wind-down, on the premise that its request only adds one message.
+  It also narrows the tool surface to the finalizing tool, so a rejected tool
+  schema or a request made too large by the surface is served there and the run
+  reports what it found. Only refusals the surface cannot cause (`auth`,
+  `auth_permanent`, `billing`, `model_not_found`,
+  `oauth_long_context_beta_forbidden`, `provider_policy_blocked`,
+  `thinking_signature`, `image_too_large`) still skip it.
 - **A settled wound-down run resumed from its snapshot no longer gets the
   wind-down notice back.** `resume_from_snapshot` restored the notice for every
   snapshot whose wind-down state was armed, a finished run's included, and
