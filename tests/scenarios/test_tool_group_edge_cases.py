@@ -224,3 +224,42 @@ async def test_a_blind_call_does_not_load_past_the_tool_budget(
         for definition in run.requests[-1].tools
     )
     assert sent <= budget
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "rules owed are decided from the given-set stamped before a message's calls "
+        "run, so two loads of one group in one message (ToolSearch is concurrent-safe) "
+        "both carry the full rules"
+    ),
+)
+async def test_rules_are_given_once_when_one_message_loads_a_group_twice(
+    scenario: ScenarioFactory,
+) -> None:
+    run = scenario(
+        tools=[
+            ScriptedTool(tool_name="Note", description="record a note"),
+            ScriptedTool(tool_name="BrowserOpen", description="open a page"),
+            ScriptedTool(tool_name="BrowserClick", description="click on a page"),
+        ],
+    )
+    run.tools.register(ToolSearchTool(run.tools))
+    run.tools.declare_group(
+        "browser",
+        "Drive a web browser",
+        prefix="Browser",
+        load="lazy",
+        instructions="Ask the user before submitting a form.",
+    )
+    run.llm.queue_multi_tool_call_response(
+        tool_calls=[
+            ("s-1", "ToolSearch", {"select": "BrowserOpen"}),
+            ("s-2", "ToolSearch", {"select": "BrowserClick"}),
+        ]
+    )
+    run.llm.queue_response(text="loaded")
+    await run.run("load the browser")
+
+    results = run.tool_results()
+    assert sum("Ask the user before submitting a form." in r.content for r in results) == 1
