@@ -23,6 +23,11 @@ All notable changes to this project are recorded here. The format follows
   message could be cut. A term is now worth the larger of its own idf and its
   rarest lexicon expansion's idf at `tool_retrieval_lexicon_weight`, and terms
   that can add nothing to a score are dropped before the cap.
+- **`compute_effective_surface(top_k=0)` no longer clips to the pinned tools.**
+  `tool_retrieval_top_k` documents `0` as "no clip" and defaults to it, but the
+  registry read `0` as "retrieve no tool", so a host passing the constant
+  straight through advertised the pinned tools alone. `ToolRegistry` and
+  `InMemoryToolRegistry` now read `0` like `None`.
 
 ## [2.0.0a23] - 2026-09-27
 

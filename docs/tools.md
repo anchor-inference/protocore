@@ -180,9 +180,10 @@ Whichever layer runs, the **final ordering is always name-ascending** — the
 retrieval order drives *selection*, but the emitted list is sorted by name so
 the LLM context stays byte-stable and the KV-prefix cache survives across turns.
 The clip threshold is the RC `tool_retrieval_top_k` passed by the loop — `0`,
-the default, passes `None` and turns the clip off (see
-[why](#why-per-message-clipping-is-discouraged)) — and `retrieval` is
-`RetrievalSettings.from_constants(rc)`.
+the default, turns the clip off (see
+[why](#why-per-message-clipping-is-discouraged)); the registry reads `top_k=0`
+exactly like `None`, so a host may pass the constant as it is — and `retrieval`
+is `RetrievalSettings.from_constants(rc)`.
 
 The loop does not send this list as it is. `runtime/tool_deferral.py` builds the
 request's tools from it: it leaves out any tool group the run

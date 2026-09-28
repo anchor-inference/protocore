@@ -336,9 +336,10 @@ class ToolRegistry(IToolRegistry):
  the core tool-surface floor must survive a tenant ``visible``
  whitelist, not just the retrieval clip (see
  :meth:`_floored_visible_tools`).
- 2. If ``top_k`` is ``None``, or the tools that are not pinned number
- no more than ``top_k``: return the floored set sorted by name (no
- retrieval).
+ 2. If ``top_k`` is ``None`` or ``0`` (the default of
+ ``tool_retrieval_top_k``, which turns the clip off), or the tools that
+ are not pinned number no more than ``top_k``: return the floored set
+ sorted by name (no retrieval).
  3. Otherwise: pinned (policy.pinned) + forced_pinned + ``always_load``
  tools always included, and ``top_k`` more go to the best-ranked of
  the rest for ``query`` (the same ranking as :meth:`search`, fallback
@@ -367,8 +368,10 @@ class ToolRegistry(IToolRegistry):
  """
         visible_tools = self._floored_visible_tools(tenant_id, policy)
 
-        # Layer 2 + 3: clipping + retrieval
-        if top_k is None:
+        # Layer 2 + 3: clipping + retrieval. ``0`` is "no clip", as the
+        # constant it is read from documents it — not "retrieve no tool",
+        # which would advertise the pinned tools and nothing else.
+        if top_k is None or top_k <= 0:
             return [t.definition for t in visible_tools]
 
         # Layer-3 pins + the core floor. ``forced_pinned`` is already in the
@@ -393,21 +396,19 @@ class ToolRegistry(IToolRegistry):
         # the message said.
         if len(others) <= top_k:
             return [t.definition for t in visible_tools]
-        remaining = top_k
-        if remaining and others:
-            if query.strip():
-                # ``search_hint`` joins this corpus too, not only ToolSearch's:
-                # a tool's Russian hint must surface it in the advertised
-                # payload, not only through progressive discovery.
-                generation, tools = self._snapshot()
-                allowed = frozenset(t.name for t in others)
-                ranked = set(self._rank(query, generation, tools, allowed, remaining, retrieval))
-                chosen.extend(t for t in others if t.name in ranked)
-            else:
-                # No retrieval signal (autonomous batch, synthetic resume): the
-                # first others by name rather than none — a zero-tool surface
-                # leaves the model unable to act.
-                chosen.extend(others[:remaining])
+        if query.strip():
+            # ``search_hint`` joins this corpus too, not only ToolSearch's:
+            # a tool's Russian hint must surface it in the advertised
+            # payload, not only through progressive discovery.
+            generation, tools = self._snapshot()
+            allowed = frozenset(t.name for t in others)
+            ranked = set(self._rank(query, generation, tools, allowed, top_k, retrieval))
+            chosen.extend(t for t in others if t.name in ranked)
+        else:
+            # No retrieval signal (autonomous batch, synthetic resume): the
+            # first others by name rather than none — a zero-tool surface
+            # leaves the model unable to act.
+            chosen.extend(others[:top_k])
 
         chosen.sort(key=lambda t: t.name)
         return [t.definition for t in chosen]
