@@ -100,6 +100,12 @@ def raw_tokens(text: str) -> list[str]:
     """
     tokens: list[str] = []
     for chunk in _IDENTIFIER.findall(text):
+        # Most chunks are plain words; splitting one would yield the word
+        # itself, and skipping the split is most of the cost of analysing
+        # prose.
+        if chunk.isalpha() and (chunk.islower() or chunk.istitle()):
+            tokens.append(fold(chunk))
+            continue
         parts = split_identifier(chunk)
         joined = fold(_SEPARATORS.sub("", chunk))
         if len(parts) > 1:

@@ -106,7 +106,8 @@ class ToolRegistry(IToolRegistry):
  because which hit is best is the information its caller asked for.
 
  ``lexicon`` is the Russian-to-English query expansion: ``"bundled"``
- (the default) loads the one shipped with the package on first use, a
+ (the default) uses the one shipped with the package, built once per
+ process and shared by every registry, a
  :class:`Lexicon` supplies a host's own, ``None`` turns expansion off.
  ``retriever`` is an optional host ranker fused with the lexical ranking
  by reciprocal rank fusion.

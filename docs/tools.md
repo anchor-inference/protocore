@@ -272,8 +272,13 @@ an inflection the stemmer does not reduce. It serves both `search` and the clip.
 
 **Cost.** The analysed catalogue and the scoring constants are built once per
 catalogue version and settings and cached on the registry instance; `register`
-and `unregister` start a new version. At about 700 tools a build takes around
-150 ms and a query about a third of a millisecond.
+and `unregister` start a new version. What does not belong to one catalogue is
+shared by the whole process: the bundled lexicon is read and built once, and
+each tool's analysed fields are cached by its `ToolDocument`, so a registry
+built over tools the process has seen before — a host that builds one per
+request, or a catalogue in which one tool changed — only re-scores. At about 700
+tools a first build takes around 110 ms, a rebuild over known tools around
+20 ms, and a query well under a millisecond.
 
 **A host ranker.** `ToolRegistry(retriever=...)` accepts an `IToolRetriever`
 (`contracts/tool_retrieval.py`): a synchronous `rank(query, documents, limit)`

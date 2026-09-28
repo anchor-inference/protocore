@@ -27,13 +27,20 @@ Why the index is built once
 Tokenising and stemming a catalogue of hundreds of tools costs far more than
 scoring one query against it, so :class:`ToolIndex` is built once per catalogue
 version and settings, and a query only walks the postings of its own terms. The
-index is owned by the registry instance that built it — nothing here keeps
-state at module level.
+index is owned by the registry instance that built it.
+
+What does not depend on one catalogue is shared by the whole process, because a
+host may build a registry per request and would otherwise pay it every time:
+the bundled lexicon is read and built once (:meth:`Lexicon.bundled`), the
+analysed fields of a tool are cached per :class:`ToolDocument`, and a word's
+stem per word. All three are immutable once built and bounded in size, so a
+rebuilt index costs its scoring pass and little else.
 """
 # ruff: noqa: RUF001 — Russian word forms are the point of the lexicon rules
 
 from __future__ import annotations
 
+import functools
 import json
 import math
 import re
@@ -41,6 +48,7 @@ from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from importlib import resources
+from types import MappingProxyType
 from typing import Final
 
 from protocore.contracts.tool_retrieval import RetrievalSettings, ToolDocument
@@ -50,6 +58,13 @@ from protocore.runtime.text_analysis import STOPWORDS, content_words, fold
 
 #: Package data: English word -> the Russian words and phrases for it.
 BUNDLED_LEXICON_RESOURCE: Final[str] = "tool_retrieval_lexicon.json"
+
+# Bounds of the process-wide caches. A few catalogues of several hundred tools
+# fit in the first; the second covers the vocabulary of those catalogues and of
+# the queries against them. Past either bound the least recently used entry is
+# dropped, which costs a re-analysis, never a wrong result.
+_ANALYZED_DOCUMENT_CACHE_SIZE: Final[int] = 8192
+_STEM_CACHE_SIZE: Final[int] = 65536
 
 # A pasted log or a long message can carry hundreds of distinct words; scoring
 # all of them costs time and lets common words drown the few that name a tool.
@@ -188,9 +203,11 @@ class Lexicon:
     __slots__ = ("_expansions",)
 
     def __init__(self, expansions: Mapping[str, Iterable[str]]) -> None:
-        self._expansions: dict[str, tuple[str, ...]] = {
-            source: tuple(sorted(set(targets))) for source, targets in expansions.items() if targets
-        }
+        # Read-only once built: the bundled instance is shared by every
+        # registry in the process.
+        self._expansions: Mapping[str, tuple[str, ...]] = MappingProxyType(
+            {source: tuple(sorted(set(targets))) for source, targets in expansions.items() if targets}
+        )
 
     @classmethod
     def from_translations(cls, translations: Mapping[str, Sequence[str]]) -> Lexicon:
@@ -223,14 +240,10 @@ class Lexicon:
     def bundled(cls) -> Lexicon:
         """The Russian-to-English lexicon shipped with the package.
 
-        Read and built on every call; the caller keeps the result. The tool
-        registry builds it once, on its first query.
+        Read and built once per process, on the first call; every later call,
+        from any registry, returns the same immutable instance.
         """
-        text = resources.files("protocore.runtime").joinpath(BUNDLED_LEXICON_RESOURCE).read_text(encoding="utf-8")
-        translations = json.loads(text)
-        if not isinstance(translations, dict):
-            raise ValueError(f"{BUNDLED_LEXICON_RESOURCE} must hold a JSON object")
-        return cls.from_translations(translations)
+        return _bundled_lexicon()
 
     def expand(self, term: str) -> tuple[str, ...]:
         """English stems ``term`` expands to; empty when it has none.
@@ -264,13 +277,56 @@ def _imperatives(word: str) -> tuple[str, ...]:
     return ()
 
 
-@dataclass(frozen=True, slots=True)
-class _Posting:
-    """One term's field frequencies in one document."""
+@functools.cache
+def _bundled_lexicon() -> Lexicon:
+    text = resources.files("protocore.runtime").joinpath(BUNDLED_LEXICON_RESOURCE).read_text(encoding="utf-8")
+    translations = json.loads(text)
+    if not isinstance(translations, dict):
+        raise ValueError(f"{BUNDLED_LEXICON_RESOURCE} must hold a JSON object")
+    return Lexicon.from_translations(translations)
 
-    document: int
-    frequencies: tuple[int, int, int, int, int]
-    """Occurrences in name, hint, summary, rest of description, parameters."""
+
+#: A word's stem, cached for the process: catalogues and queries repeat words.
+_stem: Final = functools.lru_cache(maxsize=_STEM_CACHE_SIZE)(stem)
+
+
+def _analyze_field(text: str) -> Counter[str]:
+    """Stem -> occurrences in ``text``."""
+    return Counter(_stem(word) for word in content_words(text))
+
+
+# One term's occurrences in name, hint, summary, rest of description, parameters.
+_Frequencies = tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _AnalyzedDocument:
+    """What analysis makes of one tool, independent of any catalogue."""
+
+    lengths: tuple[int, int, int, int, int]
+    """Terms in each field."""
+    terms: tuple[tuple[str, _Frequencies], ...]
+    """Each distinct term with its occurrences per field."""
+
+
+@functools.lru_cache(maxsize=_ANALYZED_DOCUMENT_CACHE_SIZE)
+def _analyze_document(document: ToolDocument) -> _AnalyzedDocument:
+    """The analysed fields of ``document``, cached for the process.
+
+    A registry rebuilt over the same tools, or a catalogue in which one tool
+    changed, analyses only the documents it has not seen before.
+    """
+    summary, rest = split_summary(document.description)
+    name, hint, first, other, parameters = (
+        _analyze_field(text)
+        for text in (document.name, document.search_hint, summary, rest, document.parameters)
+    )
+    terms = tuple(
+        (term, (name[term], hint[term], first[term], other[term], parameters[term]))
+        for term in sorted(name.keys() | hint.keys() | first.keys() | other.keys() | parameters.keys())
+    )
+    lengths = (name.total(), hint.total(), first.total(), other.total(), parameters.total())
+    return _AnalyzedDocument(lengths, terms)
 
 
 class AnalyzedCatalogue:
@@ -283,7 +339,6 @@ class AnalyzedCatalogue:
 
     __slots__ = (
         "_fallback",
-        "_stems",
         "average_lengths",
         "documents",
         "field_lengths",
@@ -294,17 +349,8 @@ class AnalyzedCatalogue:
     def __init__(self, documents: Iterable[ToolDocument]) -> None:
         self.documents: tuple[ToolDocument, ...] = tuple(sorted(documents, key=lambda document: document.name))
         self.names: tuple[str, ...] = tuple(document.name for document in self.documents)
-        # Every word seen, with its stem: a query mostly uses the catalogue's
-        # own words, and this spares stemming them again on each query.
-        self._stems: dict[str, str] = {}
-        field_counts: list[tuple[Counter[str], ...]] = []
-        for document in self.documents:
-            summary, rest = split_summary(document.description)
-            fields = (document.name, document.search_hint, summary, rest, document.parameters)
-            field_counts.append(tuple(Counter(self._analyze(text)) for text in fields))
-        self.field_lengths: list[tuple[int, ...]] = [
-            tuple(sum(counter.values()) for counter in counters) for counters in field_counts
-        ]
+        analysed = [_analyze_document(document) for document in self.documents]
+        self.field_lengths: list[tuple[int, int, int, int, int]] = [document.lengths for document in analysed]
         # The floor keeps a field no tool uses (no hints anywhere) from
         # dividing by zero; its frequencies are all zero, so the value is moot.
         document_count = max(1, len(self.documents))
@@ -312,32 +358,30 @@ class AnalyzedCatalogue:
             max(1e-9, sum(lengths[index] for lengths in self.field_lengths) / document_count)
             for index in range(_FIELD_COUNT)
         )
-        postings: dict[str, list[_Posting]] = {}
-        for position, counters in enumerate(field_counts):
-            for term in set().union(*counters):
-                frequencies = (
-                    counters[0][term], counters[1][term], counters[2][term], counters[3][term], counters[4][term]
-                )
-                postings.setdefault(term, []).append(_Posting(position, frequencies))
-        self.postings: dict[str, list[_Posting]] = postings
-        self._fallback = _FallbackMatcher(self.documents)
-
-    def _analyze(self, text: str) -> list[str]:
-        terms: list[str] = []
-        for word in content_words(text):
-            stemmed = self._stems.get(word)
-            if stemmed is None:
-                stemmed = self._stems[word] = stem(word)
-            terms.append(stemmed)
-        return terms
+        #: Term -> (document position, occurrences per field), in position order.
+        postings: dict[str, list[tuple[int, _Frequencies]]] = {}
+        for position, document in enumerate(analysed):
+            for term, frequencies in document.terms:
+                entry = postings.get(term)
+                if entry is None:
+                    postings[term] = [(position, frequencies)]
+                else:
+                    entry.append((position, frequencies))
+        self.postings: dict[str, list[tuple[int, _Frequencies]]] = postings
+        # Built on first use: most queries score something and never need it.
+        self._fallback: _FallbackMatcher | None = None
 
     def query_terms(self, query: str) -> list[str]:
         """Stems of ``query``'s content words, repeats kept, in query order."""
-        stems = self._stems
-        return [stems.get(word) or stem(word) for word in content_words(query)]
+        return [_stem(word) for word in content_words(query)]
 
     def fallback(self, query: str, limit: int, allowed: frozenset[str] | None) -> list[str]:
-        return self._fallback.match(query, limit, allowed)
+        matcher = self._fallback
+        if matcher is None:
+            # Two threads that miss together both build; either result is
+            # the same.
+            matcher = self._fallback = _FallbackMatcher(self.documents)
+        return matcher.match(query, limit, allowed)
 
 
 class ToolIndex:
@@ -365,21 +409,28 @@ class ToolIndex:
         k1, b = settings.bm25_k1, settings.bm25_b
         count = len(catalogue.documents)
         averages = catalogue.average_lengths
+        # A field's weight over its length normaliser, per document: what one
+        # occurrence of a term in that field adds to the term's frequency.
+        scales = [
+            tuple(
+                weights[index] / (1.0 - b + b * lengths[index] / averages[index]) if weights[index] else 0.0
+                for index in range(_FIELD_COUNT)
+            )
+            for lengths in catalogue.field_lengths
+        ]
         self._idf: dict[str, float] = {}
         self._contributions: dict[str, tuple[tuple[int, float], ...]] = {}
         for term, postings in catalogue.postings.items():
             idf = math.log(1.0 + (count - len(postings) + 0.5) / (len(postings) + 0.5))
             self._idf[term] = idf
             scored: list[tuple[int, float]] = []
-            for posting in postings:
-                lengths = catalogue.field_lengths[posting.document]
-                frequency = 0.0
-                for index, occurrences in enumerate(posting.frequencies):
-                    if occurrences and weights[index]:
-                        normaliser = 1.0 - b + b * lengths[index] / averages[index]
-                        frequency += weights[index] * occurrences / normaliser
+            for position, (name, hint, summary, rest, parameters) in postings:
+                scale = scales[position]
+                frequency = (
+                    name * scale[0] + hint * scale[1] + summary * scale[2] + rest * scale[3] + parameters * scale[4]
+                )
                 if frequency:
-                    scored.append((posting.document, idf * frequency / (k1 + frequency)))
+                    scored.append((position, idf * frequency / (k1 + frequency)))
             if scored:
                 self._contributions[term] = tuple(scored)
 

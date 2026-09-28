@@ -34,6 +34,16 @@ All notable changes to this project are recorded here. The format follows
   stopword, and what was left of the query was "issue". The analyser now also
   keeps the joined form of every tail of an identifier's parts (`getissue`,
   `githubgetissue`), on both the catalogue and the query side.
+- **Building a retrieval index no longer repeats work the process has done.**
+  `Lexicon.bundled()` read and built the 2000-entry lexicon on every call, so
+  every new registry paid for it, and every registry re-tokenised and
+  re-stemmed each tool; a host that builds a registry per request paid about
+  a quarter of a second per request at 500 tools. The bundled lexicon is now
+  built once per process and is read-only; each tool's analysed fields are
+  cached by `ToolDocument` and each word's stem by word (both bounded); plain
+  words skip identifier splitting; and the fallback matcher is built only when
+  a query needs it. At 500 tools a rebuild over known tools takes about 15 ms
+  and a first build about 90 ms, against about 250 ms before.
 
 ## [2.0.0a23] - 2026-09-27
 
