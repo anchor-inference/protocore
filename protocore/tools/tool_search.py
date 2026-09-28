@@ -10,9 +10,10 @@ names what it loaded under
 loop — which owns the surface — does the loading, for names the live policy
 admits.
 
-The loop advertises this tool only while something is held back. With the whole
-catalogue on the surface it has nothing to find, and a model offered a search
-tool it does not need spends turns on it.
+The loop advertises this tool only while it has something to find: a group held
+back, or tools the per-message clip left off the surface. With the whole
+catalogue on the surface a model offered a search tool it does not need spends
+turns on it.
 """
 from __future__ import annotations
 
@@ -113,10 +114,11 @@ class ToolSearchTool(Tool):
 
     name_: ClassVar[str] = TOOL_SEARCH_TOOL_NAME
     # The loop recognises a discovery tool by this role, and advertises one only
-    # while something is held back.
+    # while something is held back or clipped off the surface.
     tool_roles: ClassVar[tuple[ToolRole, ...]] = (ToolRole.discovers_tools,)
-    # Survives the per-message clip like AskUser does; the loop still hides it
-    # when there is nothing to find.
+    # Survives the per-message clip like AskUser does, so that what the clip
+    # leaves off can still be found; the loop still hides it when there is
+    # nothing to find.
     always_load: ClassVar[bool] = True
     # Reads the catalogue and nothing else, so parallel calls are safe; the
     # loop applies what they loaded in the order the model asked.

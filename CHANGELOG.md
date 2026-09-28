@@ -16,6 +16,11 @@ All notable changes to this project are recorded here. The format follows
   host's policy admits on its own are pinned now, checked on every request, and
   the surface appends a loaded tool only when dispatch would admit it — a
   child's declared tool set included.
+- **`ToolSearch` stays advertised while the per-message clip leaves tools
+  off.** It was hidden whenever no group was held back, so with
+  `tool_retrieval_top_k` on the tools the clip left off could not be found.
+  The discovery tool is hidden only when every admitted tool is on the
+  surface.
 
 ## [2.0.0a23] - 2026-09-27
 

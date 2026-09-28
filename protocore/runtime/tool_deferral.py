@@ -719,8 +719,8 @@ def build_tool_surface(engine: QueryEngine) -> list[ToolDefinition]:
     """The tool definitions the next request advertises.
 
     The base surface is the registry's, in name order, minus held-back groups
-    and — while nothing is held back — minus the discovery tool, which has
-    nothing to find then. Discovered tools follow in discovery order. The
+    and — while every admitted tool is on it — minus the discovery tool, which
+    has nothing to find then. Discovered tools follow in discovery order. The
     order is the cache contract: the base does not move when a tool is loaded,
     and a loaded tool does not move when another one is.
     """
@@ -732,24 +732,31 @@ def build_tool_surface(engine: QueryEngine) -> list[ToolDefinition]:
     rc = engine.config.rc
     discovery = discovery_tool_names(registry.list_all(), engine.config.tool_roles)
     hidden = set(decision.deferred_names)
-    if not decision.deferred_groups:
-        explicit = set(policy.forced_pinned) | set(engine.config.tool_visibility_policy.pinned)
-        hidden |= discovery - explicit
     surface_policy = _unpinned_policy(engine, policy)
     if hidden - set(surface_policy.blocked):
         surface_policy = surface_policy.model_copy(
             update={"blocked": set(surface_policy.blocked) | hidden}
         )
+    top_k = rc.tool_retrieval_top_k or None
     base = list(
         registry.compute_effective_surface(
             tenant_id=engine.config.tenant_id,
             policy=surface_policy,
             query=engine.latest_user_message.text if engine.latest_user_message else "",
-            top_k=rc.tool_retrieval_top_k or None,
+            top_k=top_k,
             retrieval=RetrievalSettings.from_constants(rc),
         )
     )
     present = {definition.name for definition in base}
+    if not decision.deferred_groups:
+        # Nothing held back: the discovery tool has something to find only if
+        # the per-message clip left admitted tools off this surface. With the
+        # whole catalogue on it, a search tool would only cost the model turns.
+        explicit = set(policy.forced_pinned) | set(engine.config.tool_visibility_policy.pinned)
+        superfluous = (discovery & present) - explicit
+        if superfluous and not (top_k is not None and _clip_left_tools_off(engine, present)):
+            base = [definition for definition in base if definition.name not in superfluous]
+            present -= superfluous
     appended: list[ToolDefinition] = []
     # The same two stages dispatch applies: a loaded tool the host's policy
     # no longer admits, or that a child's declared tool set never did, is not
@@ -768,6 +775,23 @@ def build_tool_surface(engine: QueryEngine) -> list[ToolDefinition]:
     if limit > 0 and len(base) + len(appended) > limit:
         appended = _fit_loaded(engine, appended, max(0, limit - len(base)))
     return base + appended
+
+
+def _clip_left_tools_off(engine: QueryEngine, present: set[str]) -> bool:
+    """Whether an admitted tool is missing from ``present`` for the clip alone.
+
+    Measured against the surface the same policy gives with no clip and the
+    loaded tools already counted: what is missing then is exactly what a
+    search could find and load.
+    """
+    unclipped = engine.tools.compute_effective_surface(
+        tenant_id=engine.config.tenant_id, policy=_unpinned_policy(engine, engine.effective_tool_policy), top_k=None
+    )
+    loaded = set(engine.context_manager.discovered_tool_names())
+    return any(
+        definition.name not in present and definition.name not in loaded
+        for definition in unclipped
+    )
 
 
 def _fit_loaded(

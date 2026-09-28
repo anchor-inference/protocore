@@ -529,9 +529,11 @@ which stays exactly as it was.
 `protocore/tools/tool_search.py` ships the discovery tool:
 `ToolSearchTool(registry)`, named `ToolSearch`, carrying the role
 `discovers_tools` in its own `tool_roles`, `always_load`, and concurrent-safe.
-The loop advertises it **only while something is held back**; with the whole
-catalogue on the surface it has nothing to find, and a model offered a search
-it does not need spends turns on it.
+The loop advertises it **only while it has something to find**: a group held
+back, or — with `tool_retrieval_top_k` on — admitted tools the per-message clip
+left off the surface, which a search finds and loads like any other. With the
+whole catalogue on the surface it is left off, and the prompt is what it would
+be without it: a model offered a search it does not need spends turns on it.
 
 - `query` in free text returns up to `tool_search_max_results` matches, best
   first, one line each — `Name(param1, param2*) — first sentence`, required

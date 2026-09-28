@@ -176,13 +176,6 @@ async def test_a_loaded_tool_the_whitelist_drops_and_readmits_comes_back_where_i
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "build_tool_surface hides every discovers_tools tool while no group is held "
-        "back, including when the per-message clip left tools off the surface"
-    ),
-)
 async def test_a_clipped_surface_keeps_its_search_tool(scenario: ScenarioFactory) -> None:
     """With the per-message clip on, the tools it leaves off can only be found
     by a search; the search tool is always-load for exactly that reason."""
@@ -194,6 +187,39 @@ async def test_a_clipped_surface_keeps_its_search_tool(scenario: ScenarioFactory
     advertised = run.advertised_tool_names(0)
     assert len(advertised) < len(_tools()) + 1  # the clip did leave tools off
     assert "ToolSearch" in advertised
+
+
+async def test_a_clipped_tool_is_found_and_loaded_by_the_search(
+    scenario: ScenarioFactory,
+) -> None:
+    """The search tool kept on a clipped surface does its job: a tool the clip
+    left off is found, loaded, and appended after the clipped base."""
+    run = scenario(tools=_tools(), rc=default_rc(tool_retrieval_top_k=1))
+    run.tools.register(ToolSearchTool(run.tools))
+    run.llm.queue_tool_call_response(
+        tool_call_id="s-1", tool_name="ToolSearch", tool_input={"query": "select:Zeta"}
+    )
+    run.llm.queue_response(text="done")
+    await run.run("note this down")
+
+    assert "Zeta" not in run.advertised_tool_names(0)
+    assert run.advertised_tool_names(1)[-1] == "Zeta"
+    assert "ToolSearch" in run.advertised_tool_names(1)
+
+
+async def test_a_clip_that_leaves_nothing_off_hides_the_search_tool(
+    scenario: ScenarioFactory,
+) -> None:
+    """A clip wide enough for every admitted tool leaves the search nothing to
+    find, and the surface is what it would be with the clip off."""
+    run = scenario(tools=_tools(), rc=default_rc(tool_retrieval_top_k=len(_tools())))
+    run.tools.register(ToolSearchTool(run.tools))
+    run.llm.queue_response(text="done")
+    await run.run("note this down")
+
+    advertised = run.advertised_tool_names(0)
+    assert "ToolSearch" not in advertised
+    assert sorted(advertised) == sorted(tool.name for tool in _tools())
 
 
 @pytest.mark.xfail(
