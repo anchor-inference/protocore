@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0a25] - 2026-09-29
+
 ### Added
 
 - `LoopConstants.compaction_keep_recent_max_ratio` (default 0.25): the share of
