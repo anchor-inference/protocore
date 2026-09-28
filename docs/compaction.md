@@ -326,7 +326,7 @@ nothing or keep nothing; point the same code at a real provider to measure it.
 | `compaction_emergency_ratio` | 0.95 | the proactive emergency line |
 | `compaction_keep_recent_turns` | 4 | trailing messages kept verbatim |
 | `compaction_force_keep_recent_turns` | 1 | the same after a provider refusal |
-| `tool_result_truncation_ratio` | 0.10 | an output this share of the window is masked whatever its age |
+| `tool_result_truncation_ratio` | 0.10 | the most one tool result may take: a larger fresh result is cut to its head where it enters (the whole value stored, its reference named), and an older output this size is masked whatever its age |
 | `compaction_mask_keep_recent_results` | 8 | outputs never masked for age |
 | `compaction_mask_min_tokens` | 300 | smaller outputs are not masked for age |
 | `compaction_mask_distinct_lines` | 6 | distinct lines a placeholder keeps |

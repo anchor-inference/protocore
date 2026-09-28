@@ -6,6 +6,19 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A tool result larger than the per-result limit is cut where it enters the
+  run.** `tool_result_truncation_ratio` of the window was enforced only by
+  compaction, on results outside the protected tail; the result a tool had just
+  returned is always inside it, so a single oversized output reached the model
+  whole, and one larger than the window ended the run with
+  `llm_context_window_exceeded` even after the reactive pass. The whole value is
+  now stored in the blob store when the result is recorded, the model is shown
+  its head within the limit and a line naming the stored reference, and the
+  reference becomes the result's `canonical_ref`. The result's metadata carries
+  `protocore.tool_result_cut_on_entry` (`TOOL_RESULT_CUT_ON_ENTRY_METADATA_KEY`).
+
 ## [2.0.0a24] - 2026-09-28
 
 ### Added

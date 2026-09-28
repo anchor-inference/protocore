@@ -144,6 +144,9 @@ async def test_a_prompt_over_the_cliff_is_compacted_unconditionally(
             compaction_trigger_ratio=0.5,
             compaction_emergency_ratio=0.8,
             compaction_keep_recent_turns=1,
+            # The pressure comes from the results themselves, so each must be
+            # within the per-result limit: a larger one is cut where it enters.
+            tool_result_truncation_ratio=0.5,
         ),
         tools=[ScriptedTool(tool_name="Note", content="x" * 1_700)],
     )
@@ -181,6 +184,7 @@ async def test_the_cliff_switch_leaves_the_ordinary_gate_running(
             compaction_emergency_ratio=0.8,
             compaction_emergency_proactive_enabled=False,
             compaction_keep_recent_turns=1,
+            tool_result_truncation_ratio=0.5,
         ),
         tools=[ScriptedTool(tool_name="Note", content="x" * 1_100)],
     )

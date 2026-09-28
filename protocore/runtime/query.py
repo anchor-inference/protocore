@@ -260,6 +260,7 @@ from protocore.runtime.tool_dispatch import (
     _record_tool_call_soft_cap_warning,
 )
 from protocore.runtime.tool_permission import ToolPermissionGate
+from protocore.runtime.tool_result_entry_cap import cap_fresh_result as _cap_fresh_result
 from protocore.runtime.tool_surface import (
     note_surface_described,
     read_tool_surface,
@@ -6590,6 +6591,13 @@ async def _drain_dispatch_tool_deferred(
             outcome = item
             break
         events.append(item)
+    if outcome is not None:
+        outcome = await _cap_fresh_result(
+            outcome,
+            rc=engine.config.rc,
+            blob_store=engine.blobs,
+            tenant_id=engine.config.tenant_id,
+        )
     if outcome is not None and not outcome.approval_required:
         settle_intent(intent, result=str(outcome.content or "")[:200])
         _forget_intent(engine, intent)
@@ -11656,6 +11664,13 @@ async def _dispatch_tool(
             outcome = item
             break
         buffered.append(item)
+    if outcome is not None:
+        outcome = await _cap_fresh_result(
+            outcome,
+            rc=engine.config.rc,
+            blob_store=engine.blobs,
+            tenant_id=engine.config.tenant_id,
+        )
     if outcome is not None and outcome.approval_required:
         # The gate parked the call before the tool was reached. The record must
         # say so, or a resumed run reads "dispatched" and tells the model the
@@ -11781,6 +11796,13 @@ async def _dispatch_tool(
                 outcome = item
                 break
             buffered.append(item)
+        if outcome is not None:
+            outcome = await _cap_fresh_result(
+                outcome,
+                rc=engine.config.rc,
+                blob_store=engine.blobs,
+                tenant_id=engine.config.tenant_id,
+            )
         if dispatch_tree_permit is not None:
             await dispatch_tree_permit.reacquire()
         if outcome is None:
