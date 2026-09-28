@@ -80,3 +80,39 @@ async def test_a_group_loaded_whole_stays_whole_under_the_provider_tool_limit(
     advertised = run.advertised_tool_names(1)
     loaded = [name for name in advertised if name.startswith("Browser")]
     assert loaded in ([], [f"Browser{i:02d}" for i in range(6)])
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "a group's rules are written into the system prompt but never counted against "
+        "tool_definitions_ratio: a group whose definitions fit stays on the surface and "
+        "its rules land in every request, however long they are"
+    ),
+)
+async def test_rules_of_a_group_on_the_surface_count_against_the_tool_budget(
+    scenario: ScenarioFactory,
+) -> None:
+    rules = "Always double-check the page before acting on it. " * 400  # ~20 000 chars
+    run = scenario(
+        tools=[
+            ScriptedTool(tool_name="Note", description="record a note"),
+            ScriptedTool(tool_name="BrowserOpen", description="open a page"),
+        ],
+        rc=default_rc(model_context_window=4_096),
+    )
+    run.tools.register(ToolSearchTool(run.tools))
+    run.tools.declare_group(
+        "browser", "Drive a web browser", prefix="Browser", load="auto", instructions=rules
+    )
+    run.llm.queue_response(text="done")
+    await run.run("hello")
+
+    # The 1 024-token budget for tools (a quarter of the window) is exceeded
+    # five times over by the rules alone, so the group should be held back and
+    # its rules given only when it is loaded. Today the rules go into the
+    # system prompt and the first request is refused as over the window
+    # (LLMContextWindowExceeded) before it is sent.
+    assert run.requests, "no request was sent: the rules filled the context window"
+    assert "Always double-check the page" not in _system_text(run, 0)
+    assert "BrowserOpen" not in run.advertised_tool_names(0)
