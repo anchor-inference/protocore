@@ -697,8 +697,10 @@ refuses: the argument checks run before the gate, and a refused tool is never
 
 ### A runaway batch
 
-`max_tool_calls_per_turn` (default 64) bounds the tool calls dispatched from one
-model message. The calls past it are each answered with an error and never run,
+`max_tool_calls_per_turn` (default 24) bounds the tool calls dispatched from one
+model message. That leaves room for a genuine fan-out, such as reading a couple
+of dozen files at once, while one runaway message stays well short of the
+per-run tool-call soft caps. The calls past it are each answered with an error and never run,
 so every call still has its result and the transcript stays valid. They do not
 count as the tool failing — a thousand refused copies of one search would
 otherwise trip the circuit breaker on it. More than a thousand parallel calls in

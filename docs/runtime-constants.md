@@ -246,7 +246,7 @@ caps the tools a run keeps loaded, and is also the headroom the count limit
 leaves for them. `tool_search_max_results` and `tool_search_autoload_count` shape
 a `ToolSearch` result, `tool_catalogue_max_listed_names` decides when a
 prefix-declared group is listed by its prefix, and `max_tool_calls_per_turn`
-bounds one model message's batch. `tool_retrieval_top_k` is `0` — the
+(default `24`) bounds one model message's batch. `tool_retrieval_top_k` is `0` — the
 per-message clip is off, and turning it on is not recommended. See
 [`tools.md`](tools.md#holding-tool-groups-back).
 

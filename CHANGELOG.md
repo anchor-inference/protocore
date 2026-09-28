@@ -6,6 +6,17 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **`max_tool_calls_per_turn` defaults to 24** (was 64). It bounds the calls
+  dispatched from one model message; 24 still fits a genuine fan-out, such as
+  reading a couple of dozen files at once, while 64 let a single runaway
+  message come close to the per-run tool-call soft caps
+  (`subagent_tool_call_soft_cap` is 40) before any call was refused.
+- **`tool_retrieval_top_k` stays `0`**, the per-message clip off. A host that
+  passes the constant to `compute_effective_surface` as it is now gets the
+  same unclipped surface the loop advertises (see Fixed).
+
 ### Fixed
 
 - **Russian imperatives reach the tools their infinitives reach.** The bundled
