@@ -83,6 +83,7 @@ from protocore.contracts.tool_registry import (
     TOOL_GROUP_LOADS,
     IToolRegistry,
     ToolVisibilityPolicy,
+    policy_admits,
 )
 from protocore.contracts.tool_roles import (
     EMPTY_TOOL_ROLE_MAP,
@@ -2150,11 +2151,6 @@ class QueryEngine:
         base = self.config.tool_visibility_policy
         rc_floor = frozenset(self.config.rc.tool_surface_forced_pins)
         merged_floor = base.forced_pinned | rc_floor
-        # Discovered tools join ``pinned`` so dispatch admits them under a
-        # ``visible`` whitelist, exactly as it admits what it advertises. The
-        # surface builder takes them back out and appends them after the base.
-        dynamic_pins = frozenset(self.context_manager.discovered_tool_names())
-        merged_pins = set(base.pinned) | set(dynamic_pins)
         # Union the per-run circuit-broken tools into ``blocked`` so a
         # tool that crossed ``max_consecutive_tool_errors`` is removed from the
         # advertised surface (``ToolRegistry._floored_visible_tools`` lets
@@ -2162,6 +2158,25 @@ class QueryEngine:
         # (``ToolPermissionGate.check`` Stage-1 reads ``policy.blocked``). Empty
         # for every run that never tripped the breaker ⇒ no-op.
         merged_blocked = base.blocked | frozenset(self._circuit_broken_tools)
+        # Discovered tools join ``pinned`` so dispatch admits them under a
+        # ``visible`` whitelist, exactly as it admits what it advertises — but
+        # only the ones the host's policy admits on its own. ``pinned`` is
+        # admitted past ``visible``, so pinning a loaded tool the whitelist
+        # excludes would make loading it a way round the whitelist: a name
+        # seeded from an earlier run, or loaded before the host narrowed the
+        # policy mid-run, was callable that way. Read on every access, so a
+        # tool the policy drops is unpinned from the next request on, and
+        # comes back if the policy admits it again. The surface builder takes
+        # the pins back out and appends the tools after the base.
+        merged_pins = set(base.pinned)
+        discovered = self.context_manager.discovered_tool_names()
+        if discovered:
+            admission = base.model_copy(
+                update={"forced_pinned": merged_floor, "blocked": merged_blocked}
+            )
+            merged_pins.update(
+                name for name in discovered if policy_admits(admission, name)
+            )
         if (
             merged_floor == base.forced_pinned
             and merged_pins == base.pinned

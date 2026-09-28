@@ -16,6 +16,7 @@ import pytest
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.tools import ToolContext
 from protocore.contracts.types import MessageRole, TextBlock, ToolResult
+from protocore.runtime.events import EventType
 from protocore.runtime.tool_surface import forget_tool_surfaces
 from protocore.tools import ToolSearchTool
 
@@ -44,13 +45,6 @@ def _with_search(run: Scenario) -> Scenario:
     return run
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QueryEngineConfig.discovered_tools is loaded without a policy check; "
-        "the loaded name is then folded into pinned, which a visible whitelist admits"
-    ),
-)
 async def test_a_seeded_tool_outside_the_visible_whitelist_is_neither_advertised_nor_run(
     scenario: ScenarioFactory,
 ) -> None:
@@ -73,6 +67,39 @@ async def test_a_seeded_tool_outside_the_visible_whitelist_is_neither_advertised
     assert "Mcp_Github_create_issue" not in run.advertised_tool_names(0)
     result = run.tool_results()[0]
     assert result.is_error, result.content
+    # Nor is the seed announced as having loaded it.
+    assert not run.events_of(EventType.TOOL_GROUP_LOADED)
+    assert not run.events_of(EventType.TOOL_DISCOVERED)
+
+
+async def test_a_seeded_tool_inside_the_whitelist_is_loaded_as_before(
+    scenario: ScenarioFactory,
+) -> None:
+    """The check admits what the policy admits: a seed the whitelist covers
+    is advertised, announced and callable exactly as it was."""
+    run = _with_search(
+        scenario(
+            tools=_tools(),
+            tool_visibility_policy=ToolVisibilityPolicy(
+                visible={"Note", "Zeta", "ToolSearch", "Mcp_Github_create_issue"}
+            ),
+            discovered_tools=("Mcp_Github_create_issue",),
+        )
+    )
+    run.llm.queue_tool_call_response(
+        tool_call_id="c-1", tool_name="Mcp_Github_create_issue", tool_input={"v": "x"}
+    )
+    run.llm.queue_response(text="done")
+    await run.run("file it")
+
+    assert run.advertised_tool_names(0)[-1] == "Mcp_Github_create_issue"
+    assert not run.tool_results()[0].is_error
+    (loaded,) = run.events_of(EventType.TOOL_GROUP_LOADED)
+    assert loaded.payload == {
+        "group": "github",
+        "via": "seed",
+        "tools": ["Mcp_Github_create_issue"],
+    }
 
 
 @dataclass
@@ -92,14 +119,6 @@ class _Narrow(ScriptedTool):
         return await super().invoke(context, arguments)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "a loaded tool stays in the effective pinned set after the host's whitelist "
-        "drops it, and pinned is admitted past visible; the re-made deferral decision "
-        "does not unload it"
-    ),
-)
 async def test_a_loaded_tool_the_whitelist_later_drops_is_no_longer_callable(
     scenario: ScenarioFactory,
 ) -> None:

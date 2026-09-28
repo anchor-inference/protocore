@@ -6,6 +6,17 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A loaded tool is admitted like any other tool.** Loaded names were folded
+  into `pinned` unconditionally, and `pinned` is admitted past a `visible`
+  whitelist, so a tool seeded through `QueryEngineConfig.discovered_tools`,
+  restored from a snapshot, or loaded before the host narrowed its policy was
+  advertised and callable although the whitelist excluded it. Only names the
+  host's policy admits on its own are pinned now, checked on every request, and
+  the surface appends a loaded tool only when dispatch would admit it — a
+  child's declared tool set included.
+
 ## [2.0.0a23] - 2026-09-27
 
 ### Changed

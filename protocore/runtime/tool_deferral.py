@@ -751,10 +751,13 @@ def build_tool_surface(engine: QueryEngine) -> list[ToolDefinition]:
     )
     present = {definition.name for definition in base}
     appended: list[ToolDefinition] = []
+    # The same two stages dispatch applies: a loaded tool the host's policy
+    # no longer admits, or that a child's declared tool set never did, is not
+    # advertised, so the model is never handed a schema every call of which
+    # the gate refuses. Loading a tool is not a way past either stage.
+    admitted = _admits(engine)
     for name in engine.context_manager.discovered_tool_names():
-        # ``pinned`` is where the engine admits a discovered tool, and where a
-        # wind-down or an execution profile withdraws it again.
-        if name in present or name not in policy.pinned or name in policy.blocked:
+        if name in present or not admitted(name):
             continue
         tool = registry.get(name)
         if tool is None:
@@ -1147,7 +1150,12 @@ def seed_group_events(engine: QueryEngine) -> list[TurnEvent]:
     engine._seeded_tool_names = ()
     if not seeded:
         return []
-    present = set(engine.context_manager.discovered_tool_names())
+    # A seeded name the run may not call was not loaded for it, whatever the
+    # seed said, and is not announced as loaded either.
+    admitted = _admits(engine)
+    present = {
+        name for name in engine.context_manager.discovered_tool_names() if admitted(name)
+    }
     by_group: dict[str, tuple[str, list[str]]] = {}
     for name in seeded:
         group = _group_of(engine, name) if name in present else ""

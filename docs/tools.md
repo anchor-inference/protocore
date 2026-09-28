@@ -614,6 +614,18 @@ matches whether or not the model wanted them. A seeded tool counts as called.
 Each snapshot row carries `called`; a row without it is taken as called. A row
 of a tool loaded as part of a whole group also carries `group`.
 
+A loaded tool — seeded, restored from a snapshot, or loaded during the run — is
+admitted exactly as any other tool is. The engine folds loaded names into
+`pinned` so dispatch admits them under a `visible` whitelist, but only the names
+the host's policy admits on its own: `pinned` is admitted past `visible`, so a
+loaded name the whitelist excludes would otherwise be callable for having been
+loaded. The check is made on every request, so a tool the operator drops from
+the whitelist between runs is not brought back by the seed, and one dropped
+mid-run is neither advertised nor callable from the next request on; a child's
+declared tool set applies to loaded tools the same way. The run's loaded list
+still carries the name — it comes back if the policy admits it again — and the
+host's seed for the next run is checked the same way.
+
 A group is carried whole with `QueryEngineConfig.loaded_tool_groups`: each group
 named there is loaded as `ToolSearch(group=...)` would load it — only the tools
 the run may call, one entry under `pinned_tool_max_count`, newer than the tools
