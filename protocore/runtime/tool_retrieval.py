@@ -30,6 +30,7 @@ version and settings, and a query only walks the postings of its own terms. The
 index is owned by the registry instance that built it — nothing here keeps
 state at module level.
 """
+# ruff: noqa: RUF001 — Russian word forms are the point of the lexicon rules
 
 from __future__ import annotations
 
@@ -61,6 +62,39 @@ _MAX_QUERY_TERMS: Final[int] = 25
 # list missed; mapping them to English would expand to noise.
 _MIN_LEXICON_WORD_LENGTH: Final[int] = 3
 
+# Perfective prefixes of Russian verbs, tried longest first ("пере" before "по").
+# What is left after one must be at least this long, or a short word would lose
+# its first letters and land on an unrelated stem.
+_VERB_PREFIXES: Final[tuple[str, ...]] = tuple(
+    sorted(
+        (
+            "пере", "пред", "обо", "раз", "рас", "под", "при", "про", "над",
+            "вы", "за", "на", "от", "по", "до", "из", "ис", "об", "вз", "вс", "со", "с", "у",
+        ),
+        key=lambda prefix: (-len(prefix), prefix),
+    )
+)
+_MIN_UNPREFIXED_STEM_LENGTH: Final[int] = 4
+
+# Imperatives of a Russian infinitive, by its ending: (ending, replacements).
+# Which of "-и" and "-ь" an "-ить" verb takes depends on stress, which the
+# spelling does not show, so both are generated; the wrong one is not a word
+# and never occurs in a query. The first matching ending wins.
+_IMPERATIVE_RULES: Final[tuple[tuple[str, tuple[str, ...]], ...]] = (
+    ("овать", ("уй",)),
+    ("евать", ("юй", "уй")),
+    ("скать", ("щи", "скай")),
+    ("зать", ("жи", "зай")),
+    ("сать", ("ши", "сай")),
+    ("ать", ("ай",)),
+    ("ять", ("яй",)),
+    ("нуть", ("ни", "нь")),
+    ("ить", ("и", "ь")),
+    ("еть", ("и", "ь")),
+    ("ыть", ("ой",)),
+    ("йти", ("йди",)),
+)
+
 # The fallback ignores tokens shorter than this on both sides, and matches a
 # shared prefix of at least this many letters (Russian inflections share long
 # stems: "память"/"памяти").
@@ -77,7 +111,7 @@ _SENTENCE_END: Final[re.Pattern[str]] = re.compile(r"(?<=[.!?])\s+")
 # model is shown as the whole of what a tool does. Compared folded, with the
 # full stops of the abbreviation itself.
 _NEVER_FINAL: Final[frozenset[str]] = frozenset(
-    {"e.g.", "i.e.", "vs.", "cf.", "approx.", "incl.", "т.е.", "напр.", "т.к.", "т.н.", "см.", "ср."}  # noqa: RUF001 — Russian abbreviations
+    {"e.g.", "i.e.", "vs.", "cf.", "approx.", "incl.", "т.е.", "напр.", "т.к.", "т.н.", "см.", "ср."}
 )
 # These end a sentence as often as not ("…, CSV, etc. Use it when…"), so they
 # end one only when the next word starts a new sentence with a capital.
@@ -160,7 +194,14 @@ class Lexicon:
 
     @classmethod
     def from_translations(cls, translations: Mapping[str, Sequence[str]]) -> Lexicon:
-        """Build from ``{english word: [russian word or phrase, ...]}``."""
+        """Build from ``{english word: [russian word or phrase, ...]}``.
+
+        A Russian verb is listed as its infinitive, but asked for in the
+        imperative ("редактировать" / "отредактируй", "найти" / "найди"), and
+        the stemmer does not bring the two to one stem. Each infinitive is
+        therefore also registered under the stems of its imperatives
+        (:func:`_imperatives`).
+        """
         expansions: dict[str, set[str]] = {}
         for english, russian_phrases in translations.items():
             english_stems = {stem(word) for word in content_words(english)}
@@ -168,10 +209,14 @@ class Lexicon:
                 for word in content_words(phrase):
                     if len(word) < _MIN_LEXICON_WORD_LENGTH:
                         continue
-                    source = stem(word)
-                    # A loanword spelled the same after stemming would only
-                    # expand to itself.
-                    expansions.setdefault(source, set()).update(english_stems - {source})
+                    sources = {stem(word)}
+                    sources.update(
+                        stem(form) for form in _imperatives(word) if len(form) >= _MIN_LEXICON_WORD_LENGTH
+                    )
+                    for source in sources:
+                        # A loanword spelled the same after stemming would only
+                        # expand to itself.
+                        expansions.setdefault(source, set()).update(english_stems - {source})
         return cls(expansions)
 
     @classmethod
@@ -188,11 +233,35 @@ class Lexicon:
         return cls.from_translations(translations)
 
     def expand(self, term: str) -> tuple[str, ...]:
-        """English stems ``term`` expands to; empty when it has none."""
-        return self._expansions.get(term, ())
+        """English stems ``term`` expands to; empty when it has none.
+
+        A Russian verb stem the lexicon does not list is looked up once more
+        without its aspect prefix: the perfective is formed by prefixing the
+        imperfective ("отредактируй", "скопируй"), and no list can carry
+        every such pair. The longest prefix is tried first, and what is left
+        must stay long enough to be a word of its own.
+        """
+        expansion = self._expansions.get(term)
+        if expansion is not None:
+            return expansion
+        for prefix in _VERB_PREFIXES:
+            if term.startswith(prefix) and len(term) - len(prefix) >= _MIN_UNPREFIXED_STEM_LENGTH:
+                expansion = self._expansions.get(term[len(prefix) :])
+                if expansion is not None:
+                    return expansion
+        return ()
 
     def __len__(self) -> int:
         return len(self._expansions)
+
+
+def _imperatives(word: str) -> tuple[str, ...]:
+    """Imperative forms of ``word`` if it looks like a Russian infinitive, else none."""
+    for ending, replacements in _IMPERATIVE_RULES:
+        if word.endswith(ending):
+            base = word[: -len(ending)]
+            return tuple(base + replacement for replacement in replacements) if base else ()
+    return ()
 
 
 @dataclass(frozen=True, slots=True)

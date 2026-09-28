@@ -6,6 +6,17 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Russian imperatives reach the tools their infinitives reach.** The bundled
+  lexicon lists verbs as infinitives, and the stemmer keeps "отредактируй",
+  "найди" and "скопируй" apart from "редактировать", "найти" and
+  "копировать", so the most common form of a request expanded to nothing.
+  `Lexicon.from_translations` now also registers each infinitive under the
+  stems of its imperatives, and `Lexicon.expand` looks a stem it does not know
+  up once more without a perfective prefix. The bundled lexicon gains
+  "искать"/"поискать", "compare" and "translate".
+
 ## [2.0.0a23] - 2026-09-27
 
 ### Changed

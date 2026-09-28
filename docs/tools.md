@@ -255,7 +255,12 @@ lets a Russian query find a third-party tool that will never carry a Russian
 hint, so it also carries the loanwords and slang a Russian-speaking developer
 uses for the vocabulary of trackers, chat, calendars and deployments —
 "пулреквест", "ишью", "таска", "смержи", "выкати", "созвон", "алерт" — which no
-dictionary lists and which an MCP server's English is full of. A host passes its own with `ToolRegistry(lexicon=Lexicon.from_translations(...))`,
+dictionary lists and which an MCP server's English is full of. Verbs are listed
+as infinitives, but a request is usually an imperative, and the stemmer does not
+bring "редактировать" and "редактируй" to one stem; each infinitive is therefore
+also registered under the stems of its imperatives, and a stem the lexicon does
+not list is looked up once more without a perfective prefix ("отредактируй",
+"скопируй"). A host passes its own with `ToolRegistry(lexicon=Lexicon.from_translations(...))`,
 or turns expansion off with `lexicon=None` or a weight of 0.
 
 **When nothing scores**, a second stage matches loose substrings and shared
