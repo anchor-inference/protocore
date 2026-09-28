@@ -531,14 +531,17 @@ class LoopConstants(BaseModel):
         ),
     )
     max_tool_calls_per_turn: int = Field(
-        default=64,
+        default=24,
         ge=0,
         description=(
             "Most tool calls dispatched from one model message; 0 for no "
             "limit. Calls past it are answered with an error each, so every "
             "call still has its result, and none of them runs. A model can "
             "emit a runaway batch of identical calls — over a thousand in one "
-            "message has been seen — and each would otherwise run."
+            "message has been seen — and each would otherwise run. 24 leaves "
+            "room for a genuine fan-out (reading a couple of dozen files at "
+            "once) while one runaway message stays well short of the per-run "
+            "tool-call soft caps."
         ),
     )
     tool_retrieval_name_weight: float = Field(

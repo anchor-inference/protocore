@@ -20,6 +20,17 @@ All notable changes to this project are recorded here. The format follows
   message in snapshots, and is never sent to a provider. The request-only
   checkpoint summary is tagged too. See `docs/compaction.md`, invariant 13.
 
+### Changed
+
+- **`max_tool_calls_per_turn` defaults to 24** (was 64). It bounds the calls
+  dispatched from one model message; 24 still fits a genuine fan-out, such as
+  reading a couple of dozen files at once, while 64 let a single runaway
+  message come close to the per-run tool-call soft caps
+  (`subagent_tool_call_soft_cap` is 40) before any call was refused.
+- **`tool_retrieval_top_k` stays `0`**, the per-message clip off. A host that
+  passes the constant to `compute_effective_surface` as it is now gets the
+  same unclipped surface the loop advertises (see Fixed).
+
 ### Fixed
 
 - **A compaction pass no longer drains the history when the fixed part of the
@@ -53,6 +64,44 @@ All notable changes to this project are recorded here. The format follows
   `rearm` kept it, so the next turn opened with "your tools are gone" although
   every tool was back. The notice is now restored only for a run that is not
   terminal, and `rearm` removes any notice left in history.
+
+- **Russian imperatives reach the tools their infinitives reach.** The bundled
+  lexicon lists verbs as infinitives, and the stemmer keeps "отредактируй",
+  "найди" and "скопируй" apart from "редактировать", "найти" and
+  "копировать", so the most common form of a request expanded to nothing.
+  `Lexicon.from_translations` now also registers each infinitive under the
+  stems of its imperatives, and `Lexicon.expand` looks a stem it does not know
+  up once more without a perfective prefix. The bundled lexicon gains
+  "искать"/"поискать", "compare" and "translate".
+- **A long Russian message keeps the words that name the tool.** Past 25
+  distinct terms a query keeps the rarest, and rarity was the term's own idf in
+  the catalogue — 0 for every Russian word against English tools, so the 25
+  alphabetically first stems survived and a request at the end of a long
+  message could be cut. A term is now worth the larger of its own idf and its
+  rarest lexicon expansion's idf at `tool_retrieval_lexicon_weight`, and terms
+  that can add nothing to a score are dropped before the cap.
+- **`compute_effective_surface(top_k=0)` no longer clips to the pinned tools.**
+  `tool_retrieval_top_k` documents `0` as "no clip" and defaults to it, but the
+  registry read `0` as "retrieve no tool", so a host passing the constant
+  straight through advertised the pinned tools alone. `ToolRegistry` and
+  `InMemoryToolRegistry` now read `0` like `None`.
+- **The bare name of a namespaced tool ranks that tool first.** `get_issue`
+  ranked `mcp__github__add_issue_comment` above `mcp__github__get_issue`: the
+  index kept an identifier's parts and its whole joined form, "get" is a
+  stopword, and what was left of the query was "issue". The analyser now also
+  keeps the joined form of every tail of an identifier's parts (`getissue`,
+  `githubgetissue`), on both the catalogue and the query side.
+- **Building a retrieval index no longer repeats work the process has done.**
+  `Lexicon.bundled()` read and built the 2000-entry lexicon on every call, so
+  every new registry paid for it, and every registry re-tokenised and
+  re-stemmed each tool; a host that builds a registry per request paid about
+  a quarter of a second per request at 500 tools. The bundled lexicon is now
+  built once per process and is read-only; each tool's analysed fields are
+  cached by `ToolDocument` and each word's stem by word (both bounded); plain
+  words skip identifier splitting; and the fallback matcher is built only when
+  a query needs it. At 500 tools a rebuild over known tools takes about 15 ms
+  and a first build about 90 ms, against about 250 ms before.
+
 
 ## [2.0.0a23] - 2026-09-27
 

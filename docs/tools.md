@@ -180,9 +180,10 @@ Whichever layer runs, the **final ordering is always name-ascending** — the
 retrieval order drives *selection*, but the emitted list is sorted by name so
 the LLM context stays byte-stable and the KV-prefix cache survives across turns.
 The clip threshold is the RC `tool_retrieval_top_k` passed by the loop — `0`,
-the default, passes `None` and turns the clip off (see
-[why](#why-per-message-clipping-is-discouraged)) — and `retrieval` is
-`RetrievalSettings.from_constants(rc)`.
+the default, turns the clip off (see
+[why](#why-per-message-clipping-is-discouraged)); the registry reads `top_k=0`
+exactly like `None`, so a host may pass the constant as it is — and `retrieval`
+is `RetrievalSettings.from_constants(rc)`.
 
 The loop does not send this list as it is. `runtime/tool_deferral.py` builds the
 request's tools from it: it leaves out any tool group the run
@@ -217,7 +218,9 @@ catalogue and the query):
 
 - identifiers are split — CamelCase, `snake_case`, `kebab-case`, dotted paths,
   letter/digit boundaries — and the joined form is kept as well, so
-  `BrowserOpen` matches both `browser open` and `browseropen`;
+  `BrowserOpen` matches both `browser open` and `browseropen`, and so is the
+  joined form of every tail of the parts, so `get_issue` finds
+  `mcp__github__get_issue` ahead of the other issue tools of that server;
 - text is case-folded and `ё` is spelled `е`;
 - English and Russian stopwords are dropped, including conversational fillers
   ("please", "слушай", "короче", "плз");
@@ -255,7 +258,12 @@ lets a Russian query find a third-party tool that will never carry a Russian
 hint, so it also carries the loanwords and slang a Russian-speaking developer
 uses for the vocabulary of trackers, chat, calendars and deployments —
 "пулреквест", "ишью", "таска", "смержи", "выкати", "созвон", "алерт" — which no
-dictionary lists and which an MCP server's English is full of. A host passes its own with `ToolRegistry(lexicon=Lexicon.from_translations(...))`,
+dictionary lists and which an MCP server's English is full of. Verbs are listed
+as infinitives, but a request is usually an imperative, and the stemmer does not
+bring "редактировать" and "редактируй" to one stem; each infinitive is therefore
+also registered under the stems of its imperatives, and a stem the lexicon does
+not list is looked up once more without a perfective prefix ("отредактируй",
+"скопируй"). A host passes its own with `ToolRegistry(lexicon=Lexicon.from_translations(...))`,
 or turns expansion off with `lexicon=None` or a weight of 0.
 
 **When nothing scores**, a second stage matches loose substrings and shared
@@ -264,8 +272,13 @@ an inflection the stemmer does not reduce. It serves both `search` and the clip.
 
 **Cost.** The analysed catalogue and the scoring constants are built once per
 catalogue version and settings and cached on the registry instance; `register`
-and `unregister` start a new version. At about 700 tools a build takes around
-150 ms and a query about a third of a millisecond.
+and `unregister` start a new version. What does not belong to one catalogue is
+shared by the whole process: the bundled lexicon is read and built once, and
+each tool's analysed fields are cached by its `ToolDocument`, so a registry
+built over tools the process has seen before — a host that builds one per
+request, or a catalogue in which one tool changed — only re-scores. At about 700
+tools a first build takes around 110 ms, a rebuild over known tools around
+20 ms, and a query well under a millisecond.
 
 **A host ranker.** `ToolRegistry(retriever=...)` accepts an `IToolRetriever`
 (`contracts/tool_retrieval.py`): a synchronous `rank(query, documents, limit)`
@@ -684,8 +697,10 @@ refuses: the argument checks run before the gate, and a refused tool is never
 
 ### A runaway batch
 
-`max_tool_calls_per_turn` (default 64) bounds the tool calls dispatched from one
-model message. The calls past it are each answered with an error and never run,
+`max_tool_calls_per_turn` (default 24) bounds the tool calls dispatched from one
+model message. That leaves room for a genuine fan-out, such as reading a couple
+of dozen files at once, while one runaway message stays well short of the
+per-run tool-call soft caps. The calls past it are each answered with an error and never run,
 so every call still has its result and the transcript stays valid. They do not
 count as the tool failing — a thousand refused copies of one search would
 otherwise trip the circuit breaker on it. More than a thousand parallel calls in

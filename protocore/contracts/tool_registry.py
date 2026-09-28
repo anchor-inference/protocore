@@ -339,8 +339,9 @@ class IToolRegistry(Protocol):
 
         ``query`` is the recent user message (for retrieval); ``top_k`` is
         how many tools the clip retrieves BESIDES the pinned ones (pinned,
-        forced and always-load tools never count against it), ``None``
-        meaning no clip. ``retrieval`` carries the run's ranking settings;
+        forced and always-load tools never count against it); ``None`` and
+        ``0`` both mean no clip, so ``tool_retrieval_top_k`` can be passed
+        as it is. ``retrieval`` carries the run's ranking settings;
         ``None`` means the defaults.
         """
         ...
