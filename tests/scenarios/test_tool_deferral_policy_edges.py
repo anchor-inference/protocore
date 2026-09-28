@@ -143,6 +143,39 @@ async def test_a_loaded_tool_the_whitelist_later_drops_is_no_longer_callable(
     assert by_id["c-1"].is_error, by_id["c-1"].content
 
 
+async def test_a_loaded_tool_the_whitelist_drops_and_readmits_comes_back_where_it_was(
+    scenario: ScenarioFactory,
+) -> None:
+    """The loaded list keeps the name while the policy excludes it, so when the
+    host admits the tool again it is advertised again, at its old place in the
+    loaded tail, without another search."""
+    narrow = _Narrow(visible=frozenset({"Note", "Zeta", "ToolSearch", "Narrow", "Widen"}))
+    widen = _Narrow(tool_name="Widen", description="widen the whitelist", visible=frozenset())
+    run = _with_search(scenario(tools=[*_tools(), narrow, widen]))
+    narrow.engine = widen.engine = run.engine
+    run.llm.queue_tool_call_response(
+        tool_call_id="s-1",
+        tool_name="ToolSearch",
+        tool_input={"query": "select:Mcp_Github_create_issue"},
+    )
+    run.llm.queue_tool_call_response(tool_call_id="n-1", tool_name="Narrow", tool_input={})
+    run.llm.queue_tool_call_response(tool_call_id="w-1", tool_name="Widen", tool_input={})
+    run.llm.queue_tool_call_response(
+        tool_call_id="c-1", tool_name="Mcp_Github_create_issue", tool_input={"v": "x"}
+    )
+    run.llm.queue_response(text="done")
+    await run.run("load, narrow, widen, call")
+
+    assert run.advertised_tool_names(1)[-1] == "Mcp_Github_create_issue"
+    assert "Mcp_Github_create_issue" not in run.advertised_tool_names(2)
+    assert run.advertised_tool_names(3)[-1] == "Mcp_Github_create_issue"
+    by_id = {block.tool_call_id: block for block in run.tool_results()}
+    assert not by_id["c-1"].is_error, by_id["c-1"].content
+    assert run.engine.context_manager.called_discovered_tool_names() == (
+        "Mcp_Github_create_issue",
+    )
+
+
 @pytest.mark.xfail(
     strict=True,
     reason=(
