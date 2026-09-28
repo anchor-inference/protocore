@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0a24] - 2026-09-28
+
 ### Added
 
 - **`Message.origin` tells compaction's records from the conversation.** The

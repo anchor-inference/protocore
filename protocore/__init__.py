@@ -138,7 +138,7 @@ from protocore.runtime.token_counting import (
 from protocore.safety import DefaultShellSafetyPolicy, ShellPolicyDecision
 from protocore.tools import tool
 
-__version__ = "2.0.0a23"
+__version__ = "2.0.0a24"
 
 # Categorized re-export surface — intentionally NOT alphabetically sorted.
 __all__ = [  # noqa: RUF022
