@@ -20,7 +20,8 @@ behind it that happened in a real long-running session.
 | window `W` | `model_context_window`, the provider's context window in tokens |
 | prompt `P` | the whole request: the history **plus** the system prompt and the tool definitions (the *overhead*), in calibrated tokens |
 | trigger `T` | `compaction_trigger_tokens` (see [Budget arithmetic](#budget-arithmetic)); a pass opens when `P > T` |
-| target `R` | where an opened pass aims; `R < T` |
+| fixed part `F` | what no tier can remove: the overhead plus the protected set |
+| target `R` | where an opened pass aims; `R < T` unless `F ≥ T` |
 | pass | one run of the cascade below, opened by a gate |
 | span | what one summary stands for: one or more adjacent tool-pairing units |
 | carrier | the text that replaces a span: a summary, a fold or a floor digest |
@@ -156,9 +157,18 @@ than trusting a summary of its contents.
 The gate measures the whole prompt — history plus the system prompt and tools
 the last request carried — against the trigger, which already sits below the
 window less the output reserve (see below). An opened pass aims at the target
-`R = compaction_target_ratio × min(T, P)`, so the next pass is many turns
-away, not one. A pass that frees less than `compaction_min_gain_ratio` backs
-the per-iteration gate off for `compaction_no_gain_backoff_iterations`.
+`R = F + compaction_target_ratio × (min(T, P) − F)`: it keeps that share of the
+room it can actually work in, above the fixed part `F` that no tier can remove,
+so the next pass is many turns away, not one. A pass that frees less than
+`compaction_min_gain_ratio` backs the per-iteration gate off for
+`compaction_no_gain_backoff_iterations`.
+
+*Why.* The target used to be `compaction_target_ratio × min(T, P)` on the whole
+prompt. Under a large tool surface, or behind turns seeded from an earlier run,
+the fixed part alone sat above it: no amount of compaction could reach it, so
+every tier and the floor ran to exhaustion and a routine pass drained the run's
+own work to the task and the tail, when removing a round or two would have
+brought the prompt back under the trigger.
 
 ### 9. Reversibility
 
@@ -222,7 +232,8 @@ output inside the window (`provider_reserves_output_in_context_window`), else
 ```text
 T      = min(W × compaction_trigger_ratio,
              W − O − request_context_safety_tokens − W × compaction_trigger_turn_headroom_ratio)
-R      = compaction_target_ratio × min(T, P_before)
+F      = overhead + tokens of the protected set        # the pass's own profile
+R      = F + compaction_target_ratio × max(0, min(T, P_before) − F)
 need   = P + ledger growth − R                 # what the pass still has to free
 span   ≤ compaction_summary_group_max_tokens    # adjacent units joined, oldest first
 sent   when span > max(empty-summary size, compaction_summary_min_unit_tokens)
@@ -243,7 +254,9 @@ instructions 30 %, identifiers 30 %, files 15 %, open items 15 %, failures
 
 Example, a 256k window with a 64k output cap and a trigger ratio of 0.59:
 `T = min(151,040, 256,000 − 65,536 − 1,024 − 38,400) = 151,040`,
-`R = 90,624`; a 6,000-token span is summarised within 1,200 tokens, sent with
+`R = 90,624` with nothing fixed; with a 56,000-token tool surface and 75,000
+tokens of seeded turns, `F = 131,000` and `R = 143,024`, where the whole-prompt
+ratio would have asked for 90,624, below what the pass can reach; a 6,000-token span is summarised within 1,200 tokens, sent with
 a 2,400-token cap; the ledger may spend 5,120 tokens.
 
 ## Failure states
@@ -272,6 +285,7 @@ a 2,400-token cap; the ledger may spend 5,120 tokens.
 | `outcome` | `below_target`, `below_trigger`, `above_trigger`, `at_floor` or `unchanged` |
 | `prompt_before`, `prompt_after` | the whole prompt, overhead included |
 | `trigger_threshold`, `target_tokens` | the pass's `T` and `R` |
+| `fixed_tokens` | the pass's `F`: overhead plus the protected history |
 | `tier1_masked_by_age` | outputs masked for their age rather than their size |
 | `tier2_attempted`, `tier2_failures`, `tier2_recovered` | calls made, failures by kind, replies recovered by kind |
 | `tier3_failures` | fold failures by kind |

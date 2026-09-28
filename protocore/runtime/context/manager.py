@@ -30,6 +30,7 @@ from protocore.runtime.context.compaction import (
     estimate_history_tokens,
     floor_has_work,
     place_ledger,
+    removable_indices,
     run_floor,
     run_tier1_truncation,
     run_tier2_summarisation,
@@ -544,9 +545,11 @@ class ContextManager:
     ) -> CompactionAttempt:
         """One pass of the cascade: mask, summarise, fold, floor — each only while room is still needed.
 
-        The pass aims at the TARGET, ``compaction_trigger_tokens *
-        compaction_target_ratio``, measured on the whole prompt: the history
-        plus ``overhead_tokens`` (system prompt and tools). Each tier runs only
+        The pass aims at the TARGET, measured on the whole prompt: the history
+        plus ``overhead_tokens`` (system prompt and tools). The target leaves
+        ``compaction_target_ratio`` of the room the pass can actually work in:
+        ``F + ratio * (min(trigger, prompt) - F)``, where ``F`` is what no tier
+        can remove — the overhead and the protected history. Each tier runs only
         while the prompt is above the target, cheapest first. If the prompt is
         still above the TRIGGER when the model tiers are done — the summariser
         failed, timed out, is suspended, or found nothing worth a call — the
@@ -564,26 +567,42 @@ class ContextManager:
         overhead = max(0, overhead_tokens)
         trigger = budgets.compaction_trigger_tokens
         tokens_before = self._token_estimator.estimate_history(history, rc)
+        keep = rc.compaction_force_keep_recent_turns if reactive else None
+        compact_seeded_history = reactive
         # A pass is opened because the prompt is too large: the gate saw it
         # over the trigger, or the provider refused it. Aiming below the
         # current size by the same ratio as below the trigger means an opened
         # pass always has something to free, including when the evidence that
         # opened it (a refusal) says more than the estimate does.
-        target = max(
-            1,
-            min(
-                int(trigger * rc.compaction_target_ratio),
-                int((tokens_before + overhead) * rc.compaction_target_ratio),
-            ),
+        #
+        # The ratio applies to the part of the prompt the pass can change. The
+        # overhead and the protected history (the task, the ledger, reference
+        # blocks, the kept tail, and seeded turns outside reactive recovery)
+        # stay whatever the pass does. Applied to the whole prompt, a target
+        # below that fixed part is unreachable, and every tier and the floor
+        # then run to exhaustion: the run's own work is drained to the task and
+        # the tail although dropping a round or two would have been enough.
+        removable = removable_indices(
+            history,
+            rc,
+            keep_recent_turns=keep,
+            protect_tail_from_index=protect_tail_from_index,
+            compact_seeded_history=compact_seeded_history,
         )
+        fixed = overhead + sum(
+            self._token_estimator.estimate_message(message, rc)
+            for idx, message in enumerate(history)
+            if idx not in removable
+        )
+        ceiling = min(trigger, tokens_before + overhead)
+        target = max(1, fixed + int(max(0, ceiling - fixed) * rc.compaction_target_ratio))
         attempt = CompactionAttempt(
             tokens_before=tokens_before,
             prompt_before=tokens_before + overhead,
             trigger_tokens=trigger,
             target_tokens=target,
+            fixed_tokens=fixed,
         )
-        keep = rc.compaction_force_keep_recent_turns if reactive else None
-        compact_seeded_history = reactive
         ledger = ledger_from_history(history)
         ledger_before = sum(
             self._token_estimator.estimate_message(message, rc) for message in history if is_ledger(message)

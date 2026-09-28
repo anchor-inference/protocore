@@ -22,6 +22,15 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **A compaction pass no longer drains the history when the fixed part of the
+  prompt sits above its target.** The target was `compaction_target_ratio ×
+  min(T, P)` on the whole prompt; when the system prompt, the tool definitions
+  and the protected history (the task, the ledger, the kept tail, seeded turns)
+  alone were above it, it was unreachable, and every tier and the floor ran to
+  exhaustion, leaving the task and the last messages. The target is now
+  `F + compaction_target_ratio × (min(T, P) − F)`, where `F` is what no tier
+  can remove; with nothing fixed it is unchanged. `compaction_completed`
+  carries `fixed_tokens`, and `removable_indices` names what a pass may remove.
 - **A compaction record no longer starts a new round of the run.** The ledger,
   summaries and floor digest are user-role, and the round boundary took them
   for a caller's message. After a reactive pass put the ledger before the

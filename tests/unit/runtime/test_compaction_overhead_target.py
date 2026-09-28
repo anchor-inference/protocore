@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import Message, MessageRole, TextBlock, ToolResultBlock, ToolUseBlock
 from protocore.runtime.context.budgets import derive_budgets
@@ -42,10 +40,6 @@ def _history(rounds: int, prefix: str = "call") -> list[Message]:
     return history
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="target below the fixed overhead is unreachable, so a forced pass floors the whole history",
-)
 async def test_forced_pass_over_a_large_overhead_keeps_history_it_did_not_need_to_remove() -> None:
     rc = LoopConstants(model_context_window=32_768, compaction_keep_recent_turns=2)
     trigger = derive_budgets(rc).compaction_trigger_tokens
@@ -77,10 +71,6 @@ async def test_forced_pass_over_a_large_overhead_keeps_history_it_did_not_need_t
     assert rounds_after > 2, (rounds_before, rounds_after)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="seeded turns and the overhead together sit above the target, so a routine pass floors all of the run's own work",
-)
 async def test_routine_pass_behind_a_session_seed_keeps_most_of_the_runs_own_work() -> None:
     from protocore.contracts.types import SESSION_HISTORY_SEED_METADATA_KEY
 
@@ -118,3 +108,51 @@ async def test_routine_pass_behind_a_session_seed_keeps_most_of_the_runs_own_wor
     assert attempt.floor is not None
     assert not attempt.floor.reached, (own_rounds, kept, attempt.outcome)
     assert kept > 2, (own_rounds, kept)
+
+
+async def test_the_target_leaves_the_ratio_of_the_room_above_what_no_tier_can_remove() -> None:
+    from protocore.runtime.context.compaction import compaction_event_payload
+
+    rc = LoopConstants(model_context_window=32_768, compaction_keep_recent_turns=2)
+    trigger = derive_budgets(rc).compaction_trigger_tokens
+    overhead = int(trigger * 0.3)
+    history = _history(60)
+    while estimate_history_tokens(history[:-2], rc) + overhead > trigger:
+        history = history[:-2]
+    prompt = estimate_history_tokens(history, rc) + overhead
+
+    manager = ContextManager(rc=rc, blob_store=InMemoryBlobStore(), compaction_llm=None)
+    attempt = await manager.force_compaction(
+        history=history,
+        compaction_state=CompactionState(),
+        tenant_id="t",
+        model_name="m",
+        overhead_tokens=overhead,
+    )
+
+    fixed = attempt.fixed_tokens
+    # The overhead, the task and the kept tail.
+    assert overhead < fixed < overhead + trigger * 0.1
+    ceiling = min(trigger, prompt)
+    assert attempt.target_tokens == fixed + int((ceiling - fixed) * rc.compaction_target_ratio)
+    assert attempt.prompt_after <= attempt.target_tokens
+    assert compaction_event_payload(attempt, reason="r")["fixed_tokens"] == fixed
+
+
+async def test_a_fixed_part_above_the_trigger_takes_everything_removable() -> None:
+    rc = LoopConstants(model_context_window=32_768, compaction_keep_recent_turns=2)
+    trigger = derive_budgets(rc).compaction_trigger_tokens
+    history = _history(6)
+
+    manager = ContextManager(rc=rc, blob_store=InMemoryBlobStore(), compaction_llm=None)
+    attempt = await manager.force_compaction(
+        history=history,
+        compaction_state=CompactionState(),
+        tenant_id="t",
+        model_name="m",
+        overhead_tokens=trigger + 1,
+    )
+
+    assert attempt.target_tokens == attempt.fixed_tokens
+    assert attempt.floor is not None and attempt.floor.reached
+    assert attempt.outcome == "at_floor"
