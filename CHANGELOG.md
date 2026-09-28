@@ -6,6 +6,20 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`Message.origin` tells compaction's records from the conversation.** The
+  ledger, the turn and fold summaries and the floor digest are user-role
+  messages, because a provider accepts no system message past the first, and a
+  host that persisted history by role stored them as the user's own turns and
+  seeded them into the next run as such. Every message now answers
+  `Message.origin` with `MessageOrigin.conversation` or
+  `MessageOrigin.compaction`; the value is derived from the tags compaction
+  already sets (`protocore.compaction_summary`, and `protocore.compaction_ledger`,
+  now also exported as `COMPACTION_LEDGER_METADATA_KEY`), is serialised with the
+  message in snapshots, and is never sent to a provider. The request-only
+  checkpoint summary is tagged too. See `docs/compaction.md`, invariant 13.
+
 ### Fixed
 
 - **A permanent provider refusal the tool surface could have caused is wound

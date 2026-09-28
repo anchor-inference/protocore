@@ -46,6 +46,7 @@ from protocore.contracts.tool_roles import (
     ToolRoleMap,
 )
 from protocore.contracts.types import (
+    COMPACTION_LEDGER_METADATA_KEY,
     Message,
     MessageRole,
     TextBlock,
@@ -56,7 +57,7 @@ from protocore.runtime.token_counting import estimate_tokens
 from protocore.runtime.tool_arguments import string_argument
 from protocore.runtime.wire_format import is_compacted_placeholder
 
-LEDGER_METADATA_KEY: Final[str] = "protocore.compaction_ledger"
+LEDGER_METADATA_KEY: Final[str] = COMPACTION_LEDGER_METADATA_KEY
 """On the ledger message: its structured state, from which it is rebuilt."""
 
 _OPEN_TAG: Final[str] = "<compaction-ledger>"

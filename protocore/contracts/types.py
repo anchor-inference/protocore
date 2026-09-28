@@ -19,6 +19,7 @@ from pydantic import (
     ConfigDict,
     Field,
     SerializerFunctionWrapHandler,
+    computed_field,
     field_validator,
     model_serializer,
     model_validator,
@@ -122,6 +123,23 @@ class MessageRole(StrEnum):
     user = "user"
     assistant = "assistant"
     tool = "tool"
+
+
+class MessageOrigin(StrEnum):
+    """Who put a message into history, as far as a host that keeps history cares.
+
+    The role says how the model reads a message; the origin says whose it is.
+    They differ for compaction's service records: the ledger, the turn and fold
+    summaries and the floor digest are user-role, because a provider accepts no
+    system message past the first, but nobody said them. A host that persists
+    or displays a conversation filters on this, not on the role.
+    """
+
+    conversation = "conversation"
+    """Written by the caller, the model or a tool: part of the conversation."""
+    compaction = "compaction"
+    """A record compaction wrote in place of earlier turns. Not the user's
+    message; it stands for turns the host already has in their original form."""
 
 
 class StopReason(StrEnum):
@@ -306,6 +324,12 @@ must carry it. Survives snapshot/resume via
 already-summarised turn by its DURABLE flag instead of the prior process-local
 ``str(id(obj))`` key (which minted a new value on every resume → re-summarise
 churn + summary-of-summary decay)."""
+
+COMPACTION_LEDGER_METADATA_KEY = "protocore.compaction_ledger"
+"""``Message.metadata`` key on the compaction ledger: the ledger's structured
+state (a dict), from which the ledger is rebuilt and merged on the next pass.
+Like :data:`COMPACTION_SUMMARY_METADATA_KEY` it makes the message's
+:attr:`Message.origin` :attr:`MessageOrigin.compaction`."""
 
 COMPACTION_REFERENCE_METADATA_KEY = "protocore.compaction_reference"
 """``Message.metadata`` flag (bool) marking a non-tool message as a FROZEN
@@ -825,6 +849,27 @@ class Message(BaseModel):
                 f"got role={self.role}"
             )
         return self
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def origin(self) -> MessageOrigin:
+        """Whose message this is: :attr:`MessageOrigin.compaction` for a record compaction wrote.
+
+        Derived from the tags compaction puts on every record it writes
+        (:data:`COMPACTION_SUMMARY_METADATA_KEY` on turn and fold summaries and
+        on the floor digest, :data:`COMPACTION_LEDGER_METADATA_KEY` on the
+        ledger), so it cannot drift from them and a history saved before the
+        field existed reads the same. Serialised with the message — a snapshot's
+        history carries ``"origin"`` on every entry — and ignored on the way
+        back in. Never sent to a provider.
+        """
+        metadata = self.metadata
+        if (
+            metadata.get(COMPACTION_SUMMARY_METADATA_KEY) is True
+            or metadata.get(COMPACTION_LEDGER_METADATA_KEY) is not None
+        ):
+            return MessageOrigin.compaction
+        return MessageOrigin.conversation
 
     @property
     def text(self) -> str:
@@ -1579,6 +1624,7 @@ __all__ = [
     "ImageRefBlock",
     "LLMCallRecord",
     "Message",
+    "MessageOrigin",
     "MessageRole",
     "Run",
     "RunState",

@@ -190,6 +190,27 @@ A carrier depends only on the messages it replaces: no timestamps, no
 identifiers minted at random. The same history produces the same requests,
 which is what lets a recorded run be replayed past its first compaction.
 
+### 13. Its records are marked as its own
+
+Everything compaction writes into the history — the ledger, the summaries and
+folds, the floor digest — is user-role, because a provider accepts no system
+message past the first. None of it is the user's message, and a host must not
+store or show it as one. Every such message answers `Message.origin` with
+`MessageOrigin.compaction`; everything else answers
+`MessageOrigin.conversation`. The origin is derived from the tags compaction
+already sets (`protocore.compaction_summary`, `protocore.compaction_ledger`), is
+serialised with the message — each entry of a snapshot's `history` carries
+`"origin"` — and is never sent to a provider, so what the model reads is
+unchanged.
+
+A host that persists history (`persist_history_delta`, `persist_session_history`,
+or its own reading of `engine.history`) filters on it: a compaction record
+stands for turns the host already holds in their original form, so it is
+either dropped or stored under its own origin, never as the user's turn.
+
+*Why.* The ledger was stored by a host as the user's own message, drawn as a
+user bubble, and seeded into the next run as an operator turn.
+
 ## Budget arithmetic
 
 With `O = W × llm_output_max_tokens_ratio` when the provider reserves the

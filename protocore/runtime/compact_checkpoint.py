@@ -11,7 +11,7 @@ from protocore.contracts.tool_roles import (
     WORKSPACE_MUTATION_ROLES,
     ToolRoleMap,
 )
-from protocore.contracts.types import Message, MessageRole
+from protocore.contracts.types import COMPACTION_SUMMARY_METADATA_KEY, Message, MessageRole
 
 
 def tracked_tool_names(
@@ -154,6 +154,8 @@ def apply_checkpoint(
         Message(
             role=MessageRole.user,
             content_blocks=[TextBlock(text=body)],
+            # Compaction's record, not the user's turn: its origin says so.
+            metadata={COMPACTION_SUMMARY_METADATA_KEY: True},
         )
     ]
     return prefix + tail
