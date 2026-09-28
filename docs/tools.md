@@ -580,7 +580,15 @@ be without it: a model offered a search it does not need spends turns on it.
   Tools loaded as a whole group are **one entry** under `pinned_tool_max_count`
   and are unloaded together: a model that asked for a group cannot notice that
   eviction left half of it, and a group of twelve against a cap of fifteen
-  would otherwise crowd out everything else.
+  would otherwise crowd out everything else. A group is loaded whole only
+  while the whole of it fits beside the tools already in the list — under
+  `max_advertised_tools` and under the tool-definition budget
+  (`group_load_overflow`): loaded past either, it would be cut on the next
+  request or refused with it, and a large group loaded whole undoes what
+  holding it back had saved. A group that would not fit is not loaded; the
+  result says which wall it hit and lists its tools (up to
+  `tool_search_max_results`) for the model to load the ones it needs with
+  `select:`.
 - The first tools of a group with rules that a call loads bring the rules, once
   (see [Group rules](#group-rules)).
 - The first lines of the result say which tools are now loaded and callable,
@@ -684,7 +692,11 @@ callable, and the called tool's line: "BrowserOpen is loaded now; call it
 again. It takes: BrowserOpen(url*) — …". The next call runs. The whole group,
 because a job that starts with one of its tools usually needs another next,
 and a model that had only the one it called went on without the rest; the
-line, because a retry written from memory repeated the wrong arguments. A
+line, because a retry written from memory repeated the wrong arguments. When
+the whole group would not fit the tool list (the same two walls as for
+`ToolSearch(group=...)`), only the called tool is loaded — on its own, not as
+the group — and the answer says how many more there are and how to load the
+ones needed: one blind call is not a request for a large group. A
 second blind call of the same group in the same message waits too, and is
 pointed at the first answer rather than given the rules twice. `tool_unadvertised_call`
 carries `executed: false` for such a call and, unlike for a call that ran,

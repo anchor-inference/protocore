@@ -23,6 +23,7 @@ from typing import Any, ClassVar, Final
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_registry import (
     ADVERTISED_TOOLS_METADATA_KEY,
     TOOL_ALLOWLIST_METADATA_KEY,
@@ -42,6 +43,7 @@ from protocore.contracts.tool_retrieval import RetrievalSettings
 from protocore.contracts.tool_roles import ToolRole
 from protocore.contracts.tools import Tool, ToolContext, read_metadata
 from protocore.contracts.types import ToolDefinition, ToolParameterSchema, ToolResult
+from protocore.runtime.tool_deferral import group_load_overflow
 from protocore.runtime.tool_retrieval import tool_line
 
 TOOL_SEARCH_TOOL_NAME: Final[str] = "ToolSearch"
@@ -196,7 +198,7 @@ class ToolSearchTool(Tool):
         if names or groups:
             # Names win over a description sent beside them: the model already
             # knows what it wants, and a search would load other tools too.
-            return self._select(call_id, names, groups, policy, advertised, given, mark)
+            return self._select(call_id, names, groups, policy, rc, advertised, given, mark)
         return self._search(call_id, query, policy, rc, advertised, given, mark)
 
     # ------------------------------------------------------------------
@@ -270,12 +272,30 @@ class ToolSearchTool(Tool):
             owed.append((group, declaration.instructions))
         return owed
 
+    def _overflow(
+        self, rc: Any, advertised: frozenset[str] | None, adding: Sequence[Tool]
+    ) -> str:
+        """Why ``adding`` would not fit beside the advertised tools, or ``""``.
+
+        Outside a loop nothing says what is advertised or what the limits are,
+        and the load is not judged.
+        """
+        if advertised is None or not isinstance(rc, LoopConstants):
+            return ""
+        on_surface = [
+            tool.definition
+            for name in sorted(advertised)
+            if (tool := self._registry.get(name)) is not None
+        ]
+        return group_load_overflow(rc, on_surface, [tool.definition for tool in adding])
+
     def _select(
         self,
         call_id: str,
         names: Sequence[str],
         groups: Sequence[str],
         policy: ToolVisibilityPolicy,
+        rc: Any,
         advertised: frozenset[str] | None,
         given: frozenset[str] | None,
         mark: str,
@@ -286,6 +306,7 @@ class ToolSearchTool(Tool):
         missing: list[str] = []
         whole: list[str] = []
         missing_groups: list[str] = []
+        too_large: list[tuple[str, list[str], str]] = []
         if groups:
             members = self._group_members(admitted)
             groups_by_folded = {name.casefold(): name for name in members}
@@ -296,8 +317,21 @@ class ToolSearchTool(Tool):
                 if group is None:
                     missing_groups.append(requested)
                     continue
-                if group not in whole:
-                    whole.append(group)
+                if group in whole or any(group == seen for seen, _, _ in too_large):
+                    continue
+                # A group is loaded whole only while the whole of it fits the
+                # tool list: loaded past the budget or the provider's count,
+                # it would be cut on the next request, or refused with it.
+                adding = [
+                    admitted[name]
+                    for name in members[group]
+                    if advertised is None or name not in advertised
+                ]
+                reason = self._overflow(rc, advertised, adding)
+                if reason:
+                    too_large.append((group, members[group], reason))
+                    continue
+                whole.append(group)
                 loaded.extend(name for name in members[group] if name not in loaded)
         for requested in names:
             # A name in the wrong case is still unambiguous; loading the one it
@@ -308,6 +342,25 @@ class ToolSearchTool(Tool):
             elif actual not in loaded:
                 loaded.append(actual)
         lines = _loaded_header(loaded, advertised)
+        max_results = _positive(getattr(rc, "tool_search_max_results", None), _DEFAULT_MAX_RESULTS)
+        for group, group_members, reason in too_large:
+            wall = (
+                "the provider's limit on the number of tools"
+                if reason == "count"
+                else "the budget for tool definitions"
+            )
+            lines.append("")
+            lines.append(
+                f"The {group} group ({len(group_members)} tools) is not loaded: with the "
+                f"tools already in your list it would be over {wall}. Load the ones you "
+                "need with 'select:' and their exact names:"
+            )
+            lines.extend(tool_line(admitted[name].definition) for name in group_members[:max_results])
+            if len(group_members) > max_results:
+                lines.append(
+                    f"... and {len(group_members) - max_results} more; describe what you "
+                    "need to find them."
+                )
         for requested in missing_groups:
             # Only groups with a tool the run may use are named, so a group
             # the policy blocks whole is never revealed by the list.

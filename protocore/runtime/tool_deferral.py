@@ -86,6 +86,7 @@ __all__ = [
     "calls_held_for_rules",
     "discovery_tool_names",
     "ensure_tool_deferral",
+    "group_load_overflow",
     "held_call_text",
     "hold_call_for_rules",
     "note_prompt_prefix_restarted",
@@ -204,6 +205,34 @@ def discovery_tool_names(tools: Iterable[Tool], roles: ToolRoleMap) -> frozenset
 
 def _definition_tokens(definition: ToolDefinition, rc: LoopConstants) -> int:
     return estimate_tokens(definition.model_dump_json(), rc)
+
+
+def group_load_overflow(
+    rc: LoopConstants,
+    advertised: Iterable[ToolDefinition],
+    adding: Iterable[ToolDefinition],
+) -> str:
+    """Why loading ``adding`` whole onto a surface of ``advertised`` would not fit.
+
+    ``"count"`` when the two together are over ``max_advertised_tools``,
+    ``"tokens"`` when their definitions are over the tool-definition budget
+    (``tool_definitions_ratio`` of the window), and ``""`` when the load fits.
+    The budget the deferral holds groups back for is enforced here too, at
+    the two places a group is loaded whole — ``ToolSearch(group=...)`` and a
+    blind call held for the group's rules — because a group loaded whole past
+    it undoes at one stroke what holding it back had saved, and a provider's
+    count limit would then cut the group, or refuse the request.
+    """
+    advertised = list(advertised)
+    adding = list(adding)
+    limit = rc.max_advertised_tools
+    if limit > 0 and len(advertised) + len(adding) > limit:
+        return "count"
+    budget = derive_budgets(rc).tool_definitions_budget_tokens
+    tokens = sum(_definition_tokens(definition, rc) for definition in (*advertised, *adding))
+    if tokens > budget:
+        return "tokens"
+    return ""
 
 
 def _load_of(
@@ -1046,6 +1075,8 @@ def held_call_text(
     loaded: Sequence[str],
     first: bool,
     mark: str = "",
+    unloaded: Sequence[str] = (),
+    discovery_tool: str = "",
 ) -> str:
     """The answer to a blind call held for its group's rules.
 
@@ -1056,7 +1087,10 @@ def held_call_text(
     written without the schema, and a retry from memory repeated the same
     wrong arguments; the other names are there because a model told only
     that its one tool was loaded went on to treat the rest of the group as
-    missing, and did their jobs by other means.
+    missing, and did their jobs by other means. ``unloaded`` are the group's
+    other tools the call did not load, because the whole group would not fit
+    the tool list; the answer says so and how to load the ones it needs, with
+    ``discovery_tool`` when the run has one.
     """
     others = [other for other in loaded if other != name]
     if first and rules:
@@ -1085,6 +1119,16 @@ def held_call_text(
             f"The whole {group} group is loaded now, so these are callable too: "
             f"{', '.join(others)}."
         )
+    elif unloaded:
+        how = (
+            f"load the ones you need with {discovery_tool} ('select:' and their exact names)"
+            if discovery_tool
+            else "call the one you need by its exact name"
+        )
+        lines.append(
+            f"The rest of the {group} group ({len(unloaded)} tools) is not loaded: "
+            f"the whole group would not fit your tool list, so {how}."
+        )
     lines.append(f"{name} is loaded now; call it again. It takes: {signature}")
     return "\n".join(lines)
 
@@ -1101,7 +1145,12 @@ def hold_call_for_rules(
     The whole group is loaded, as ``ToolSearch(group=...)`` would, and not the
     one tool: the rules are the group's, and a job that starts with one of its
     tools usually needs another of them next — which a model that had only
-    the called tool loaded could not see, and did without.
+    the called tool loaded could not see, and did without. Unless the whole
+    group would not fit the tool list (:func:`group_load_overflow`): then only
+    the called tool is loaded, as before groups were, and the answer names how
+    many more there are and how to load the ones the model needs. One blind
+    call is not a request for the group, and a large group loaded whole past
+    the budget undoes what holding it back had saved.
     """
     manager = engine.context_manager
     registry = engine.tools
@@ -1120,7 +1169,19 @@ def hold_call_for_rules(
     )
     if call.name not in members:
         members = sorted((*members, call.name))
-    newly = [name for name in members if manager.discover_tool(name, group=group)]
+    unloaded: list[str] = []
+    adding = [name for name in members if name not in advertised]
+    if group_load_overflow(
+        engine.config.rc,
+        [t.definition for n in advertised if (t := registry.get(n)) is not None],
+        [t.definition for n in adding if (t := registry.get(n)) is not None],
+    ):
+        unloaded = [name for name in members if name != call.name]
+        members = [call.name]
+    # Loaded as a group only when the group came whole: one tool of it is one
+    # entry, evicted on its own, and not a group the cap must keep together.
+    as_group = group if not unloaded else ""
+    newly = [name for name in members if manager.discover_tool(name, group=as_group)]
     # Not a use: the call did not run. Counted as one, a group the model
     # called once blind and then let go was carried into the session's next
     # run as though it had been used.
@@ -1128,6 +1189,8 @@ def hold_call_for_rules(
     if first and rules:
         engine._tool_group_rules_given.add(group)
     tool = registry.get(call.name)
+    discovery = discovery_tool_names(registry.list_all(), engine.config.tool_roles)
+    listed_discovery = {name for name in discovery if admitted(name)}
     content = held_call_text(
         call.name,
         group,
@@ -1136,6 +1199,8 @@ def hold_call_for_rules(
         loaded=members,
         first=first,
         mark=engine._tool_rules_mark,
+        unloaded=unloaded,
+        discovery_tool=min(listed_discovery) if listed_discovery else "",
     )
     events = [
         TurnEvent(

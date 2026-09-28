@@ -318,6 +318,36 @@ async def test_a_group_argument_loads_every_admitted_tool_of_the_group() -> None
     assert result.metadata[TOOL_GROUP_RULES_METADATA_KEY] == ["github"]
 
 
+async def test_a_group_that_would_not_fit_the_tool_list_is_listed_and_not_loaded() -> None:
+    # Two tools on the surface, a provider limit of three: the two github
+    # tools cannot both come, so neither does, and the model is shown them to
+    # pick from; a name beside the group still loads.
+    result = await _raw_call(
+        _grouped_catalogue(),
+        {"group": "github", "select": ["BrowserOpen"]},
+        rc=LoopConstants(max_advertised_tools=3),
+        advertised=frozenset({"ToolSearch", "ServiceStart"}),
+    )
+    assert result.metadata[TOOLS_LOADED_METADATA_KEY] == ["BrowserOpen"]
+    assert result.metadata[TOOL_GROUPS_LOADED_METADATA_KEY] == []
+    assert result.metadata[TOOL_GROUP_RULES_METADATA_KEY] == []
+    lines = result.content.splitlines()
+    assert lines[0] == "Loaded, and callable from your next step: BrowserOpen."
+    assert lines[2] == (
+        "The github group (2 tools) is not loaded: with the tools already in your list "
+        "it would be over the provider's limit on the number of tools. Load the ones you "
+        "need with 'select:' and their exact names:"
+    )
+    assert lines[3].startswith("Mcp_Github_create_issue(")
+    assert lines[4].startswith("Mcp_Github_list_issues(")
+    assert "Never close an issue" not in result.content
+    # Outside a loop nothing says what is advertised, and the load is not judged.
+    unjudged = await _raw_call(
+        _grouped_catalogue(), {"group": "github"}, rc=LoopConstants(max_advertised_tools=1)
+    )
+    assert unjudged.metadata[TOOL_GROUPS_LOADED_METADATA_KEY] == ["github"]
+
+
 async def test_select_takes_group_tokens_beside_names() -> None:
     result = await _raw_call(
         _grouped_catalogue(), {"query": "select:group:browser,SecretVault"}

@@ -48,6 +48,14 @@ All notable changes to this project are recorded here. The format follows
   `group_rules_text` with the group's definitions against
   `tool_definitions_ratio`, and `declare_group` refuses instructions over
   `TOOL_GROUP_INSTRUCTIONS_MAX_CHARS` (8 000 characters).
+- **A group is loaded whole only while the whole of it fits.** A blind call
+  held for its group's rules, and `ToolSearch(group=...)`, loaded every tool
+  of the group with no check against `max_advertised_tools` or the
+  tool-definition budget, so one blind call of a large server's tool put the
+  next request's definitions far over the budget the deferral had enforced.
+  Both are judged by `group_load_overflow` now: a held call loads the called
+  tool alone and says how many more there are and how to load them, and
+  `ToolSearch` lists a group that would not fit instead of loading it.
 
 ## [2.0.0a23] - 2026-09-27
 

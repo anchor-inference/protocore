@@ -22,6 +22,7 @@ from protocore.runtime.query_engine import QueryEngine, QueryEngineConfig
 from protocore.runtime.tool_deferral import (
     NO_DEFERRAL,
     discovery_tool_names,
+    group_load_overflow,
     plan_tool_deferral,
     render_tool_catalogue,
 )
@@ -158,6 +159,18 @@ def test_over_the_token_budget_the_largest_groups_go_first_until_it_fits() -> No
     assert deferred == ("large",)
     assert names == {f"Large{i}" for i in range(4)}
     assert reasons == ("tokens",)
+
+
+def test_a_whole_group_load_is_judged_against_the_count_and_the_budget() -> None:
+    advertised = [_padded(f"On{i}", words=10).definition for i in range(3)]
+    small = [_padded(f"Small{i}", words=10).definition for i in range(2)]
+    large = [_padded(f"Large{i}", words=200).definition for i in range(4)]
+    rc = LoopConstants(model_context_window=4_096)
+    assert group_load_overflow(rc, advertised, small) == ""
+    assert group_load_overflow(rc, advertised, large) == "tokens"
+    # The count is the harder wall and is named first.
+    assert group_load_overflow(LoopConstants(max_advertised_tools=4), advertised, small) == "count"
+    assert group_load_overflow(LoopConstants(max_advertised_tools=5), advertised, small) == ""
 
 
 def test_a_groups_rules_weigh_with_its_definitions() -> None:

@@ -182,17 +182,9 @@ async def test_two_sessions_with_the_same_setup_send_the_same_system_prompt(
     assert prompts[0] == prompts[1]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "a blind call of one tool of a group with rules loads every tool of the group, "
-        "with no check against tool_definitions_ratio: a large group loaded whole "
-        "puts the request's definitions far over the budget the deferral was enforcing"
-    ),
-)
-async def test_a_blind_call_does_not_load_past_the_tool_budget(
-    scenario: ScenarioFactory,
-) -> None:
+def _large_browser_run(scenario: ScenarioFactory) -> Scenario:
+    """Thirty browser tools whose definitions together are well over the
+    2 048-token budget an 8k window gives, held back as a lazy group with rules."""
     long = "performs one specific browser action and reports what happened on the page. " * 3
     run = scenario(
         tools=[
@@ -212,18 +204,64 @@ async def test_a_blind_call_does_not_load_past_the_tool_budget(
         load="lazy",
         instructions="Ask before submitting a form.",
     )
-    run.llm.queue_tool_call_response(
-        tool_call_id="c-1", tool_name="Browser00", tool_input={"v": "x"}
-    )
-    run.llm.queue_response(text="read the rules")
-    await run.run("open a page")
+    return run
 
+
+def _sent_definition_tokens(run: Scenario) -> tuple[int, int]:
     rc = run.engine.config.rc
     budget = derive_budgets(rc).tool_definitions_budget_tokens
     sent = sum(
         estimate_tokens(definition.model_dump_json(), rc)
         for definition in run.requests[-1].tools
     )
+    return sent, budget
+
+
+async def test_a_blind_call_does_not_load_past_the_tool_budget(
+    scenario: ScenarioFactory,
+) -> None:
+    run = _large_browser_run(scenario)
+    run.llm.queue_tool_call_response(
+        tool_call_id="c-1", tool_name="Browser00", tool_input={"v": "x"}
+    )
+    run.llm.queue_response(text="read the rules")
+    await run.run("open a page")
+
+    sent, budget = _sent_definition_tokens(run)
+    assert sent <= budget
+    # Only the called tool is loaded, on its own and not as the group, and the
+    # answer says how many more there are and how to load the ones needed.
+    (held,) = run.tool_results()
+    assert "Rules for the browser tools" in held.content
+    assert (
+        "The rest of the browser group (29 tools) is not loaded: the whole group would "
+        "not fit your tool list, so load the ones you need with ToolSearch ('select:' "
+        "and their exact names)." in held.content
+    )
+    assert "callable too" not in held.content
+    assert [n for n in run.advertised_tool_names(1) if n.startswith("Browser")] == ["Browser00"]
+    assert run.engine.context_manager.loaded_tool_group_names() == ()
+
+
+async def test_a_group_load_over_the_budget_loads_nothing_and_says_so(
+    scenario: ScenarioFactory,
+) -> None:
+    """``ToolSearch(group=...)`` is held to the same budget: a group that would
+    not fit is listed for the model to pick from, and nothing is loaded."""
+    run = _large_browser_run(scenario)
+    run.llm.queue_tool_call_response(
+        tool_call_id="s-1", tool_name="ToolSearch", tool_input={"group": "browser"}
+    )
+    run.llm.queue_response(text="picked")
+    await run.run("open a page")
+
+    (result,) = run.tool_results()
+    assert result.content.startswith("Nothing was loaded.\n\nThe browser group (30 tools) is not loaded")
+    assert "over the budget for tool definitions" in result.content
+    assert "... and 22 more; describe what you need to find them." in result.content
+    assert "Rules for the browser tools" not in result.content
+    assert not any(n.startswith("Browser") for n in run.advertised_tool_names(1))
+    sent, budget = _sent_definition_tokens(run)
     assert sent <= budget
 
 
