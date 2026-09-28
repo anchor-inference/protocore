@@ -555,7 +555,12 @@ which stays exactly as it was.
 
 `protocore/tools/tool_search.py` ships the discovery tool:
 `ToolSearchTool(registry)`, named `ToolSearch`, carrying the role
-`discovers_tools` in its own `tool_roles`, `always_load`, and concurrent-safe.
+`discovers_tools` in its own `tool_roles`, `always_load`, and dispatched one
+call at a time (not `is_concurrent_safe`): what one call owes depends on what
+the calls before it in the same message gave, and run in parallel two loads of
+one group in one message each carried the group's rules; serial, the loop folds
+each result in before the next call is stamped with the groups whose rules are
+given, and a local ranking costs nothing to serialise.
 The loop advertises it **only while it has something to find**: a group held
 back, or — with `tool_retrieval_top_k` on — admitted tools the per-message clip
 left off the surface, which a search finds and loads like any other. With the

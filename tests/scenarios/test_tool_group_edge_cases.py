@@ -330,17 +330,7 @@ async def test_a_group_load_over_the_budget_loads_nothing_and_says_so(
     assert sent <= budget
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "rules owed are decided from the given-set stamped before a message's calls "
-        "run, so two loads of one group in one message (ToolSearch is concurrent-safe) "
-        "both carry the full rules"
-    ),
-)
-async def test_rules_are_given_once_when_one_message_loads_a_group_twice(
-    scenario: ScenarioFactory,
-) -> None:
+def _ruled_browser_run(scenario: ScenarioFactory) -> Scenario:
     run = scenario(
         tools=[
             ScriptedTool(tool_name="Note", description="record a note"),
@@ -356,6 +346,13 @@ async def test_rules_are_given_once_when_one_message_loads_a_group_twice(
         load="lazy",
         instructions="Ask the user before submitting a form.",
     )
+    return run
+
+
+async def test_rules_are_given_once_when_one_message_loads_a_group_twice(
+    scenario: ScenarioFactory,
+) -> None:
+    run = _ruled_browser_run(scenario)
     run.llm.queue_multi_tool_call_response(
         tool_calls=[
             ("s-1", "ToolSearch", {"select": "BrowserOpen"}),
@@ -367,3 +364,32 @@ async def test_rules_are_given_once_when_one_message_loads_a_group_twice(
 
     results = run.tool_results()
     assert sum("Ask the user before submitting a form." in r.content for r in results) == 1
+    # The first load gives them; the second, folded in after it, owes none.
+    assert "Rules for the browser tools" in results[0].content
+    assert "Rules for the browser tools" not in results[1].content
+    assert run.advertised_tool_names(1)[-2:] == ["BrowserOpen", "BrowserClick"]
+
+
+async def test_a_blind_call_beside_a_search_of_its_group_is_pointed_at_the_search(
+    scenario: ScenarioFactory,
+) -> None:
+    """A search that loads the group and a blind call of one of its tools in
+    the same message: the call is held, as decided before the message ran, and
+    its answer points at the search's rules rather than repeating them."""
+    run = _ruled_browser_run(scenario)
+    run.llm.queue_multi_tool_call_response(
+        tool_calls=[
+            ("s-1", "ToolSearch", {"group": "browser"}),
+            ("c-1", "BrowserClick", {"v": "x"}),
+        ]
+    )
+    run.llm.queue_response(text="loaded")
+    await run.run("load the browser and click")
+
+    searched, held = run.tool_results()
+    assert "Rules for the browser tools" in searched.content
+    assert held.content.startswith(
+        "Not run yet: BrowserClick was not in your tool list. The rules for the "
+        "browser tools are in another result of this step."
+    )
+    assert sum("Ask the user before submitting a form." in r.content for r in (searched, held)) == 1

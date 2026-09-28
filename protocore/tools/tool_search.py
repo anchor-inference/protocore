@@ -122,9 +122,13 @@ class ToolSearchTool(Tool):
     # leaves off can still be found; the loop still hides it when there is
     # nothing to find.
     always_load: ClassVar[bool] = True
-    # Reads the catalogue and nothing else, so parallel calls are safe; the
-    # loop applies what they loaded in the order the model asked.
-    is_concurrent_safe: ClassVar[bool] = True
+    # Dispatched one at a time, although it reads the catalogue and nothing
+    # else: what one call owes depends on what the calls before it in the same
+    # message gave. Run in parallel, two loads of one group in one message
+    # each read the rules as not yet given and both carried them. Serial, the
+    # loop folds each result in before the next call is stamped with the
+    # groups whose rules are given. A local ranking costs nothing to serialise.
+    is_concurrent_safe: ClassVar[bool] = False
     is_destructive: ClassVar[bool] = False
     description_: ClassVar[str] = (
         "Find and load tools that are available but not loaded yet. Describe "

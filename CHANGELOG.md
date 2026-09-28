@@ -61,6 +61,12 @@ All notable changes to this project are recorded here. The format follows
   left half on the list while the model had been told all of it was loaded.
   A group now leaves the request whole, as it leaves the cap, and a smaller
   older entry may take its place.
+- **A group's rules are given once even when one message loads it twice.**
+  `ToolSearch` was concurrent-safe, so two calls in one message were both
+  stamped with the groups given before the message ran and both carried the
+  full rules. It is dispatched one call at a time now; each result is folded
+  in before the next call is stamped, and a blind call beside a search of its
+  group is pointed at the search's rules instead of repeating them.
 
 ## [2.0.0a23] - 2026-09-27
 

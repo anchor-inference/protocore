@@ -191,7 +191,9 @@ def test_the_tool_describes_itself_as_a_discovery_tool() -> None:
     # A model that took the tool for a skill loader stopped short of the skill.
     assert "skills are not tools" in tool.definition.description
     assert tool.always_load is True
-    assert tool.is_concurrent_safe is True
+    # Serial on purpose: what one call owes depends on what the calls before
+    # it in the same message gave.
+    assert tool.is_concurrent_safe is False
 
 
 async def test_a_tool_already_in_the_list_is_not_reported_as_loaded() -> None:
