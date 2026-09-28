@@ -120,6 +120,7 @@ from protocore.contracts.turn_policy import (
     TurnPolicyOutcome,
 )
 from protocore.contracts.types import (
+    COMPACTION_SUMMARY_METADATA_KEY,
     PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY,
     SESSION_HISTORY_SEED_METADATA_KEY,
     SYNTHETIC_RECOVERY_BACKGROUND_WAKE,
@@ -143,6 +144,7 @@ from protocore.contracts.types import (
     ContentBlock,
     HookEvent,
     Message,
+    MessageOrigin,
     MessageRole,
     StopReason,
     TextBlock,
@@ -7188,12 +7190,21 @@ def _this_round_messages(engine: QueryEngine) -> list[Message]:
     hands the engine a session's earlier turns verbatim would have a run-scoped
     predicate answer for a previous run. Anything after the last caller message
     belongs to the round now driving, whoever assembled the history.
+
+    Compaction's records (:attr:`MessageOrigin.compaction`: the ledger, the
+    summaries, the floor digest) are user-role too, and are not a caller's
+    message either. The ledger in particular is placed after the newest
+    compacted output, which can be the last message before a runtime nudge;
+    counted as a boundary it would leave the round with nothing but the nudge,
+    and a run that did real work would read as having produced nothing.
     Pure / total — never raises.
     """
     start = 0
     for index, message in enumerate(engine.history):
-        if message.role is MessageRole.user and not message.metadata.get(
-            SYNTHETIC_RECOVERY_METADATA_KEY
+        if (
+            message.role is MessageRole.user
+            and not message.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
+            and message.origin is not MessageOrigin.compaction
         ):
             start = index + 1
     return engine.history[start:]
@@ -7217,6 +7228,10 @@ def _run_produced_output(engine: QueryEngine) -> bool:
     """
     for message in _this_round_messages(engine):
         if message.role is MessageRole.tool:
+            return True
+        if message.metadata.get(COMPACTION_SUMMARY_METADATA_KEY) is True:
+            # A summary or floor digest inside the round stands for this
+            # round's own calls and results, compacted out of the window.
             return True
         if message.role is not MessageRole.assistant:
             continue

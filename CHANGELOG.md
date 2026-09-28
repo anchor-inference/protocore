@@ -22,6 +22,13 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **A compaction record no longer starts a new round of the run.** The ledger,
+  summaries and floor digest are user-role, and the round boundary took them
+  for a caller's message. After a reactive pass put the ledger before the
+  runtime's continue prompt, the run read as having produced nothing: a
+  provider failure then failed it instead of winding it down, and an answer
+  written before the ledger was no longer preserved. They are now skipped as
+  boundaries, and a summary inside the round counts as the round's output.
 - **A permanent provider refusal the tool surface could have caused is wound
   down again.** Since 2.0.0a22 every refusal the adapter classified as final
   skipped the wind-down, on the premise that its request only adds one message.

@@ -206,7 +206,9 @@ unchanged.
 A host that persists history (`persist_history_delta`, `persist_session_history`,
 or its own reading of `engine.history`) filters on it: a compaction record
 stands for turns the host already holds in their original form, so it is
-either dropped or stored under its own origin, never as the user's turn.
+either dropped or stored under its own origin, never as the user's turn. The
+runtime reads it the same way: a compaction record does not start a new round
+of the run, so work done before a pass still counts as the run's output.
 
 *Why.* The ledger was stored by a host as the user's own message, drawn as a
 user bubble, and seeded into the next run as an operator turn.
