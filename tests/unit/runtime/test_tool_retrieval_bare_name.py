@@ -1,12 +1,11 @@
 """A tool asked for by its name without the server prefix is found first.
 
 MCP tools are registered as ``mcp__<server>__<tool>``, and a model searching
-for one writes the part it knows, ``get_issue``. The analyser keeps the
-identifier's parts and the whole joined identifier, but not the joined tail:
-the document carries ``mcpgithubgetissue`` and never ``getissue``, while the
-query carries ``getissue`` and not the prefix. "get" is a stopword, so what is
-left of the query is "issue", which every issue tool shares, and a
-neighbour outranks the tool that was named exactly.
+for one writes the part it knows, ``get_issue``. "get" is a stopword, so
+without more the query is "issue", which every issue tool shares. The analyser
+therefore indexes the joined form of every tail of an identifier's parts: the
+document carries ``getissue`` as well as ``mcpgithubgetissue``, and the tool
+that was named exactly ranks first.
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ import pytest
 
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_retrieval import RetrievalSettings, ToolDocument
+from protocore.runtime.text_analysis import raw_tokens
 from protocore.runtime.tool_retrieval import AnalyzedCatalogue, Lexicon, ToolIndex
 
 _CATALOGUE = (
@@ -29,13 +29,6 @@ _CATALOGUE = (
 )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "only the whole identifier is indexed joined, and 'get' is a stopword, "
-        "so a bare MCP tool name scores like any tool sharing its other words"
-    ),
-)
 @pytest.mark.parametrize("name", ["get_issue", "get_pull_request"])
 def test_the_bare_name_of_an_mcp_tool_ranks_it_first(name: str) -> None:
     index = ToolIndex(
@@ -44,3 +37,10 @@ def test_the_bare_name_of_an_mcp_tool_ranks_it_first(name: str) -> None:
         Lexicon.bundled(),
     )
     assert index.rank(name, 1) == [f"mcp__github__{name}"]
+
+
+def test_every_tail_of_an_identifier_is_indexed_joined() -> None:
+    assert raw_tokens("mcp__github__get_issue") == [
+        "mcp", "github", "get", "issue", "mcpgithubgetissue", "githubgetissue", "getissue",
+    ]
+    assert raw_tokens("get_issue") == ["get", "issue", "getissue"]

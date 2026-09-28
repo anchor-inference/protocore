@@ -28,6 +28,12 @@ All notable changes to this project are recorded here. The format follows
   registry read `0` as "retrieve no tool", so a host passing the constant
   straight through advertised the pinned tools alone. `ToolRegistry` and
   `InMemoryToolRegistry` now read `0` like `None`.
+- **The bare name of a namespaced tool ranks that tool first.** `get_issue`
+  ranked `mcp__github__add_issue_comment` above `mcp__github__get_issue`: the
+  index kept an identifier's parts and its whole joined form, "get" is a
+  stopword, and what was left of the query was "issue". The analyser now also
+  keeps the joined form of every tail of an identifier's parts (`getissue`,
+  `githubgetissue`), on both the catalogue and the query side.
 
 ## [2.0.0a23] - 2026-09-27
 

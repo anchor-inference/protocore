@@ -218,7 +218,9 @@ catalogue and the query):
 
 - identifiers are split — CamelCase, `snake_case`, `kebab-case`, dotted paths,
   letter/digit boundaries — and the joined form is kept as well, so
-  `BrowserOpen` matches both `browser open` and `browseropen`;
+  `BrowserOpen` matches both `browser open` and `browseropen`, and so is the
+  joined form of every tail of the parts, so `get_issue` finds
+  `mcp__github__get_issue` ahead of the other issue tools of that server;
 - text is case-folded and `ё` is spelled `е`;
 - English and Russian stopwords are dropped, including conversational fillers
   ("please", "слушай", "короче", "плз");

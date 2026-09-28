@@ -10,8 +10,13 @@ The steps, in order:
 1. **Identifier splitting.** Tool names and parameter names are identifiers,
    and a query says ``browser open`` where the catalogue says ``BrowserOpen``.
    Every identifier-shaped chunk yields its parts (CamelCase, ``snake_case``,
-   ``kebab-case``, dotted and slashed paths, letter/digit boundaries) *and* the
-   joined form, so both ``browser open`` and ``browseropen`` find it.
+   ``kebab-case``, dotted and slashed paths, letter/digit boundaries), the
+   joined form, so both ``browser open`` and ``browseropen`` find it, *and*
+   the joined form of every tail of its parts. A namespaced name keeps its
+   specific part last (``mcp__github__get_issue``, ``module.Class.method``),
+   and a caller who knows only that part writes ``get_issue``: its joined
+   form ``getissue`` must be in the index too, or what is left of the query
+   is the words every sibling shares.
 2. **Case folding** plus ``ё`` -> ``е``: Russian text is written both ways and
    the two spellings are the same word.
 3. **Stopwords**, English and Russian, including the conversational fillers an
@@ -89,7 +94,7 @@ def split_identifier(chunk: str) -> list[str]:
 
 
 def raw_tokens(text: str) -> list[str]:
-    """Folded words of ``text``, identifiers split with their joined form kept.
+    """Folded words of ``text``, identifiers split with their joined forms kept.
 
     Stopwords are still present; :func:`analyze` removes them.
     """
@@ -100,6 +105,8 @@ def raw_tokens(text: str) -> list[str]:
         if len(parts) > 1:
             tokens.extend(parts)
             tokens.append(joined)
+            # Tails of two parts or more; a one-part tail is already a part.
+            tokens.extend("".join(parts[start:]) for start in range(1, len(parts) - 1))
         else:
             # A plain word, or a chunk whose separators left one part: the
             # word pattern drops whatever non-word character remains.
