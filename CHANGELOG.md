@@ -12,6 +12,19 @@ All notable changes to this project are recorded here. The format follows
   the engine's history begins — calls a compaction folded away, or an earlier
   run's calls — which a host still shows and pairs by id. No new call is given
   one of them.
+- **A call whose executor went away is parked, not failed.** A tool whose work
+  runs on a machine the run does not own raises `ExternalCallPauseRequested`
+  when that machine is out of reach. The dispatcher announces it with the
+  usual `tool_call_pending` envelope tagged `external_call`, and the loop parks
+  the call as an `external_call` interrupt instead of writing a failure or an
+  unknown outcome for it: the command may still be running over there, and an
+  unknown outcome invites the model to repeat a write. The durable intent
+  record says `PAUSED_EXTERNAL`, so a restart does not call the outcome unknown
+  either; a parked call inside a parallel batch waits while its siblings keep
+  their results. `redispatch_external_calls(engine)` hands every parked call to
+  its tool again, in the order they were parked, through the whole dispatch
+  path with the gate skipped; the tool answers the repeat from what its
+  executor already did, keyed by the call id, so nothing runs twice.
 
 ### Fixed
 
@@ -37,6 +50,14 @@ All notable changes to this project are recorded here. The format follows
   stored with a repeat is read back whole: the repair gives the later call an
   id of its own and pairs each result with the oldest call of its id that has
   none, instead of dropping the call.
+- **The cache hit rate is the cached share of the whole prompt.** Every
+  adapter normalises `input_tokens` to the whole prompt with its cached part
+  inside it, and the price already read it that way, but the turn's hit rate
+  added the cache reads to it a second time: a session that was 90 per cent
+  cached reported 0.47. The rate is now cache reads over input, clamped to one.
+  The OpenAI-compatible normaliser also sums an Anthropic-shaped report, which
+  leaves the cache out of `input_tokens`, up to the whole prompt, so the rate
+  and the price hold for both conventions.
 
 ## [2.0.0a26] - 2026-10-22
 
