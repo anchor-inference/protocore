@@ -425,8 +425,20 @@ class LLMRequest(BaseModel):
 class LLMResponseUsage(BaseModel):
     """Token usage summary.
 
-    Adapters normalise to the Anthropic-style shape (``cache_read_input_tokens``
-    / ``cache_creation_input_tokens``); OpenAI-style ``cached_tokens`` is
+    ``input_tokens`` is the WHOLE prompt, with the cached part inside it: the
+    tokens read from the cache and the tokens written to it are counted in
+    ``input_tokens`` and named again beside it. That is what an OpenAI-shaped
+    ``prompt_tokens`` already means. An Anthropic-shaped report leaves the
+    cache out of its ``input_tokens``, so an adapter for such a provider adds
+    ``cache_read_input_tokens`` and ``cache_creation_input_tokens`` to it. The
+    price (:meth:`protocore.providers.spend.ModelPricing.cost`) and the turn's
+    cache hit rate (cache reads over ``input_tokens``) both read it this way;
+    an adapter that reports only the uncached part makes the hit rate read 1.0
+    and the price charge too little for the uncached part, which the cache
+    counts are subtracted from.
+
+    The cache counts use the Anthropic names (``cache_read_input_tokens`` /
+    ``cache_creation_input_tokens``); OpenAI-style ``cached_tokens`` is
     surfaced separately for adapters (vLLM) that emit it under
     ``usage.prompt_tokens_details.cached_tokens``.
     """
@@ -434,6 +446,7 @@ class LLMResponseUsage(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     input_tokens: int = 0
+    """The whole prompt, cache reads and cache writes included."""
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_read_input_tokens: int | None = None
@@ -497,7 +510,8 @@ class ProviderDelta(BaseModel):
     2. Order is causal — thinking before text before tool_use (per
        provider's emission); core does not reorder.
     3. Final ``kind=usage`` envelope MUST surface cumulative
-       ``{input_tokens, output_tokens}``.
+       ``{input_tokens, output_tokens}``, ``input_tokens`` being the whole
+       prompt with its cached part inside it (see :class:`LLMResponseUsage`).
     """
 
     model_config = ConfigDict(frozen=True)

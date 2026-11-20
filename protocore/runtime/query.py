@@ -149,6 +149,7 @@ from protocore.contracts.types import (
     SYNTHETIC_RECOVERY_LONGFILE_SALVAGE,
     SYNTHETIC_RECOVERY_LONGFILE_TERMINAL_SEAL,
     SYNTHETIC_RECOVERY_METADATA_KEY,
+    SYNTHETIC_RECOVERY_PARTIAL_REPLY_RESUME,
     SYNTHETIC_RECOVERY_POST_TOOL_EMPTY_NUDGE,
     SYNTHETIC_RECOVERY_PRE_DISPATCH_TERMINAL_VERIFY,
     SYNTHETIC_RECOVERY_PRE_TERMINAL_SELF_VERIFY,
@@ -200,6 +201,7 @@ from protocore.runtime.intent import (
     find_intent,
     mark_dispatched,
     mark_paused_ask_user,
+    mark_paused_external,
     mark_pending_approval,
     orphaned_intents,
     settle_intent,
@@ -211,6 +213,7 @@ from protocore.runtime.intent import (
 )
 from protocore.runtime.live_control import (
     QueuedPrompt,
+    note_placed,
     place_items,
     placed_as_user_message,
     restore_queued_items,
@@ -251,6 +254,11 @@ from protocore.runtime.skill_index import (
 from protocore.runtime.subagent_budget import SubagentTreeBudget, SubagentTreePermit
 from protocore.runtime.token_counting import estimate_tokens as _estimate_tokens
 from protocore.runtime.tool_arguments import argument_names, string_argument
+from protocore.runtime.tool_call_ids import (
+    ToolCallIdAssigner,
+    rekey_repeated_tool_call_ids,
+    tool_call_ids_in,
+)
 from protocore.runtime.tool_deferral import (
     build_tool_surface,
     calls_held_for_rules,
@@ -1621,6 +1629,7 @@ def _inject_queue_into_history(
         engine._steer_queue = remaining_dicts
     else:
         engine._follow_up_queue = remaining_dicts
+    note_placed(engine, [item.id for item in placed])
     return TurnEvent(
         type=EventType.QUEUE_UPDATE,
         run_id=engine.config.run_id,
@@ -1776,6 +1785,38 @@ def build_llm_request(
         extra=extra,
         observability=observability,
     )
+
+
+def _close_on_partial_reply(
+    engine: QueryEngine, messages: list[Message]
+) -> tuple[list[Message], int]:
+    """``messages`` closed with a note when they end on a reply a dropped stream cut short.
+
+    A stream that fails mid-reply leaves its partial reply in the history, so
+    the transcript and what the reader saw agree, and the retry is then built
+    on a history that ends on that assistant message. Some providers take a
+    request ending on an assistant message as a prefill and refuse it outright
+    (and with it the retry, the wind-down and the run), and a chat template
+    renders a second assistant turn after the first. A short user note asking
+    the model to go on from where it stopped closes the request for every
+    adapter. Like the turn context it exists in this request only: it is never
+    written to the history, and it rides after the cache breakpoints, so the
+    prefix in front of it is unchanged. Returns how many messages it added.
+    """
+    if not messages:
+        return messages, 0
+    last = messages[-1]
+    if (
+        last.role is not MessageRole.assistant
+        or last.metadata.get(PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY) is not True
+    ):
+        return messages, 0
+    note = Message(
+        role=MessageRole.user,
+        content_blocks=[TextBlock(text=engine.prompt_text("partial_reply_resume"))],
+        metadata={SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_PARTIAL_REPLY_RESUME},
+    )
+    return [*messages, note], 1
 
 
 async def _with_turn_context(
@@ -2184,12 +2225,16 @@ async def resume(
 
     if engine.state is LoopState.AWAITING:
         parked = engine.pending_interrupts
+        # Only a question is answered by the next message. An external call's
+        # result comes from its executor, and taking whatever the operator
+        # types next for it would hand the model words as a command's output
+        # and leave no place for the real result when the executor is back.
         answerable = tuple(
-            item for item in parked if item.kind is not InterruptKind.approval
+            item for item in parked if item.kind is InterruptKind.question
         )
         if abandon_approval:
             for item in parked:
-                _abandon_pending_approval(engine, item.tool_call_id)
+                _abandon_parked_call(engine, item)
                 engine.release_interrupt(item.interrupt_id)
         elif message is not None and len(parked) == len(answerable) == 1:
             # One question outstanding and the answer has arrived. It settles
@@ -2215,12 +2260,50 @@ async def resume(
                 "decided on, and questions the model really asked, to the "
                 "model as failures. Pass resolutions to answer them all, "
                 "approved_tool_call for the single-approval case, or "
-                "abandon_approval=True to close them as never answered."
+                "abandon_approval=True to close them as never answered; a "
+                "parked external call is handed over again with "
+                "redispatch_external_calls once its executor is back."
             )
         engine.transition_to(LoopState.RUNNING)
 
     async for event in engine.run(message):
         yield event
+
+
+def _abandon_parked_call(engine: QueryEngine, interrupt: PendingInterrupt) -> None:
+    """Close a parked call that will never be answered, with what is true of it.
+
+    A call held at a gate or on a question never reached an effect worth
+    hiding, and is closed as never approved. An external call did: it was
+    handed to an executor that went away, so it may have run or may still be
+    running. Telling the model it never ran invites the repeat the pause
+    exists to prevent, so it is closed with the unknown outcome a call lost in
+    flight gets.
+    """
+    if interrupt.kind is InterruptKind.external_call:
+        _close_external_call_as_unknown(engine, interrupt.tool_call_id)
+        return
+    _abandon_pending_approval(engine, interrupt.tool_call_id)
+
+
+def _close_external_call_as_unknown(engine: QueryEngine, tool_call_id: str) -> None:
+    """Answer an abandoned external call with the unknown-outcome text."""
+    intent = find_intent(engine.open_intents, tool_call_id)
+    text = (
+        unknown_outcome_text(intent, engine.config.rc)
+        if intent is not None
+        else engine.config.rc.tool_result_unknown_outcome_placeholder
+    )
+    _insert_tool_result_after_use(
+        engine.history,
+        tool_call_id=tool_call_id,
+        content=text,
+        is_error=False,
+    )
+    if intent is not None:
+        settle_unknown(intent)
+        _forget_intent(engine, intent)
+    engine.forget_tool_name(tool_call_id)
 
 
 def _abandon_pending_approval(engine: QueryEngine, tool_call_id: str) -> None:
@@ -4393,6 +4476,20 @@ async def _stream_one_assistant_message(
                         )
                         engine.forget_tool_name(tool_call.id)
                         continue
+                    if outcome.external_call_required:
+                        # A read handed to an executor that went away: parked
+                        # like a held call, so its siblings keep their results
+                        # and the host hands this one over again later.
+                        flags.approval_pending = True
+                        async for evt in park_deferred_hold(
+                            engine,
+                            tool_call.id,
+                            events,
+                            park=_park_pause_interrupt,
+                            parked=parked_calls,
+                        ):
+                            yield evt
+                        continue
                     if outcome.approval_required:
                         # The hook match predicate should have steered any
                         # hook-gated tool onto the serial path, so this branch
@@ -4661,14 +4758,15 @@ async def _stream_one_assistant_message(
                             )
                             engine.forget_tool_name(tool_call.id)
                             continue
-                        if outcome.approval_required:
+                        if outcome.approval_required or outcome.external_call_required:
                             # The eligibility predicate steers a hook-gated
                             # delegation call onto the serial path, so this is
                             # a gate registered mid-turn. Every held child is
                             # parked, in the order the model asked for them —
                             # a group answered one decision at a time would
                             # cost one stop, one snapshot and one redraw per
-                            # child.
+                            # child. A child whose executor went away waits
+                            # the same way, to be handed over again.
                             flags.approval_pending = True
                             async for evt in park_deferred_hold(
                                 engine,
@@ -5053,7 +5151,9 @@ async def _drive_one_stream(
     # After the breakpoints, which are placed on the stable messages only: the
     # turn context is the one part of the request that differs every time, and
     # a cache marker on it would write a prefix no later request can match.
+    full_messages, resume_note = _close_on_partial_reply(engine, full_messages)
     full_messages, volatile_suffix = await _with_turn_context(engine, full_messages)
+    volatile_suffix += resume_note
     # The forced-tool slot. ``build_llm_request`` places it on
     # ``extra["forced_tool_choice"]``; the native-thinking axis it threads
     # alongside (``enable_thinking`` + ``reasoning_effort``, always as a pair
@@ -5426,6 +5526,11 @@ async def _drive_one_stream(
         if answer:
             yield from _text_delta_events(engine, answer, block_idx=block_idx)
 
+    # Renamed before anything reads them: the events, the attempt's calls and
+    # through them the history, the dispatcher and the approvals all carry the
+    # conversation's id, and a provider that repeats an id cannot make two
+    # calls one.
+    call_ids = ToolCallIdAssigner(_tool_call_ids_in_use(engine, full_messages, result))
     async for delta in _iter_with_idle_watchdog(
         _as_provider_deltas(upstream),
         idle_timeout=rc.llm_stream_idle_timeout_seconds,
@@ -5435,6 +5540,7 @@ async def _drive_one_stream(
     ):
         if engine.stop_requested:
             break
+        delta = call_ids.assign(delta)
 
         if delta.reasoning_items:
             result.reasoning_items.extend(delta.reasoning_items)
@@ -5767,6 +5873,27 @@ async def _drive_one_stream(
             },
         )
         open_block_kind = None
+
+
+def _tool_call_ids_in_use(
+    engine: QueryEngine,
+    outbound: list[Message],
+    result: _StreamAttemptResult,
+) -> set[str]:
+    """Every id a call arriving now must not be given, as the engine's own set.
+
+    The whole history and not this run's part of it: an id names one call in
+    the conversation, and an earlier run's call is paired by id like any other.
+    The outbound list adds the ids the pairing repair gave a stored repeat,
+    which the history does not carry; the attempt adds calls already taken from
+    this stream's earlier tries. Returned by reference, so the ids the stream
+    issues stay used after a compaction folds their calls away.
+    """
+    used = engine._tool_call_ids_used
+    used.update(tool_call_ids_in(engine.history))
+    used.update(tool_call_ids_in(outbound))
+    used.update(call.id for call in result.tool_calls)
+    return used
 
 
 def _calibrate_token_estimate(
@@ -7002,7 +7129,12 @@ async def _drain_dispatch_tool_deferred(
         events.append(item)
     if outcome is not None:
         outcome = await _admit_fresh_result(engine, outcome)
-    if outcome is not None and not outcome.approval_required:
+    if outcome is not None and outcome.external_call_required:
+        # Its executor went away: the call is parked, not finished, and the
+        # record says so, so a restart hands it over again rather than calling
+        # its outcome unknown.
+        mark_paused_external(intent)
+    elif outcome is not None and not outcome.approval_required:
         # Durable now, in completion order, while an earlier sibling may still
         # be running: placement waits for the whole batch, the record does not.
         await _record_outcome_finished(engine, tool_call, intent, outcome)
@@ -10601,7 +10733,7 @@ def _replay_dispatch_state(
     surfaced error for this tool in LLM order. The caller must use the returned
     outcome for both SSE event text and history append.
     """
-    if outcome is None or outcome.approval_required:
+    if outcome is None or outcome.approval_required or outcome.external_call_required:
         return outcome
 
     # Gathered calls deliberately defer evidence admission so the immutable
@@ -11012,6 +11144,16 @@ def _park_pause_interrupt(
     name = tool_name or str(payload.get("tool_name") or "")
     if payload.get("ask_user") or payload.get("kind") == "ask_user":
         return engine.mark_awaiting_answer(tool_call_id, tool_name=name, payload=payload)
+    if payload.get("kind") == "external_call":
+        # Handed to an executor that went away: the host hands it over again
+        # when that executor is back, so the interrupt carries what the tool
+        # said about where the call went, not the whole envelope.
+        return engine.mark_awaiting_answer(
+            tool_call_id,
+            tool_name=name,
+            payload=dict(payload.get("external_call_payload") or {}),
+            kind=InterruptKind.external_call,
+        )
     return engine.mark_pending_approval(tool_call_id, tool_name=name, payload=payload)
 
 
@@ -11339,7 +11481,7 @@ async def _record_outcome_finished(
     question has no outcome yet, so nothing is recorded for it here.
     """
     store = engine.tool_outcome_store
-    if store is None or outcome.approval_required or outcome.ask_user_required:
+    if store is None or outcome.approval_required or outcome.ask_user_required or outcome.external_call_required:
         return
     await store.record_finished(
         _invocation_record(engine, tool_call, intent, outcome=outcome)
@@ -12326,6 +12468,29 @@ async def _dispatch_tool(
         engine.forget_tool_name(tool_call.id)
         await engine._persist_snapshot()
         return
+    elif outcome is not None and outcome.external_call_required:
+        # The call went to an executor outside the run, which went away before
+        # it answered. Like a question, it appends nothing to history and
+        # settles nothing: the parking walk records the wait off the pending
+        # envelope, and the host hands the call over again with
+        # ``redispatch_external_calls`` once the executor is back.
+        _assert_pause_envelope_matches_intent(intent, buffered)
+        mark_paused_external(intent)
+        # Parked here as well as by the walk, as a question is: a call handed
+        # over again from a resume, outside the walk, must still leave a wait.
+        engine.mark_awaiting_answer(
+            tool_call.id,
+            tool_name=tool_call.name,
+            payload=dict(outcome.external_call_payload or {}),
+            kind=InterruptKind.external_call,
+        )
+        if dispatch_tree_permit is not None:
+            await dispatch_tree_permit.reacquire()
+        for evt in buffered:
+            yield evt
+        engine.forget_tool_name(tool_call.id)
+        await engine._persist_snapshot()
+        return
     elif outcome is not None:
         # The result is durable from here even though history only takes it at
         # the end of this dispatch, after the hooks and the accounting.
@@ -12682,7 +12847,7 @@ async def resume_interrupts(
             engine.release_interrupt(interrupt.interrupt_id)
 
             if resolution.decision is InterruptDecision.abandon:
-                _abandon_pending_approval(engine, interrupt.tool_call_id)
+                _abandon_parked_call(engine, interrupt)
                 continue
 
             if resolution.decision is InterruptDecision.deny:
@@ -12756,6 +12921,84 @@ async def resume_interrupts(
         )
         if not engine.is_terminal:
             engine.transition_to(LoopState.COMPLETED)
+
+
+async def redispatch_external_calls(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
+    """Hand every parked external call to its tool again, now that its executor is back.
+
+    An ``external_call`` interrupt is a call whose executor went away before it
+    answered (:class:`~protocore.contracts.tools.ExternalCallPauseRequested`).
+    The call may have run over there, may still be running, or may never have
+    arrived, and only the executor knows which; so the resume is not an answer
+    the host composes but the same call dispatched again, through the whole
+    path a fresh call takes — hooks, result shaping, the history write — with
+    the gate skipped because it already let the call through once. The tool
+    owes the repeat the executor's own answer, keyed by the call's id: the
+    result of the run that already happened, the rest of a run still going, or
+    a first run of a call that never arrived.
+
+    The calls are handed over in the order they were parked, which is the order
+    the model asked for them. One whose executor is still away parks again
+    under the identity it already had, and the run stays ``AWAITING``. When
+    nothing is left parked the run is ``RUNNING`` and nothing is driven: the
+    caller opens the next turn with ``run(None)``, which reads the results as
+    the newest thing in the history.
+
+    A stopped run hands nothing over. A call whose result is already in the
+    history (written by a process that died before releasing the wait) is
+    released without running the tool again. Only external calls are touched;
+    an approval or a question parked beside them stays parked.
+    """
+    async with engine.driving_turn():
+        external = interrupts_of_kind(engine.pending_interrupts, InterruptKind.external_call)
+        if engine.stop_requested or not external:
+            return
+        # Every parked call is found in the history before anything moves: an
+        # interrupt naming a call the history does not hold is refused with
+        # the run still AWAITING and nothing handed over, rather than after the
+        # first calls ran and the state was already RUNNING.
+        calls = {
+            interrupt.interrupt_id: _tool_call_from_history(engine, interrupt.tool_call_id)
+            for interrupt in external
+            if not _history_has_tool_result(engine, interrupt.tool_call_id)
+        }
+        if engine.state is LoopState.AWAITING:
+            engine.transition_to(LoopState.RUNNING)
+        reparked: list[PendingInterrupt] = []
+        for interrupt in external:
+            if engine.stop_requested:
+                break
+            if _history_has_tool_result(engine, interrupt.tool_call_id):
+                engine.release_interrupt(interrupt.interrupt_id)
+                continue
+            tool_call = calls[interrupt.interrupt_id]
+            # Released only once the call has an answer, not before it is
+            # dispatched: a call whose executor is still away parks again, and
+            # parking a call that is still recorded keeps the identity the host
+            # was handed (``park_interrupt``) instead of minting a second one
+            # for the same wait.
+            held = len(reparked)
+            async for evt in dispatch_parking_holds(
+                engine,
+                tool_call,
+                dispatch=_dispatch_tool_preapproved,
+                park=_park_pause_interrupt,
+                parked=reparked,
+            ):
+                yield evt
+            if len(reparked) == held:
+                engine.release_interrupt(interrupt.interrupt_id)
+        if reparked:
+            yield _interrupt_parked_event(engine, reparked[-1])
+        if engine.pending_interrupts:
+            if engine.state is LoopState.RUNNING:
+                engine.transition_to(LoopState.AWAITING)
+        await engine._persist_snapshot()
+
+
+def _dispatch_tool_preapproved(engine: QueryEngine, tool_call: ToolCall) -> AsyncIterator[TurnEvent]:
+    """A call the gate already let through once, dispatched again without asking it twice."""
+    return _dispatch_tool(engine, tool_call, preapproved=True)
 
 
 async def answer_pending(
@@ -13062,56 +13305,44 @@ def _repair_outbound_tool_pairing(
     3. **Reverse-strip** — drop any ``ToolResultBlock`` whose
        ``tool_call_id`` has no matching ``ToolUseBlock`` (and any standalone
        tool message left empty after its block was repositioned).
-    4. **Dedupe** — keep only the first occurrence of each ``tool_use`` id
-       and each ``tool_result`` id (the CC-1212 duplicate-id deadlock).
+    4. **Dedupe** — keep only the first ``tool_result`` for each call (a
+       duplicate id 400s on every retry, which once deadlocked a run).
+
+    Before any of that, a call id repeated on a second ``tool_use`` is given
+    an id of its own (:func:`rekey_repeated_tool_call_ids`). Calls arriving now
+    get unique ids at the stream, but a stored transcript can still hold a
+    repeat, and keeping only the first call with an id hid the later call and
+    its result from the model while its effect stayed on disk.
 
     Pure function: ``messages`` is not mutated; a new list of (possibly
     new) :class:`Message` objects is returned. ``Message`` /
     :class:`ToolResultBlock` are frozen, so unchanged messages are reused
     by reference.
     """
-    # Pass 1 — index every tool_use id (first occurrence) and the FIRST
-    # real ToolResultBlock seen per id (anywhere in the list), so pass 2 can
-    # reposition the real result directly after its tool_use regardless of
-    # where it currently sits. Later duplicate results are dropped.
-    tool_use_ids: set[str] = set()
+    messages = rekey_repeated_tool_call_ids(messages)
+    # Pass 1 — index the FIRST real ToolResultBlock seen per id (anywhere in
+    # the list), so pass 2 can reposition the real result directly after its
+    # tool_use regardless of where it currently sits. Later duplicate results
+    # are dropped.
     result_block_by_id: dict[str, ToolResultBlock] = {}
     for message in messages:
         for block in message.content_blocks:
-            if isinstance(block, ToolUseBlock):
-                tool_use_ids.add(block.tool_call_id)
-            elif isinstance(block, ToolResultBlock):
+            if isinstance(block, ToolResultBlock):
                 if block.tool_call_id not in result_block_by_id:
                     result_block_by_id[block.tool_call_id] = block
 
     result: list[Message] = []
-    seen_tool_use_ids: set[str] = set()
     # tool_use ids whose result we have already emitted (repositioned real or
     # synthetic) so a standalone tool message / duplicate never re-emits it.
     emitted_result_ids: set[str] = set()
 
     for message in messages:
         if message.role is MessageRole.assistant:
-            # Dedupe duplicate tool_use blocks within / across assistant
-            # turns; preserve the FIRST occurrence.
-            new_blocks: list[ContentBlock] = []
-            kept_tool_use_ids: list[str] = []
-            changed = False
-            for block in message.content_blocks:
-                if isinstance(block, ToolUseBlock):
-                    if block.tool_call_id in seen_tool_use_ids:
-                        changed = True
-                        continue
-                    seen_tool_use_ids.add(block.tool_call_id)
-                    kept_tool_use_ids.append(block.tool_call_id)
-                new_blocks.append(block)
-            if changed:
-                # An assistant turn that was ALL duplicate tool_use would now
-                # be empty — drop it (its surviving sibling already carries
-                # the id). Otherwise rebuild with the surviving blocks.
-                if not new_blocks:
-                    continue
-                message = message.model_copy(update={"content_blocks": new_blocks})
+            kept_tool_use_ids = [
+                block.tool_call_id
+                for block in message.content_blocks
+                if isinstance(block, ToolUseBlock)
+            ]
             result.append(message)
             # Emit each kept tool_use's result immediately after this turn,
             # in tool_use order: the repositioned real result if one exists

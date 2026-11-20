@@ -422,8 +422,12 @@ crashes. The shared assistant loop is **not** a single immutable path:
   tool_name, payload, created_at_ms, expires_at_ms)` carries one wait;
   `InterruptKind` says which of three it is (`approval` — a call parked at a
   gate that has NOT run; `question` — a call that ran far enough to ask and
-  whose answer is its result; `external_call` — a result arriving by another
-  route), and the kind decides which decisions are legal. The engine holds
+  whose answer is its result; `external_call` — a call handed to an executor
+  outside the run that went away, handed over again with
+  `redispatch_external_calls`), and the kind decides which decisions are
+  legal. An abandoned external call is closed with the unknown-outcome text,
+  never with "never ran", and a message passed to `resume()` answers a parked
+  question but never an external call. The engine holds
   however many are open at once, in park order, and writes them to the
   snapshot; `LoopState.AWAITING` with none of them recorded is refused at the
   transition (`loop_state.assert_awaiting_is_witnessed`), because it is a run
@@ -910,15 +914,37 @@ truncation at `max_tokens`, teardown).
   before the request is assembled (and before cache breakpoints are computed,
   so indices address the final list). Four repairs: forward-fill synthetic
   `is_error` results for orphaned `tool_use` blocks, reposition every real
-  result directly after its `tool_use`, reverse-strip orphaned results,
-  de-duplicate repeated ids.
+  result directly after its `tool_use`, reverse-strip orphaned results, drop a
+  second result for the same call. A call id repeated on a later `tool_use`
+  in a stored transcript is first given an id of its own, and each result
+  goes to the oldest call with its id that has none yet
+  (`runtime/tool_call_ids.py::rekey_repeated_tool_call_ids`); keeping only the
+  first call hid the later one and its result from the model.
+- `ToolCallIdAssigner` (`runtime/tool_call_ids.py`) — renames the calls of a
+  response as it arrives, so no call repeats an id the conversation has used:
+  some models write their own ids and count them per response or from what
+  they were shown (Kimi's `functions.Write:0`). A provider id that is unique
+  is kept; a repeat gets the next number of its stem (`functions.Write:3`) or
+  a `_2` suffix. The events, the history, the dispatcher and the approvals all
+  see the new id. `QueryEngine.reserve_tool_call_ids(ids)` adds the ids a
+  host still shows that the history no longer holds, such as calls a
+  compaction folded away.
 - `_synthesize_missing_tool_results(history, error_content)` — mutates history
   in place at **every teardown checkpoint** (stop-before-start,
   compaction-failed, lifecycle deny, stop-after-stream, dispatch-cancel, LLM
   terminal error), so the persisted snapshot stays pairing-valid and ordered
   for a resume on another pod. Idempotent.
+- `_close_on_partial_reply(engine, messages)` — a request whose history ends on
+  a reply a dropped stream cut short (the partial attempt kept in history,
+  `PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY`) is closed with a short user note
+  from the `partial_reply_resume` template. Some providers take a request
+  ending on an assistant message as a prefill and refuse it, and a chat
+  template renders a second assistant turn after it. The note exists in that
+  request only: it rides after the cache breakpoints, is counted in
+  `volatile_suffix_messages`, and is never written to the history.
 
-**Prompt templates.** `tool_result_pairing_repair`, `tool_result_interrupted`.
+**Prompt templates.** `tool_result_pairing_repair`, `tool_result_interrupted`,
+`partial_reply_resume`.
 
 ### Skills routing / surfacing
 
@@ -1315,13 +1341,14 @@ the matching RC field says otherwise.
   that keeps the queues in a store calls `load_queued(steer, follow_up)` from
   its `reload_live_control` and `merge_queued(stored_steer, stored_follow_up)`
   from its `persist_live_control`, inside the store's transaction. The merge
-  applies the seen rule (`merge_queue`): a stored item the engine holds or was
-  handed by its last read is the engine's to decide about; any other stored
-  item arrived after that read and is kept behind the engine's remainder, so a
-  message that landed while the run held the queue is not overwritten. The
-  returned `QueueMerge` carries the lists to write and `consumed`, the ids the
-  engine was handed and placed (never one taken back). A withdrawal and a
-  promotion outlive a read that predates them until the next merge. Every
+  (`merge_queue`) writes the engine's remainder first and keeps behind it every
+  other stored item that was neither placed nor taken back, so a message that
+  landed while the run held the queue is not overwritten, and neither is one a
+  stop emptied out of the engine's lists to hand back. The returned
+  `QueueMerge` carries the lists to write and `consumed`: exactly the ids the
+  `queue_update` events since the last merge named as placed, never one that
+  merely left the engine's lists. A withdrawal, a promotion and a placement
+  outlive a read that predates them until the next merge. Every
   terminal `message_stop` lists the ids the engine still held unplaced as
   `leftover_queued`, so a host can open its next run with them.
 - `runtime/run_work_budget.py` — cumulative tree-lifetime budget

@@ -304,6 +304,12 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "that call sits, which is the same pairing concern as the repairs "
         "below"
     ),
+    "protocore/runtime/query.py::_close_external_call_as_unknown": _whole(
+        "closes an abandoned external call with the unknown-outcome text: the "
+        "result has to go directly after the call it answers, wherever in the "
+        "transcript that call sits, the same pairing concern as the "
+        "abandonment above"
+    ),
     "protocore/runtime/query.py::_settle_parked_call": _whole(
         "closes a call a person's decision answered — a denial, an answer to "
         "the question the tool asked — and the result has to go directly "
@@ -422,6 +428,19 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     ),
     "protocore/runtime/query.py::_repair_outbound_tool_pairing": _whole(
         "wire-pairing repair over the outbound message list it is handed"
+    ),
+    "protocore/runtime/query.py::_tool_call_ids_in_use": _whole(
+        "identity: a tool call id names one call in the whole conversation "
+        "and every call in it is paired by id, so no id the transcript "
+        "carries can be given to a new call"
+    ),
+    "protocore/runtime/tool_call_ids.py::rekey_repeated_tool_call_ids": _whole(
+        "wire-pairing repair over the outbound message list it is handed: "
+        "tells two calls that share an id apart by their position in it"
+    ),
+    "protocore/runtime/tool_call_ids.py::tool_call_ids_in": _whole(
+        "identity lookup: the set of call ids in whatever sequence it is "
+        "handed, for keeping a new id clear of all of them"
     ),
     "protocore/runtime/query.py::_normalize_outbound_system_messages": _whole(
         "prompt assembly over the outbound message list it is handed"
@@ -612,6 +631,14 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     ),
     "protocore/runtime/context/ledger.py::Ledger.absorb": _Declaration(
         reason="records the messages one tier is taking out of the window",
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
+    "protocore/runtime/query.py::_close_on_partial_reply": _Declaration(
+        reason=(
+            "closes the message list of one outbound request when it ends on a "
+            "cut-short reply; the list is a request being assembled, and the "
+            "transcript itself is never handed in"
+        ),
         claim=_Claim.NOT_THE_TRANSCRIPT,
     ),
     "protocore/runtime/query.py::_with_turn_context": _Declaration(
