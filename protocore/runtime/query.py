@@ -2192,12 +2192,16 @@ async def resume(
 
     if engine.state is LoopState.AWAITING:
         parked = engine.pending_interrupts
+        # Only a question is answered by the next message. An external call's
+        # result comes from its executor, and taking whatever the operator
+        # types next for it would hand the model words as a command's output
+        # and leave no place for the real result when the executor is back.
         answerable = tuple(
-            item for item in parked if item.kind is not InterruptKind.approval
+            item for item in parked if item.kind is InterruptKind.question
         )
         if abandon_approval:
             for item in parked:
-                _abandon_pending_approval(engine, item.tool_call_id)
+                _abandon_parked_call(engine, item)
                 engine.release_interrupt(item.interrupt_id)
         elif message is not None and len(parked) == len(answerable) == 1:
             # One question outstanding and the answer has arrived. It settles
@@ -2223,12 +2227,50 @@ async def resume(
                 "decided on, and questions the model really asked, to the "
                 "model as failures. Pass resolutions to answer them all, "
                 "approved_tool_call for the single-approval case, or "
-                "abandon_approval=True to close them as never answered."
+                "abandon_approval=True to close them as never answered; a "
+                "parked external call is handed over again with "
+                "redispatch_external_calls once its executor is back."
             )
         engine.transition_to(LoopState.RUNNING)
 
     async for event in engine.run(message):
         yield event
+
+
+def _abandon_parked_call(engine: QueryEngine, interrupt: PendingInterrupt) -> None:
+    """Close a parked call that will never be answered, with what is true of it.
+
+    A call held at a gate or on a question never reached an effect worth
+    hiding, and is closed as never approved. An external call did: it was
+    handed to an executor that went away, so it may have run or may still be
+    running. Telling the model it never ran invites the repeat the pause
+    exists to prevent, so it is closed with the unknown outcome a call lost in
+    flight gets.
+    """
+    if interrupt.kind is InterruptKind.external_call:
+        _close_external_call_as_unknown(engine, interrupt.tool_call_id)
+        return
+    _abandon_pending_approval(engine, interrupt.tool_call_id)
+
+
+def _close_external_call_as_unknown(engine: QueryEngine, tool_call_id: str) -> None:
+    """Answer an abandoned external call with the unknown-outcome text."""
+    intent = find_intent(engine.open_intents, tool_call_id)
+    text = (
+        unknown_outcome_text(intent, engine.config.rc)
+        if intent is not None
+        else engine.config.rc.tool_result_unknown_outcome_placeholder
+    )
+    _insert_tool_result_after_use(
+        engine.history,
+        tool_call_id=tool_call_id,
+        content=text,
+        is_error=False,
+    )
+    if intent is not None:
+        settle_unknown(intent)
+        _forget_intent(engine, intent)
+    engine.forget_tool_name(tool_call_id)
 
 
 def _abandon_pending_approval(engine: QueryEngine, tool_call_id: str) -> None:
@@ -12770,7 +12812,7 @@ async def resume_interrupts(
             engine.release_interrupt(interrupt.interrupt_id)
 
             if resolution.decision is InterruptDecision.abandon:
-                _abandon_pending_approval(engine, interrupt.tool_call_id)
+                _abandon_parked_call(engine, interrupt)
                 continue
 
             if resolution.decision is InterruptDecision.deny:
@@ -12876,6 +12918,15 @@ async def redispatch_external_calls(engine: QueryEngine) -> AsyncIterator[TurnEv
         external = interrupts_of_kind(engine.pending_interrupts, InterruptKind.external_call)
         if engine.stop_requested or not external:
             return
+        # Every parked call is found in the history before anything moves: an
+        # interrupt naming a call the history does not hold is refused with
+        # the run still AWAITING and nothing handed over, rather than after the
+        # first calls ran and the state was already RUNNING.
+        calls = {
+            interrupt.interrupt_id: _tool_call_from_history(engine, interrupt.tool_call_id)
+            for interrupt in external
+            if not _history_has_tool_result(engine, interrupt.tool_call_id)
+        }
         if engine.state is LoopState.AWAITING:
             engine.transition_to(LoopState.RUNNING)
         reparked: list[PendingInterrupt] = []
@@ -12885,7 +12936,7 @@ async def redispatch_external_calls(engine: QueryEngine) -> AsyncIterator[TurnEv
             if _history_has_tool_result(engine, interrupt.tool_call_id):
                 engine.release_interrupt(interrupt.interrupt_id)
                 continue
-            tool_call = _tool_call_from_history(engine, interrupt.tool_call_id)
+            tool_call = calls[interrupt.interrupt_id]
             # Released only once the call has an answer, not before it is
             # dispatched: a call whose executor is still away parks again, and
             # parking a call that is still recorded keeps the identity the host

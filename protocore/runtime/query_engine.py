@@ -4535,7 +4535,12 @@ class QueryEngine:
         calls a compaction folded away, or an earlier run's calls the host
         did not seed — which a host still shows and pairs by id. The engine
         already keeps clear of every id in its own history.
+
+        A bare string is refused: iterated, it would reserve its characters
+        and leave the id itself free.
         """
+        if isinstance(ids, str):
+            raise TypeError("reserve_tool_call_ids takes an iterable of ids, not a single id string")
         self._tool_call_ids_used.update(ids)
 
     async def replace_history(self, messages: Sequence[Message], *, reason: str) -> TurnEvent:

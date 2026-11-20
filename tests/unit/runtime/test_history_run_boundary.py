@@ -304,6 +304,12 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "that call sits, which is the same pairing concern as the repairs "
         "below"
     ),
+    "protocore/runtime/query.py::_close_external_call_as_unknown": _whole(
+        "closes an abandoned external call with the unknown-outcome text: the "
+        "result has to go directly after the call it answers, wherever in the "
+        "transcript that call sits, the same pairing concern as the "
+        "abandonment above"
+    ),
     "protocore/runtime/query.py::_settle_parked_call": _whole(
         "closes a call a person's decision answered — a denial, an answer to "
         "the question the tool asked — and the result has to go directly "

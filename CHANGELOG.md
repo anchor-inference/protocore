@@ -11,7 +11,8 @@ All notable changes to this project are recorded here. The format follows
 - **`QueryEngine.reserve_tool_call_ids(ids)`.** Ids a conversation used before
   the engine's history begins — calls a compaction folded away, or an earlier
   run's calls — which a host still shows and pairs by id. No new call is given
-  one of them.
+  one of them. A bare string is refused with `TypeError` rather than reserved
+  character by character.
 - **A call whose executor went away is parked, not failed.** A tool whose work
   runs on a machine the run does not own raises `ExternalCallPauseRequested`
   when that machine is out of reach. The dispatcher announces it with the
@@ -24,7 +25,16 @@ All notable changes to this project are recorded here. The format follows
   their results. `redispatch_external_calls(engine)` hands every parked call to
   its tool again, in the order they were parked, through the whole dispatch
   path with the gate skipped; the tool answers the repeat from what its
-  executor already did, keyed by the call id, so nothing runs twice.
+  executor already did, keyed by the call id, so nothing runs twice. Every
+  parked call is found in the history before anything is handed over, so an
+  interrupt naming a call the history lacks is refused with the run still
+  `AWAITING`. An abandoned external call (the `abandon` decision, or
+  `resume(..., abandon_approval=True)`) is closed with the unknown-outcome
+  text, because it may have run, never with the "never executed" text an
+  abandoned approval gets. A message passed to `resume()` answers a parked
+  question but not a parked external call: that drive is refused, as over a
+  parked approval, instead of writing the operator's words in as the
+  command's output.
 
 ### Fixed
 
@@ -36,7 +46,10 @@ All notable changes to this project are recorded here. The format follows
   from its store. `consumed` is now exactly the ids the `queue_update` events
   named as placed (recorded with `note_placed`), and an item that only left
   the engine's lists stays in the store. A read between a placement and its
-  write-back no longer hands the placed item to the engine again.
+  write-back no longer hands the placed item to the engine again. A host that
+  wrote a stop's `restored_queue_items` back into its store by hand stops
+  doing so: the items are still there, and writing them again queues each one
+  twice.
 - **A repeated tool call id no longer hides a call from the model.** Some
   models write their own call ids and count them per response or from the
   history they were shown (Kimi's `functions.Write:0`), so a later call could
@@ -57,7 +70,11 @@ All notable changes to this project are recorded here. The format follows
   cached reported 0.47. The rate is now cache reads over input, clamped to one.
   The OpenAI-compatible normaliser also sums an Anthropic-shaped report, which
   leaves the cache out of `input_tokens`, up to the whole prompt, so the rate
-  and the price hold for both conventions.
+  and the price hold for both conventions. `LLMResponseUsage` and the
+  `ProviderDelta` usage invariant now say so: `input_tokens` is the whole
+  prompt, cache reads and writes included. An adapter of a host's own that
+  reports only the uncached part has to add the cache counts to it, or the
+  rate reads 1.0 on every turn that is more than half cached.
 
 ## [2.0.0a26] - 2026-10-22
 

@@ -16,6 +16,8 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+import pytest
+
 from protocore.contracts.tools import ToolContext
 from protocore.contracts.types import (
     Message,
@@ -123,6 +125,13 @@ async def test_an_id_the_host_reserved_is_not_issued_again(scenario: ScenarioFac
     await run.run("take a note")
 
     assert [block.tool_call_id for block in run.tool_uses()] != [KIMI_ID]
+
+
+def test_a_single_id_string_is_refused_rather_than_reserved_letter_by_letter(scenario: ScenarioFactory) -> None:
+    run = scenario()
+
+    with pytest.raises(TypeError):
+        run.engine.reserve_tool_call_ids(KIMI_ID)
 
 
 async def test_a_stored_history_with_a_repeated_id_loses_nothing(scenario: ScenarioFactory) -> None:

@@ -422,8 +422,12 @@ crashes. The shared assistant loop is **not** a single immutable path:
   tool_name, payload, created_at_ms, expires_at_ms)` carries one wait;
   `InterruptKind` says which of three it is (`approval` — a call parked at a
   gate that has NOT run; `question` — a call that ran far enough to ask and
-  whose answer is its result; `external_call` — a result arriving by another
-  route), and the kind decides which decisions are legal. The engine holds
+  whose answer is its result; `external_call` — a call handed to an executor
+  outside the run that went away, handed over again with
+  `redispatch_external_calls`), and the kind decides which decisions are
+  legal. An abandoned external call is closed with the unknown-outcome text,
+  never with "never ran", and a message passed to `resume()` answers a parked
+  question but never an external call. The engine holds
   however many are open at once, in park order, and writes them to the
   snapshot; `LoopState.AWAITING` with none of them recorded is refused at the
   transition (`loop_state.assert_awaiting_is_witnessed`), because it is a run

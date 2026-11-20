@@ -15,7 +15,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from protocore.contracts.interrupt import InterruptKind
+import pytest
+
+from protocore.contracts.interrupt import (
+    InterruptDecision,
+    InterruptKind,
+    InterruptResolution,
+    InterruptResolutionError,
+)
 from protocore.contracts.tools import ExternalCallPauseRequested, Tool, ToolContext
 from protocore.contracts.types import (
     ToolDefinition,
@@ -23,7 +30,8 @@ from protocore.contracts.types import (
     ToolResult,
     ToolResultBlock,
 )
-from protocore.runtime import EventType, LoopState, redispatch_external_calls
+from protocore.runtime import EventType, LoopState, redispatch_external_calls, resume, resume_interrupts
+from protocore.runtime.intent import find_intent
 from protocore.runtime.query_engine import QueryEngine
 from tests.scenarios.test_interrupt_resolution import _Runtime, _user
 
@@ -243,5 +251,82 @@ async def test_a_stopped_run_hands_nothing_over() -> None:
     async for _ in redispatch_external_calls(engine):
         pass
 
+    assert tool.invocations == 1
+    assert machine.executions == []
+
+
+# -- closing a parked external call says nothing it does not know ------------
+
+
+async def test_abandoning_an_external_call_reports_an_unknown_outcome_not_a_call_that_never_ran() -> None:
+    """The executor went away after the call was handed to it: the command may
+    have run. "Never executed, nothing changed" would invite the model to run
+    it a second time."""
+    runtime = _Runtime()
+    engine, _, _ = await _parked(runtime, _Machine())
+    [parked] = engine.pending_interrupts
+    rc = engine.config.rc
+
+    async for _ in resume_interrupts(
+        engine,
+        {parked.interrupt_id: InterruptResolution(parked.interrupt_id, InterruptDecision.abandon)},
+    ):
+        pass
+
+    result = _results(engine)["toolu_x"]
+    assert result.content == rc.tool_result_unknown_outcome_placeholder
+    assert result.content != rc.tool_result_approval_abandoned_placeholder
+    assert engine.pending_interrupts == ()
+    assert find_intent(engine.open_intents, "toolu_x") is None
+
+
+async def test_abandon_approval_on_resume_closes_an_external_call_as_unknown() -> None:
+    runtime = _Runtime()
+    engine, _, _ = await _parked(runtime, _Machine())
+    snapshot = engine.snapshot()
+    runtime.llm.queue_response(text="noted")
+    restored = runtime.engine()
+
+    async for _ in resume(restored, snapshot, abandon_approval=True):
+        pass
+
+    content = _results(restored)["toolu_x"].content
+    assert content == restored.config.rc.tool_result_unknown_outcome_placeholder
+
+
+async def test_a_message_does_not_become_the_result_of_a_parked_external_call() -> None:
+    """The next thing the operator types is not the command's output."""
+    runtime = _Runtime()
+    machine = _Machine()
+    engine, _, _ = await _parked(runtime, machine)
+    snapshot = engine.snapshot()
+    restored = runtime.engine()
+
+    with pytest.raises(ValueError, match="redispatch_external_calls"):
+        async for _ in resume(restored, snapshot, message=_user("are you still there?")):
+            pass
+
+    assert "toolu_x" not in _results(restored)
+    [still] = restored.pending_interrupts
+    assert still.kind is InterruptKind.external_call
+    machine.online = True
+    async for _ in redispatch_external_calls(restored):
+        pass
+    assert _results(restored)["toolu_x"].content == "ran make"
+
+
+async def test_an_interrupt_naming_a_call_the_history_lacks_is_refused_before_anything_runs() -> None:
+    runtime = _Runtime()
+    machine = _Machine()
+    engine, tool, _ = await _parked(runtime, machine)
+    engine.mark_awaiting_answer("toolu_ghost", tool_name="RemoteExec", kind=InterruptKind.external_call)
+    machine.online = True
+
+    with pytest.raises(InterruptResolutionError):
+        async for _ in redispatch_external_calls(engine):
+            pass
+
+    assert engine.state is LoopState.AWAITING
+    assert [item.tool_call_id for item in engine.pending_interrupts] == ["toolu_x", "toolu_ghost"]
     assert tool.invocations == 1
     assert machine.executions == []

@@ -343,11 +343,12 @@ def orphaned_intents(
 ) -> list[IntentRecord]:
     """Records left ``DISPATCHED`` with no result anywhere in history.
 
-    Every other state is deliberately excluded. ``PENDING_APPROVAL`` and
-    ``PAUSED_ASK_USER`` are waiting for something that has not arrived, and
-    ``RESERVED`` was recorded before anything was tried — none of the three is
-    an unknown outcome, and describing one as such would tell the model a call
-    that never ran may already have taken effect.
+    Every other state is deliberately excluded. ``PENDING_APPROVAL``,
+    ``PAUSED_ASK_USER`` and ``PAUSED_EXTERNAL`` are waiting for something that
+    has not arrived, and ``RESERVED`` was recorded before anything was tried —
+    none of them is an unknown outcome, and describing one as such would tell
+    the model a call that never ran may already have taken effect, or settle a
+    call whose executor still owes its answer.
     """
     return [
         item
