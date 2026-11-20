@@ -633,6 +633,14 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         reason="records the messages one tier is taking out of the window",
         claim=_Claim.NOT_THE_TRANSCRIPT,
     ),
+    "protocore/runtime/query.py::_close_on_partial_reply": _Declaration(
+        reason=(
+            "closes the message list of one outbound request when it ends on a "
+            "cut-short reply; the list is a request being assembled, and the "
+            "transcript itself is never handed in"
+        ),
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
     "protocore/runtime/query.py::_with_turn_context": _Declaration(
         reason=(
             "appends the host's turn context to the message list of one "

@@ -149,6 +149,7 @@ from protocore.contracts.types import (
     SYNTHETIC_RECOVERY_LONGFILE_SALVAGE,
     SYNTHETIC_RECOVERY_LONGFILE_TERMINAL_SEAL,
     SYNTHETIC_RECOVERY_METADATA_KEY,
+    SYNTHETIC_RECOVERY_PARTIAL_REPLY_RESUME,
     SYNTHETIC_RECOVERY_POST_TOOL_EMPTY_NUDGE,
     SYNTHETIC_RECOVERY_PRE_DISPATCH_TERMINAL_VERIFY,
     SYNTHETIC_RECOVERY_PRE_TERMINAL_SELF_VERIFY,
@@ -1784,6 +1785,38 @@ def build_llm_request(
         extra=extra,
         observability=observability,
     )
+
+
+def _close_on_partial_reply(
+    engine: QueryEngine, messages: list[Message]
+) -> tuple[list[Message], int]:
+    """``messages`` closed with a note when they end on a reply a dropped stream cut short.
+
+    A stream that fails mid-reply leaves its partial reply in the history, so
+    the transcript and what the reader saw agree, and the retry is then built
+    on a history that ends on that assistant message. Some providers take a
+    request ending on an assistant message as a prefill and refuse it outright
+    (and with it the retry, the wind-down and the run), and a chat template
+    renders a second assistant turn after the first. A short user note asking
+    the model to go on from where it stopped closes the request for every
+    adapter. Like the turn context it exists in this request only: it is never
+    written to the history, and it rides after the cache breakpoints, so the
+    prefix in front of it is unchanged. Returns how many messages it added.
+    """
+    if not messages:
+        return messages, 0
+    last = messages[-1]
+    if (
+        last.role is not MessageRole.assistant
+        or last.metadata.get(PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY) is not True
+    ):
+        return messages, 0
+    note = Message(
+        role=MessageRole.user,
+        content_blocks=[TextBlock(text=engine.prompt_text("partial_reply_resume"))],
+        metadata={SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_PARTIAL_REPLY_RESUME},
+    )
+    return [*messages, note], 1
 
 
 async def _with_turn_context(
@@ -5118,7 +5151,9 @@ async def _drive_one_stream(
     # After the breakpoints, which are placed on the stable messages only: the
     # turn context is the one part of the request that differs every time, and
     # a cache marker on it would write a prefix no later request can match.
+    full_messages, resume_note = _close_on_partial_reply(engine, full_messages)
     full_messages, volatile_suffix = await _with_turn_context(engine, full_messages)
+    volatile_suffix += resume_note
     # The forced-tool slot. ``build_llm_request`` places it on
     # ``extra["forced_tool_choice"]``; the native-thinking axis it threads
     # alongside (``enable_thinking`` + ``reasoning_effort``, always as a pair

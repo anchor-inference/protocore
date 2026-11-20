@@ -320,6 +320,13 @@ tells the model the tool has been disabled and to answer/finalize from the
 conversation instead of retrying. Runtime scaffolding (not user-authored), so it
 is filtered from the durable transcript like the other synthetic user nudges."""
 
+SYNTHETIC_RECOVERY_PARTIAL_REPLY_RESUME = "partial_reply_resume"
+"""``SYNTHETIC_RECOVERY_METADATA_KEY`` value for the note that closes a request
+whose history ends on a reply a dropped stream cut short. It exists in that
+request only, never in the history: a request that ends on an assistant message
+is a prefill to some providers, which refuse it, and a second assistant turn to
+a chat template."""
+
 SYNTHETIC_RECOVERY_GUARANTEED_TERMINAL = "guaranteed_terminal_scaffold"
 """``SYNTHETIC_RECOVERY_METADATA_KEY`` value for guaranteed-terminal scaffold."""
 
@@ -429,6 +436,7 @@ _ORIGIN_BY_RECOVERY_KIND: dict[str, MessageOrigin] = {
     SYNTHETIC_RECOVERY_TRUNCATION_CONTINUE: MessageOrigin.recovery,
     SYNTHETIC_RECOVERY_MAX_OUTPUT_CONTINUE: MessageOrigin.recovery,
     SYNTHETIC_RECOVERY_CIRCUIT_BREAKER: MessageOrigin.recovery,
+    SYNTHETIC_RECOVERY_PARTIAL_REPLY_RESUME: MessageOrigin.recovery,
     SYNTHETIC_RECOVERY_GUARANTEED_TERMINAL: MessageOrigin.recovery,
     SYNTHETIC_RECOVERY_LONGFILE_SALVAGE: MessageOrigin.recovery,
     SYNTHETIC_RECOVERY_LONGFILE_TERMINAL_SEAL: MessageOrigin.recovery,

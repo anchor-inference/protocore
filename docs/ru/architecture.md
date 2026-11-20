@@ -933,11 +933,19 @@ resume-from-partial-batch, усечение по max_tokens, teardown).
   hook-deny, stop-after-stream, dispatch-cancel, LLM-error terminal), так что
   персистированный снимок остаётся валидным по парности и упорядоченным для resume на другом
   поде. Идемпотентна.
+- `_close_on_partial_reply(engine, messages)` — запрос, история которого кончается ответом,
+  оборванным упавшим потоком (частичная попытка, сохранённая в истории,
+  `PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY`), закрывается короткой пользовательской заметкой из
+  шаблона `partial_reply_resume`. Некоторые провайдеры принимают запрос, кончающийся сообщением
+  ассистента, за prefill и отвергают его, а шаблон чата рисует после него второй ход
+  ассистента. Заметка есть только в этом запросе: она идёт после точек кэша, считается в
+  `volatile_suffix_messages` и никогда не пишется в историю.
 
 **Как подключается.** `_repair_outbound_tool_pairing` выполняется на каждом исходящем запросе;
 `_synthesize_missing_tool_results` выполняется на всех путях аномального выхода.
 
-**Шаблоны промптов.** `tool_result_pairing_repair`, `tool_result_interrupted`.
+**Шаблоны промптов.** `tool_result_pairing_repair`, `tool_result_interrupted`,
+`partial_reply_resume`.
 
 ### Skills routing / surfacing
 

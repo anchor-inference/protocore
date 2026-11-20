@@ -934,8 +934,17 @@ truncation at `max_tokens`, teardown).
   compaction-failed, lifecycle deny, stop-after-stream, dispatch-cancel, LLM
   terminal error), so the persisted snapshot stays pairing-valid and ordered
   for a resume on another pod. Idempotent.
+- `_close_on_partial_reply(engine, messages)` — a request whose history ends on
+  a reply a dropped stream cut short (the partial attempt kept in history,
+  `PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY`) is closed with a short user note
+  from the `partial_reply_resume` template. Some providers take a request
+  ending on an assistant message as a prefill and refuse it, and a chat
+  template renders a second assistant turn after it. The note exists in that
+  request only: it rides after the cache breakpoints, is counted in
+  `volatile_suffix_messages`, and is never written to the history.
 
-**Prompt templates.** `tool_result_pairing_repair`, `tool_result_interrupted`.
+**Prompt templates.** `tool_result_pairing_repair`, `tool_result_interrupted`,
+`partial_reply_resume`.
 
 ### Skills routing / surfacing
 

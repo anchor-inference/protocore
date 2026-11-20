@@ -75,6 +75,18 @@ All notable changes to this project are recorded here. The format follows
   prompt, cache reads and writes included. An adapter of a host's own that
   reports only the uncached part has to add the cache counts to it, or the
   rate reads 1.0 on every turn that is more than half cached.
+- **A retry after a stream that dropped mid-reply no longer ends its request on
+  the partial reply.** The partial reply stays in the history, so the
+  transcript agrees with what the reader saw, and the retry was then built on
+  a history ending on that assistant message. Some providers take that as a
+  prefill and refuse it (`This model does not support assistant message
+  prefill`), and the retry, the wind-down and the run failed with it; a chat
+  template renders a second assistant turn after it. Such a request is now
+  closed with a short user note from the new `partial_reply_resume` template,
+  asking the model to go on from where it stopped. The note exists in that
+  request only: it rides after the cache breakpoints, is counted in
+  `volatile_suffix_messages`, and is never written to the history. It is
+  marked with the new `SYNTHETIC_RECOVERY_PARTIAL_REPLY_RESUME` kind.
 
 ## [2.0.0a26] - 2026-10-22
 
