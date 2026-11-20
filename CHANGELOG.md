@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0b1] - 2026-11-20
+
 ### Added
 
 - **`QueryEngine.reserve_tool_call_ids(ids)`.** Ids a conversation used before
