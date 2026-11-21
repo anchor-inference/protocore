@@ -301,6 +301,11 @@ summary they reserve room for is held to
 `session_memory_running_summary_token_cap` (1,900), which also bounds
 `session_memory_fold_max_output_tokens` (1,000) from above (an approximate
 comparison: the cap is the calibrated estimate, the bound the provider's count).
+`session_seed_fold_cuts_before_pin` (2) pins a turn the summariser keeps being
+cut off on; `session_memory_registry_max_tokens` (2,000) and
+`session_memory_registry_head_chars` (240) bound the artifact registry;
+`session_seed_budget_ratio` (0.75) and `session_seed_run_reserve_min_tokens`
+(6,000) drive the recommended seed budget (see [`compaction.md`](compaction.md#seeding-the-next-run)).
 `session_memory_head_protect_turns` (1) and `session_memory_head_max_tokens`
 (3,000) protect the session's first turns. The defaults suit a window of
 a few tens of thousands of tokens and chats of a few tool-heavy turns. See

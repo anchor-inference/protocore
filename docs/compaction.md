@@ -415,14 +415,30 @@ turns, and makes the summariser call.
   window only when the summary records it, a reset summary brings every turn
   back, and a head turn whose protection lapses is carried and then folded.
   The stored forms (`SessionSummary.to_text`, `to_dict`) carry a format
-  marker; anything without it loads as a fresh summary.
-- **Under pressure** the older full turns are masked first, then the newest
-  turn's result text is cut to the longest head that fits (its images stay),
-  then it is masked; then window turns are left out oldest first, then the
-  head, the newest turn, the registry and the summary, and one notice says
-  what is not in context. The seed always fits its budget; the fold plan,
-  which counts every turn the summary does not record, folds what was left
-  out in batches over the following runs.
+  marker, the entry count and a digest; anything without them — blank, old,
+  foreign or torn — loads as a fresh summary. A fold's `CoverageStep` names
+  the coverage it was planned against, and `fold_run` refuses it on any other
+  summary (`stale_plan`), so a range can never span a turn it does not
+  record.
+- **Under pressure** the older full turns are masked first; the registry
+  shrinks toward its list of paths; the newest turn's result text is cut to
+  the longest head that fits (its images stay), then masked; then window
+  turns are left out oldest first, then the head, the registry and the
+  summary; the newest turn is reduced to its question and answer, and only
+  then left out. One notice says what is not in context. The seed always fits
+  its budget and the previous answer outranks everything else; the fold
+  plan, which counts every turn the summary does not record, folds what was
+  left out in batches over the following runs. The registry itself is held
+  to `session_memory_registry_max_tokens` (oldest snapshots first to a head
+  of `session_memory_registry_head_chars`, then to the path).
+- **In-run compaction re-masks the seeded previous turn first.** Its
+  messages carry their masked form (`SESSION_SEED_MASKED_FORM_METADATA_KEY`),
+  and `remask_seeded_turns` puts it in place before Tier 1 touches the run's
+  own work, so the seed can carry the previous turn uncut.
+  `recommend_seed_budget(rc, overhead_tokens)` gives the seed
+  `session_seed_budget_ratio` of the room between the overhead and the
+  compaction trigger, leaving at least `session_seed_run_reserve_min_tokens`
+  to the run.
 - **Prefix-stable.** A masked turn is the same bytes in every seed, and the
   summary only changes when a fold lands, so consecutive seeds share
   everything up to the previous seed's full tail, on the messages and on the
@@ -441,14 +457,21 @@ turns, and makes the summariser call.
 - **Delta folds.** The summariser is shown the stored summary and the turns
   leaving the window in their masked form (`build_summary_delta_request`,
   `SUMMARY_DELTA_SYSTEM`) and writes only new entries under fixed sections,
-  or `NOTHING NEW`; under PENDING / NEXT, `- nothing open` empties the list
-  and `- DONE: <item>` closes one item. `parse_summary_delta` refuses an
-  empty, all-reasoning or cut-off-before-its-first-entry reply, so no
-  coverage advances on it. A reply cut off at its output bound only adds: its
-  complete entries are kept, nothing is replaced, cleared or closed, and
-  coverage does not advance, so the turns are folded again. `fold_run`
-  merges the entries, records the coverage, keeps the stale-fold count, and
-  applying the same delta again changes nothing. Over `session_memory_running_summary_token_cap`, whole entries are
+  or `NOTHING NEW`; tool output reaches it fenced, every line prefixed, as
+  data it must not take instructions from. PENDING / NEXT is a list of open
+  items: new items are appended, `- DONE: <item>` closes the stored item it
+  names (matched case-, space- and punctuation-insensitively; an unmatched
+  one is reported), only `- nothing open` empties it, and "no change" words
+  change nothing. `parse_summary_delta` refuses an empty, all-reasoning or
+  cut-off-before-its-first-entry reply, so no coverage advances on it. A
+  reply cut off at its output bound only adds: its complete entries are kept,
+  nothing is cleared or closed, and coverage does not advance, so the turns
+  are folded again in a halved batch; after `session_seed_fold_cuts_before_pin`
+  cut folds of a single turn it is pinned — carried masked for good — rather
+  than retried. `fold_run` merges the entries (never one already stored),
+  records the coverage, keeps the stale-fold count, and applying the same
+  step again changes nothing. A held fold changes the summary without moving
+  coverage, so it breaks the prefix after the head, like a fold. Over `session_memory_running_summary_token_cap`, whole entries are
   shed oldest first, ARTIFACTS before later REQUESTS before KEY FACTS &
   IDENTIFIERS before CONSTRAINTS & DECISIONS, PENDING / NEXT last, and a
   section says how many it shed. *Why.* A summary rewritten whole on every run
@@ -611,6 +634,11 @@ nothing or keep nothing; point the same code at a real provider to measure it.
 | `session_seed_fold_trigger_ratio` | 0.9 | share of the seed budget at which a fold is planned |
 | `session_seed_fold_target_ratio` | 0.6 | share a planned fold brings the seed down to |
 | `session_seed_fold_min_turns_between` | 1 | runs a fold must leave free, in newest-turn masked sizes |
+| `session_seed_fold_cuts_before_pin` | 2 | cut folds of one turn before it is pinned |
+| `session_seed_budget_ratio` | 0.75 | seed share of the room between overhead and trigger |
+| `session_seed_run_reserve_min_tokens` | 6,000 | least room the recommended budget leaves the run |
+| `session_memory_registry_max_tokens` | 2,000 | bound on the registry block |
+| `session_memory_registry_head_chars` | 240 | head of a file kept when its snapshot does not fit |
 | `session_memory_head_protect_turns` | 1 | leading turns always seeded raw and never folded |
 | `session_memory_head_max_tokens` | 3,000 | largest masked size of that head |
 | `session_memory_running_summary_token_cap` | 1,900 | summary size past which whole entries are shed |

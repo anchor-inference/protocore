@@ -317,6 +317,11 @@ if iteration >= 50:
 `session_memory_running_summary_token_cap` (1 900), который же ограничивает
 сверху `session_memory_fold_max_output_tokens` (1 000) (сравнение
 приблизительное: потолок — откалиброванная оценка, предел — счёт провайдера).
+`session_seed_fold_cuts_before_pin` (2) закрепляет ход, на котором
+суммаризатор раз за разом обрывается; `session_memory_registry_max_tokens`
+(2 000) и `session_memory_registry_head_chars` (240) ограничивают реестр
+артефактов; `session_seed_budget_ratio` (0.75) и
+`session_seed_run_reserve_min_tokens` (6 000) задают рекомендованный бюджет посева (см. [`compaction.md`](compaction.md#посев-следующего-запуска)).
 `session_memory_head_protect_turns` (1) и `session_memory_head_max_tokens`
 (3 000) защищают первые ходы сессии. Значения по умолчанию подобраны под окно
 в несколько десятков тысяч токенов и диалоги из нескольких ходов с инструментами. См.
