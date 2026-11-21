@@ -288,17 +288,21 @@ carries more images between breaks; each image is priced at
 The session-seed fields are a fifth. `session_seed_full_turns` (1) and
 `session_seed_mask_batch_turns` (1) decide how many of a session's newest
 earlier turns are seeded with their tool results and how far the masking
-boundary moves at once; `session_seed_mask_min_tokens`,
+boundary moves at once; `session_seed_mask_min_chars`,
 `session_seed_mask_preview_chars` and `session_seed_mask_identifier_lines`
-shape a masked result's placeholder. `session_seed_fold_trigger_ratio` (0.9)
+shape a masked result's placeholder, and `session_seed_mask_arg_max_chars`
+and `session_seed_mask_arg_preview_chars` a masked call's arguments. `session_seed_fold_trigger_ratio` (0.9)
 and `session_seed_fold_target_ratio` (0.6, below the trigger) are the
-hysteresis of the summary fold, against the seed budget the host passes, and
-the summary they reserve room for is held to
+hysteresis of the summary fold, against the seed budget the host passes; the
+planner counts the newest full turns at their full size, so older turns are
+folded before the newest is cut. The
+summary they reserve room for is held to
 `session_memory_running_summary_token_cap` (1,900), which also bounds
-`session_memory_fold_max_output_tokens` (1,000) from above.
+`session_memory_fold_max_output_tokens` (1,000) from above (an approximate
+comparison: the cap is the calibrated estimate, the bound the provider's count).
 `session_memory_head_protect_turns` (1) and `session_memory_head_max_tokens`
-(3,000) protect the session's first turns. The defaults suit a window of about
-49k tokens and chats of a few tool-heavy turns. See
+(3,000) protect the session's first turns. The defaults suit a window of
+about 48k tokens and chats of a few tool-heavy turns. See
 [`compaction.md`](compaction.md#seeding-the-next-run).
 
 ## See also
