@@ -1221,7 +1221,7 @@ def _session_history_seed_indices(history: list[Message]) -> frozenset[int]:
       ``role=user`` ``TextBlock`` messages that DUAL-TAG
       :data:`SESSION_HISTORY_SEED_METADATA_KEY` AND
       :data:`COMPACTION_REFERENCE_METADATA_KEY` (see
-      ``session_memory._tag_seeded_reference``), so the Tier-1 A2(2)
+      ``session_seed._tag_seeded_reference``), so the Tier-1 A2(2)
       reference-block path blobs THEM to a recoverable placeholder when they
       exceed the truncation threshold. Without the reference dual-tag these
       large user-text blocks had NO shed path and were permanently immovable.

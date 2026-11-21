@@ -1,92 +1,53 @@
 
-"""Persistent, structured cross-run session memory.
+"""What a session remembers across runs: a running summary and an artifact registry.
 
-PURE core module. NEVER imports the host / adapters / frontend (the import
-boundary guard ``tests/test_core_import_boundary.py`` enforces this). The host
-loads/stores the durable memory and injects the model-client as a summarizer
-callback — core only computes.
+PURE core module. It never imports the host, a store or a model client (the
+import-boundary guard ``tests/test_core_import_boundary.py`` enforces this). The
+host loads and stores :class:`SessionMemory`, makes the summariser call, and
+hands the reply back; this module only computes.
 
-This implements an empirically-proven persistent iterative LLM running summary
-that achieves exact-fact recall at long contexts where a raw-seed approach
-collapses, at HALF the prompt tokens, PLUS a structured artifact registry built
-ONLY from parsed tool-call arguments.
+A session's next run is seeded from its RAW earlier turns
+(:mod:`protocore.runtime.context.session_seed`), with the tool results of the
+older ones masked. The memory here stands in only for what that raw window no
+longer carries:
 
-UNIVERSALITY / NO-HEURISTICS RULE (enforced by review):
-* There is ZERO regex, ZERO substring/keyword matching, ZERO hardcoded text
-  patterns anywhere in this module. ``import re`` is forbidden. Semantic
-  extraction (exact facts, headings, decisions, identifiers, versions) is the
-  job of the LLM running summary — preserved by INSTRUCTING the model in the
-  summary system prompt to keep them verbatim, multilingual (RU+EN), NOT by any
-  text-scanning post-process.
-* The artifact registry reads STRUCTURED tool-call data by named key only: for a
-  file-writing tool call, the ``path`` argument names the file the agent
-  created/edited, and the ``content`` argument is kept as a verbatim snapshot.
-  That is reading the actual tool-invocation fields by key — universal +
-  language-agnostic, not text matching.
+1. **The running summary** (:class:`SessionSummary`) — entries under five fixed
+   sections, recording the turns that have left the raw window. It is grown by
+   *delta folds*: the summariser is shown the existing summary and the turns
+   leaving the window, and asked only for what those turns add
+   (:data:`SUMMARY_DELTA_SYSTEM`, :func:`build_summary_delta_message`). The
+   reply is parsed into entries (:func:`parse_summary_delta`) and appended
+   (:func:`merge_summary_delta`). The summary is never rewritten whole, so a
+   fold costs the decode of a few hundred tokens instead of the whole summary,
+   and nothing already recorded can be lost to a rewrite that forgot it.
+2. **The artifact registry** (:class:`ArtifactLedger`) — ``path`` -> last
+   verbatim ``content`` of every file a workspace-mutating tool wrote, read by
+   role from the tool-call arguments (no text scanning). Updated after every
+   run, with or without a fold.
 
-Two persistent artifacts make up a session memory (:class:`SessionMemory`):
+The cap. Past ``session_memory_running_summary_token_cap`` the summary sheds
+whole entries, oldest first, from the sections in :data:`SUMMARY_SECTIONS`
+order of ``shed_rank`` — ARTIFACTS (the registry keeps the files) before
+later REQUESTS before KEY FACTS & IDENTIFIERS before CONSTRAINTS & DECISIONS,
+PENDING / NEXT last — and every section that lost entries says how many. The
+first REQUESTS entry, the user's original ask, is the last thing to go. It
+used to be cut from the end by characters, which removed the trailing sections
+whole and handed the next fold a summary missing headings it was required to
+keep.
 
-1. **Running summary** — folded ``Mᵢ = LLM(Sᵢ, Mᵢ₋₁)`` once per run from THAT
-   run's local messages (delta-only: the prior summary is passed as PREVIOUS
-   SUMMARY, only the new run's turns are SOURCE — the summary is NEVER
-   re-summarised, so cost is O(K) not O(K²) and fidelity is monotonic). The
-   summarizer is an INJECTED callback so core never calls a model client.
-2. **Artifact registry** — a deterministic file registry: ``path`` -> last
-   verbatim ``content`` snapshot, read by key from file-writing tool-call
-   arguments (Write / Edit / AppendFile / …). Pure structured field access.
-
-:func:`fold_run` updates a memory from a finished run's messages (the UPDATE
-step). :func:`build_seed` assembles a memory + a recent raw tail + the original
-head into a wire-ready message list for the NEXT run (the SEED step).
-
-ASYNC-NATIVE FOLD:
-Core does NOT call a model client and does NOT bridge to one via a thread. The
-LLM running-summary call lives in the HOST on the main event loop, awaited
-directly under ``asyncio.wait_for`` so a timeout cancels the awaitable cleanly
-and the LLM provider releases its inflight slot via its normal async
-cancellation / ``finally`` path (NO worker thread, NO fresh event loop → the
-slot can NEVER leak). Core only:
-
-* builds the summary prompt input via the pure :func:`build_summary_user_message`
-  (so the host serialises the exact same multilingual SOURCE MATERIAL), and
-* folds the ALREADY-COMPUTED ``new_summary_text`` into the memory in
-  :func:`fold_run` (pure assembly: free artifact-ledger update + summary set +
-  drift cap + ``turn_index`` advance).
-
-LAZY FOLD: :func:`running_summary_needed` lets the host SKIP the LLM call
-entirely when the whole prior session still fits in ``build_seed``'s raw tail
-(the running summary would never be used) — short sessions do a ledger-only,
-ZERO-LLM update.
-
-TOKEN SCALE — every gate in this module is denominated in the ONE shared
-estimate, :func:`~protocore.runtime.context.compaction.estimate_message_tokens`.
-This module used to carry its own, narrower estimate: it joined the text of
-text / tool_use / tool_result blocks plus ``reasoning_content`` and costed the
-join once, so thinking blocks, image refs and unknown block kinds contributed
-ZERO. The shared estimate costs every block, prices an
-:class:`~protocore.contracts.types.ImageRefBlock` at
-:attr:`LoopConstants.token_count_image_tokens`, and counts thinking and
-unknown blocks. For the same transcript it therefore reads at least as high as
-the old one, and MATERIALLY higher on a transcript carrying images or
-re-emitted reasoning.
-
-That shift is deliberate — an estimate that silently prices part of a
-transcript at zero is what let a session overrun the window it was measured
-against — but it MOVED THE SCALE these thresholds are read on:
-``session_memory_fold_min_tokens``, ``summary_fold_threshold_tokens`` and
-``session_memory_tail_budget_fraction`` all mean slightly less transcript than
-they did, so a fold fires marginally earlier and the seed tail is clipped
-marginally sooner on such a transcript. The defaults are unchanged and remain
-per-tenant overridable; the scale itself is pinned by
-``tests/unit/runtime/test_session_memory_token_scale.py``.
+Parsing a reply is reading the format the prompt asked for — headings this
+module named and one entry per line — not mining text for meaning. There is no
+regular expression here; semantic extraction is the summariser's job.
 """
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from enum import StrEnum
+from typing import Any, Final
 
+from protocore.contracts.llm import LLMRequest
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_roles import (
     EMPTY_TOOL_ROLE_MAP,
@@ -95,221 +56,483 @@ from protocore.contracts.tool_roles import (
     ToolRoleMap,
 )
 from protocore.contracts.types import (
-    COMPACTION_REFERENCE_METADATA_KEY,
-    SESSION_HISTORY_SEED_METADATA_KEY,
     Message,
     MessageRole,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
 )
-from protocore.runtime.context.compaction import (
-    estimate_history_tokens,
-    estimate_message_tokens,
-)
 from protocore.runtime.token_counting import estimate_tokens
 from protocore.runtime.tool_arguments import string_argument
 
 # ---------------------------------------------------------------------------
-# Structural constants (NOT tunable thresholds → not RC fields): the
-# END-OF-SUMMARY marker, render labels, the verbatim-preservation system prompt,
-# and the named tool-call field keys read by the structured artifact registry.
-# All numeric BUDGET thresholds live in LoopConstants (no inline magic
-# numbers).
+# Render-shape constants. They shape strings, not behaviour an operator tunes
+# per tenant, so they are module constants; every budget is a LoopConstants
+# field.
 # ---------------------------------------------------------------------------
 
-END_OF_SUMMARY_MARKER = (
-    "--- END OF CONTEXT SUMMARY — the message below is the current task; "
-    "respond to it, not to the summary above ---"
+#: Cap on how many files the registry pins, and on each content snapshot.
+_MAX_FILES: Final[int] = 60
+_CONTENT_SNAPSHOT_MAX_CHARS: Final[int] = 4000
+
+#: Per-block caps when a turn is rendered as text for the summariser, so one
+#: huge block cannot dominate the fold's input.
+_SERIALIZE_TOOL_ARGS_MAX_CHARS: Final[int] = 240
+_SERIALIZE_TOOL_RESULT_MAX_CHARS: Final[int] = 600
+
+#: Longest single summary entry kept. An entry is one fact; a reply that put a
+#: page on one line is clipped rather than allowed to crowd out every other.
+_ENTRY_MAX_CHARS: Final[int] = 1000
+
+#: Shortest an entry is clipped to when shedding whole entries could not bring
+#: the summary under its cap (one entry larger than the cap by itself).
+_ENTRY_MIN_CLIP_CHARS: Final[int] = 80
+
+_ELLIPSIS: Final[str] = " …"
+
+#: The words of the line a section ends with when the cap shed some of its
+#: entries: ``  (N earlier entries of this section are no longer carried)``.
+_SHED_NOTE: Final[str] = "earlier entries of this section are no longer carried"
+
+#: Characters a heading line may be decorated with by a model (markdown marks,
+#: quote marks, bullets) and that are stripped before it is compared.
+_HEADING_DECORATION: Final[str] = "#*_`>-•+ \t"
+
+#: Bullet marks stripped from the start of an entry line.
+_ENTRY_BULLETS: Final[tuple[str, ...]] = ("- ", "* ", "\u2022 ", "\u2013 ", "\u2014 ", "+ ")
+
+
+class SectionMerge(StrEnum):
+    """How a section takes a fold's new entries."""
+
+    accumulate = "accumulate"
+    """New entries are added after the stored ones (duplicates skipped)."""
+    supersede = "supersede"
+    """A fold that writes the section replaces its entries; one that leaves it
+    out keeps them. For state that is current, not cumulative."""
+
+
+@dataclass(frozen=True, slots=True)
+class SummarySection:
+    """One fixed section of the running summary."""
+
+    heading: str
+    merge: SectionMerge
+    shed_rank: int
+    """Lower sheds first when the summary is over its cap."""
+    keep_first: bool = False
+    """The section's first entry is shed only after every other entry of every
+    section is gone (the user's original request)."""
+
+
+SUMMARY_SECTIONS: Final[tuple[SummarySection, ...]] = (
+    SummarySection("REQUESTS", SectionMerge.accumulate, shed_rank=1, keep_first=True),
+    SummarySection("CONSTRAINTS & DECISIONS", SectionMerge.accumulate, shed_rank=3),
+    SummarySection("KEY FACTS & IDENTIFIERS", SectionMerge.accumulate, shed_rank=2),
+    SummarySection("PENDING / NEXT", SectionMerge.supersede, shed_rank=4),
+    SummarySection("ARTIFACTS", SectionMerge.accumulate, shed_rank=0),
 )
-"""Sentinel after the running-summary block so a local model treats the summary
-as reference DATA, not a chat turn to continue (proven on the stand)."""
+"""The sections, in render order. The order a reply writes them in does not
+matter; the order they are shown in does, and is fixed."""
 
-#: Cap on how many files are pinned + how many chars of each content snapshot is
-#: kept, so the registry block stays compact even on a huge session. These are
-#: render-shape constants (not behavioural thresholds an operator tunes per
-#: tenant), so they are module constants rather than RC fields.
-_MAX_FILES = 60
-_CONTENT_SNAPSHOT_MAX_CHARS = 4000
+_SECTION_BY_HEADING: Final[Mapping[str, SummarySection]] = {s.heading: s for s in SUMMARY_SECTIONS}
 
-#: Per-block truncation caps applied ONLY when rendering a run's transcript as
-#: TEXT INPUT for the summary fold (``_serialize_message``). They bound how much
-#: of one tool-call's args / one tool-result appears in the summarizer's source
-#: material so a single huge block cannot dominate the fold input. Like the two
-#: caps above, these are render-shape constants — they shape the serialized input
-#: string, not a behavioural threshold an operator tunes per tenant — so they are
-#: named module constants, NOT RC fields (per →
-#: "truly static values that should never vary per-scope belong only in
-#: constants.py"; the LLM summary remains the sole semantic mechanism).
-_SERIALIZE_TOOL_ARGS_MAX_CHARS = 240
-_SERIALIZE_TOOL_RESULT_MAX_CHARS = 600
-
-SUMMARY_SYSTEM = (
-    "You are a context-compression component for an autonomous agent. You "
-    "receive SOURCE MATERIAL (the session transcript to fold in — this is the "
-    "newest session turns, and on the first fold of a long session it may carry "
-    "the whole un-summarised history so far) and, optionally, a PREVIOUS SUMMARY "
-    "of everything before it. Produce ONE updated running summary of the whole "
-    "session so the agent can continue without re-reading the raw history.\n"
-    "Write the summary under these FIXED SECTION HEADINGS, ALWAYS in this exact "
-    "order, even if a section is empty:\n"
-    "  ORIGINAL ASK:\n"
+SUMMARY_DELTA_SYSTEM: Final[str] = (
+    "You keep the running summary of a conversation between a user and an "
+    "agent that spans many runs. The agent's context carries the recent turns "
+    "verbatim; older turns leave it and survive only in this summary.\n"
+    "You receive the EXISTING SUMMARY (what is already recorded; it may be "
+    "empty) and NEW TURNS (the turns leaving the agent's context now). Write "
+    "ONLY what the NEW TURNS add: entries that are not already in the EXISTING "
+    "SUMMARY. Never repeat, rephrase, reorder or correct an existing entry.\n"
+    "Write each entry on its own line starting with \"- \", under one of these "
+    "headings, each heading at most once, in any order:\n"
+    "  REQUESTS:\n"
     "  CONSTRAINTS & DECISIONS:\n"
     "  KEY FACTS & IDENTIFIERS:\n"
     "  PENDING / NEXT:\n"
     "  ARTIFACTS:\n"
+    "Leave out a heading you have nothing new for. Do not write placeholder "
+    "entries such as \"none\".\n"
     "RULES:\n"
-    "- PRESERVE every fact already in the PREVIOUS SUMMARY; ADD the new facts "
-    "from the SOURCE MATERIAL. Carry forward EVERY prior fact VERBATIM. Never "
-    "drop, paraphrase, or replace a previously-recorded fact — especially never "
-    "replace a constraint, decision, or identifier with file/essay content.\n"
-    "- CONSTRAINTS & DECISIONS and KEY FACTS & IDENTIFIERS are the HIGHEST "
-    "priority: every rule the user/agent stated (\"X MUST …\", limits, policies), "
-    "every decision, and every novel identifier/code/token/URL/version/number "
-    "goes here, copied VERBATIM (exact characters). If the summary must be "
-    "shortened to fit a budget, shorten ARTIFACTS first and NEVER drop a "
-    "constraint, decision, or identifier — those are the facts that cannot be "
-    "recovered elsewhere.\n"
-    "- Capture VERBATIM, copying the exact characters: novel identifiers/codes, "
-    "version numbers, URLs, created/edited filenames and paths, document "
-    "headings (e.g. `## Heading`), numeric constraints/limits, and every "
-    "decision the user or agent made.\n"
-    "- ARTIFACTS is for created/edited files: list each path and ONE short line "
-    "of what it is. Do NOT copy file BODIES / essay prose here — the exact file "
-    "contents are preserved separately in the artifact registry, so re-stating "
-    "them only crowds out the constraints and identifiers above.\n"
-    "- Preserve exact tokens REGARDLESS OF LANGUAGE. The conversation may be in "
-    "Russian, English, or mixed (Русский, English, или смешанный) — copy "
-    "names/codes/paths/numbers exactly in their original script; do not "
-    "translate or normalise them.\n"
-    "- Output ONLY the updated summary text under the fixed headings above. Do "
-    "not address the user."
+    "- REQUESTS: what the user asked for in the NEW TURNS, one entry per "
+    "request, in the user's own words where they are short.\n"
+    "- CONSTRAINTS & DECISIONS: every rule, limit, preference or decision the "
+    "user or the agent stated.\n"
+    "- KEY FACTS & IDENTIFIERS: facts the agent found or stated that a later "
+    "answer may need — names, titles, numbers, dates, ids, codes, URLs, paths, "
+    "versions, and which item was which in any list the agent gave — copied "
+    "VERBATIM, exact characters.\n"
+    "- PENDING / NEXT: the complete list of what is still open after the NEW "
+    "TURNS. It replaces the previous list, so write it whole, or leave the "
+    "heading out if nothing changed.\n"
+    "- ARTIFACTS: files created or edited, one line each: the path and what it "
+    "is. Not their contents; those are kept elsewhere.\n"
+    "- One fact per entry, self-contained: it must make sense without the "
+    "transcript.\n"
+    "- The conversation may be in Russian, English or mixed (Русский, English "
+    "или смешанный). Copy names, codes, paths and numbers exactly in their "
+    "original script; do not translate them.\n"
+    "- Output only headings and entries. Do not address the user."
 )
-"""Verbatim-preservation, MULTILINGUAL, SECTION-STRUCTURED summary system prompt
-(RU+EN). Fixed-order headings (CONSTRAINTS & DECISIONS / KEY FACTS & IDENTIFIERS
-BEFORE ARTIFACTS) so verbose file/essay content can never crowd out the
-hard-to-recover prose constraints, and an explicit "shorten ARTIFACTS first,
-never drop a constraint/identifier" rule for the plain (schema-less) path used by
-deepseek-style providers. This prompt is the SOLE semantic-extraction mechanism
-(no regex/text-mining anywhere); the artifact registry already holds file
-contents verbatim, so the summary keeps file entries terse on purpose."""
+"""The system prompt of a delta fold. The headings it names are
+:data:`SUMMARY_SECTIONS`; a test pins the two together."""
+
+END_OF_SUMMARY_MARKER: Final[str] = (
+    "--- END OF SUMMARY — the turns that follow continue the conversation "
+    "verbatim; it is reference for what came before them ---"
+)
+"""Closes the summary block in a seed, so a model reads the summary as
+reference data and not as a turn to continue."""
 
 
 # ---------------------------------------------------------------------------
-# Persistent artifacts
+# The running summary
 # ---------------------------------------------------------------------------
 
 
-@dataclass(slots=True)
-class ArtifactLedger:
-    """Structured file registry built ONLY from parsed tool-call arguments.
+def _clip(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - len(_ELLIPSIS))].rstrip() + _ELLIPSIS
 
-    ``files`` is an ORDERED ``path`` list (first-seen order, de-duplicated);
-    ``content`` maps ``path`` -> the last verbatim content snapshot the agent
-    wrote (capped). No text scanning, no regex — pure structured field reads.
+
+def _entry_key(entry: str) -> str:
+    """What makes two entries the same entry: case and spacing aside."""
+    return " ".join(entry.split()).casefold()
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSummary:
+    """The running summary: entries per section, and how many each section shed.
+
+    Immutable; every operation returns a new value. ``entries`` holds only the
+    sections that have entries, in no particular order (rendering imposes the
+    fixed one).
     """
 
-    files: list[str] = field(default_factory=list)
-    content: dict[str, str] = field(default_factory=dict)
+    entries: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    shed: Mapping[str, int] = field(default_factory=dict)
+    """Entries a section no longer carries because of the cap."""
 
     def is_empty(self) -> bool:
-        return not self.files
+        return not any(self.entries.values())
 
-    def to_dict(self) -> dict[str, Any]:
-        return {"files": list(self.files), "content": dict(self.content)}
+    def section(self, heading: str) -> tuple[str, ...]:
+        return tuple(self.entries.get(heading, ()))
+
+    def render(self) -> str:
+        """The summary as the seed shows it and the summariser is shown it.
+
+        Deterministic: the same summary renders to the same bytes, which is
+        what keeps the seed's prefix stable between folds.
+        """
+        lines: list[str] = []
+        for section in SUMMARY_SECTIONS:
+            items = self.entries.get(section.heading, ())
+            shed = self.shed.get(section.heading, 0)
+            if not items and not shed:
+                continue
+            lines.append(f"{section.heading}:")
+            lines.extend(f"- {item}" for item in items)
+            if shed:
+                lines.append(f"  ({shed} {_SHED_NOTE})")
+        return "\n".join(lines)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> ArtifactLedger:
-        if not data:
-            return cls()
-        content = data.get("content") or {}
+    def from_text(cls, text: str) -> SessionSummary:
+        """The summary :meth:`render` wrote, read back exactly — shed counts included.
+
+        For a host that stores the summary as text. Lines under no known
+        heading are ignored; :class:`SummaryDeltaError` when the text has
+        content and none of the headings.
+        """
+        parsed = _parse_sections(text)
         return cls(
-            files=[str(x) for x in (data.get("files") or [])],
-            content={str(k): str(v) for k, v in content.items()} if isinstance(content, dict) else {},
-        )
-
-
-@dataclass(slots=True)
-class SessionMemory:
-    """The durable, per-session structured memory carried across runs.
-
-    ``running_summary`` is the iterative LLM fold; ``ledger`` is the structured
-    file registry. ``turn_index`` counts how many runs have been folded in
-    (0 = a fresh/empty memory → SEED is a no-op, preserving the single-run path).
-
-    ``cumulative_raw_tokens`` is the running total of every folded run's RAW
-    message tokens (NOT the compressed summary size). It is the ACTUAL size of
-    the session history that :func:`build_seed` must carry, and is the input the
-    lazy-fold gate (:func:`running_summary_needed`) needs: the LLM summary may be
-    skipped ONLY while the whole raw session still fits in the seed's head+tail
-    (so the summary would never be read). Using the compressed summary's size as
-    a proxy under-summarises — a ~900-token summary stays below the threshold
-    forever while the raw history grows past the tail and is silently clipped
-    Persisted in the existing memory JSON (NO new
-    migration); ``0`` for legacy rows written before this field existed (they
-    then fold conservatively until they exceed the threshold once, which is
-    SAFE — it errs toward summarising, never toward loss).
-
-    ``stale_fold_count`` counts consecutive folds that ATTEMPTED to update the
-    summary and did not move it. A refused reply and a reply that reproduces the
-    stored summary byte for byte are the same outcome from the session's point
-    of view, and both REPEAT: the next fold is handed the same previous summary
-    and the same kind of source, so it produces the same reply and fails the
-    same way. Nothing else in the system distinguishes that from a healthy
-    session — the run succeeds, the ledger advances, ``turn_index`` advances —
-    which is why the count is carried here rather than inferred. ``0`` means the
-    last attempt advanced the summary. Deliberate skips (the lazy-fold gate,
-    load shedding) are not attempts and must leave this untouched, so the
-    adapter that knows which kind of fold ran owns the increment. Persisted in
-    the existing memory JSON (NO new migration); ``0`` for rows written before
-    this field existed.
-    """
-
-    running_summary: str = ""
-    ledger: ArtifactLedger = field(default_factory=ArtifactLedger)
-    turn_index: int = 0
-    cumulative_raw_tokens: int = 0
-    stale_fold_count: int = 0
-
-    def is_empty(self) -> bool:
-        return (
-            self.turn_index == 0
-            and not self.running_summary
-            and self.ledger.is_empty()
-            and self.cumulative_raw_tokens == 0
+            entries={k: tuple(v) for k, v in parsed.entries.items() if v},
+            shed={k: v for k, v in parsed.shed.items() if v},
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "running_summary": self.running_summary,
-            "ledger": self.ledger.to_dict(),
-            "turn_index": self.turn_index,
-            "cumulative_raw_tokens": self.cumulative_raw_tokens,
-            "stale_fold_count": self.stale_fold_count,
+            "entries": {k: list(v) for k, v in self.entries.items() if v},
+            "shed": {k: int(v) for k, v in self.shed.items() if v},
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> SessionMemory:
+    def from_dict(cls, data: Mapping[str, Any] | None) -> SessionSummary:
         if not data:
             return cls()
-        return cls(
-            running_summary=str(data.get("running_summary") or ""),
-            ledger=ArtifactLedger.from_dict(data.get("ledger")),
-            turn_index=int(data.get("turn_index") or 0),
-            cumulative_raw_tokens=int(data.get("cumulative_raw_tokens") or 0),
-            stale_fold_count=int(data.get("stale_fold_count") or 0),
+        raw_entries = data.get("entries") or {}
+        raw_shed = data.get("shed") or {}
+        entries = {
+            str(k): tuple(str(x) for x in v)
+            for k, v in raw_entries.items()
+            if str(k) in _SECTION_BY_HEADING and isinstance(v, list | tuple) and v
+        }
+        shed = {
+            str(k): int(v)
+            for k, v in raw_shed.items()
+            if str(k) in _SECTION_BY_HEADING and isinstance(v, int) and v > 0
+        }
+        return cls(entries=entries, shed=shed)
+
+
+class SummaryDeltaError(ValueError):
+    """A summariser reply that is not a delta: text with none of the headings."""
+
+
+@dataclass(frozen=True, slots=True)
+class SummaryDelta:
+    """A fold's reply, parsed: new entries per section."""
+
+    entries: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    unattributed_lines: int = 0
+    """Non-empty lines outside any known heading (dropped; worth logging)."""
+
+    def is_empty(self) -> bool:
+        return not any(self.entries.values())
+
+
+def _heading_of(line: str) -> tuple[str, str] | None:
+    """``(heading, rest of the line)`` when ``line`` opens a section, else ``None``.
+
+    Presentation a model varies freely is folded away first: markdown marks,
+    bullets, an ordinal, case, ``and`` for ``&``, spacing around ``/`` and a
+    trailing colon. Text after the colon on the same line is the section's
+    first entry.
+    """
+    text = line.strip().lstrip(_HEADING_DECORATION)
+    digits = len(text) - len(text.lstrip("0123456789"))
+    if digits and text[digits : digits + 1] in {".", ")"}:
+        text = text[digits + 1 :]
+    head, sep, rest = text.partition(":")
+    label = head
+    for mark in "*_`":
+        label = label.replace(mark, "")
+    label = " ".join(label.upper().replace(" AND ", " & ").replace("/", " / ").split())
+    if label in _SECTION_BY_HEADING:
+        return label, rest.strip().strip("*_` ") if sep else ""
+    return None
+
+
+def _entry_of(line: str) -> str:
+    text = line.strip()
+    for bullet in _ENTRY_BULLETS:
+        if text.startswith(bullet):
+            text = text[len(bullet) :].strip()
+            break
+    else:
+        digits = len(text) - len(text.lstrip("0123456789"))
+        if digits and text[digits : digits + 2] in {". ", ") "}:
+            text = text[digits + 2 :].strip()
+    if not any(ch.isalnum() for ch in text):
+        return ""
+    return _clip(text, _ENTRY_MAX_CHARS)
+
+
+def _shed_count(line: str) -> int | None:
+    """N when ``line`` is the shed note :meth:`SessionSummary.render` writes."""
+    text = line.strip()
+    if not (text.startswith("(") and text.endswith(f" {_SHED_NOTE})")):
+        return None
+    number = text[1 : -len(f" {_SHED_NOTE})")]
+    return int(number) if number.isdigit() else None
+
+
+@dataclass(slots=True)
+class _Parsed:
+    entries: dict[str, list[str]] = field(default_factory=dict)
+    shed: dict[str, int] = field(default_factory=dict)
+    order: list[tuple[str, int]] = field(default_factory=list)
+    unattributed: int = 0
+
+
+def _parse_sections(text: str) -> _Parsed:
+    parsed = _Parsed()
+    current: str | None = None
+    seen_heading = False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        heading = _heading_of(line)
+        if heading is not None:
+            seen_heading = True
+            current, rest = heading
+            parsed.entries.setdefault(current, [])
+            line = rest
+            if not line:
+                continue
+        elif current is None:
+            parsed.unattributed += 1
+            continue
+        shed = _shed_count(line)
+        if shed is not None:
+            parsed.shed[current] = parsed.shed.get(current, 0) + shed
+            continue
+        entry = _entry_of(line)
+        if entry:
+            parsed.entries[current].append(entry)
+            parsed.order.append((current, len(parsed.entries[current]) - 1))
+    if not seen_heading and text.strip():
+        raise SummaryDeltaError("the reply names none of the summary sections")
+    return parsed
+
+
+def parse_summary_delta(text: str, *, truncated: bool = False) -> SummaryDelta:
+    """Parse a delta fold's reply into new entries per section — PURE.
+
+    Each non-empty line under a known heading is one entry; a line with no
+    letter or digit is not an entry. Headings may come in any order and more
+    than once. An empty reply is an empty delta (the turns added nothing).
+
+    ``truncated`` says the reply was cut at the output bound: its last entry
+    is probably cut mid-sentence and is dropped, the rest stands.
+
+    Raises :class:`SummaryDeltaError` when the reply has text but none of the
+    headings — not a delta at all, and storing nothing from it is the right
+    answer; the host keeps the turns uncovered and folds them again.
+    """
+    parsed = _parse_sections(text)
+    if truncated and parsed.order:
+        last_heading, last_index = parsed.order[-1]
+        del parsed.entries[last_heading][last_index]
+    return SummaryDelta(
+        entries={k: tuple(v) for k, v in parsed.entries.items() if v},
+        unattributed_lines=parsed.unattributed,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class MergeReport:
+    """What one merge did to the summary."""
+
+    added: int = 0
+    duplicates: int = 0
+    replaced_sections: tuple[str, ...] = ()
+    shed: int = 0
+    clipped: int = 0
+
+
+def _over_cap(summary: SessionSummary, cap: int, rc: LoopConstants) -> bool:
+    return cap > 0 and estimate_tokens(summary.render(), rc) > cap
+
+
+def _shed_one(entries: dict[str, list[str]], shed: dict[str, int]) -> bool:
+    """Remove the oldest entry of the first section in shed order; False if none can go."""
+    for section in sorted(SUMMARY_SECTIONS, key=lambda s: s.shed_rank):
+        items = entries.get(section.heading, [])
+        floor = 1 if section.keep_first else 0
+        if len(items) > floor:
+            del items[floor]
+            shed[section.heading] = shed.get(section.heading, 0) + 1
+            return True
+    for section in sorted(SUMMARY_SECTIONS, key=lambda s: s.shed_rank):
+        items = entries.get(section.heading, [])
+        if items:
+            del items[0]
+            shed[section.heading] = shed.get(section.heading, 0) + 1
+            return True
+    return False
+
+
+def cap_summary(summary: SessionSummary, rc: LoopConstants) -> tuple[SessionSummary, int, int]:
+    """Bring ``summary`` under ``session_memory_running_summary_token_cap`` — PURE.
+
+    Whole entries go first, oldest first, in shed order. Only when the summary
+    is down to a single entry and still over the cap is that entry clipped,
+    by halves, to no less than a short floor — a cap set below one short entry
+    leaves the summary as close to it as that allows.
+    Returns the summary, the number of entries shed and of entries clipped.
+    """
+    cap = rc.session_memory_running_summary_token_cap
+    if not _over_cap(summary, cap, rc):
+        return summary, 0, 0
+    entries = {k: list(v) for k, v in summary.entries.items()}
+    shed = dict(summary.shed)
+    count = 0
+    clipped = 0
+
+    def current() -> SessionSummary:
+        return SessionSummary(
+            entries={k: tuple(v) for k, v in entries.items() if v}, shed=dict(shed)
         )
+
+    while _over_cap(current(), cap, rc) and sum(len(v) for v in entries.values()) > 1:
+        if not _shed_one(entries, shed):
+            break  # pragma: no cover - guarded by the entry count above
+        count += 1
+    while _over_cap(current(), cap, rc):
+        remaining = [(k, v) for k, v in entries.items() if v]
+        if not remaining:
+            break
+        heading, items = remaining[0]
+        limit = max(_ENTRY_MIN_CLIP_CHARS, len(items[0]) // 2)
+        if len(items[0]) <= _ENTRY_MIN_CLIP_CHARS:
+            break
+        items[0] = _clip(items[0], limit)
+        entries[heading] = items
+        clipped = 1
+    return current(), count, clipped
+
+
+def merge_summary_delta(
+    summary: SessionSummary,
+    delta: SummaryDelta,
+    rc: LoopConstants,
+) -> tuple[SessionSummary, MergeReport]:
+    """Append ``delta`` to ``summary`` and hold the result to the cap — PURE.
+
+    Append sections skip an entry already present (case and spacing aside);
+    replace sections take the delta's entries whole when it has any. Then
+    :func:`cap_summary`.
+    """
+    entries = {k: list(v) for k, v in summary.entries.items()}
+    added = 0
+    duplicates = 0
+    replaced: list[str] = []
+    for section in SUMMARY_SECTIONS:
+        new = list(delta.entries.get(section.heading, ()))
+        if not new:
+            continue
+        if section.merge is SectionMerge.supersede:
+            entries[section.heading] = []
+            replaced.append(section.heading)
+        items = entries.setdefault(section.heading, [])
+        keys = {_entry_key(item) for item in items}
+        for entry in new:
+            key = _entry_key(entry)
+            if key in keys:
+                duplicates += 1
+                continue
+            keys.add(key)
+            items.append(entry)
+            added += 1
+    shed = dict(summary.shed)
+    for heading in replaced:
+        shed.pop(heading, None)
+    merged = SessionSummary(entries={k: tuple(v) for k, v in entries.items() if v}, shed=shed)
+    capped, shed_count, clipped = cap_summary(merged, rc)
+    return capped, MergeReport(
+        added=added,
+        duplicates=duplicates,
+        replaced_sections=tuple(replaced),
+        shed=shed_count,
+        clipped=clipped,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Message token-counting + serialisation helpers (pure; no text matching)
+# The summariser's input
 # ---------------------------------------------------------------------------
 
 
 def _serialize_message(message: Message) -> str:
-    """Render a message as ``[ROLE] text [calls Tool(args)] [tool result …]`` for
-    summary INPUT, so the model treats it as source material, not a chat to
-    continue. Tool results / args are length-capped (slicing, not matching)."""
+    """Render a message as ``[ROLE] text [calls Tool(args)] [tool result …]``.
+
+    Summary INPUT, so the model treats it as material, not as a chat to
+    continue. Tool arguments and results are length-capped by slicing.
+    """
     role = message.role.value.upper()
     pieces: list[str] = []
     for block in message.content_blocks:
@@ -333,52 +556,96 @@ def _serialize_turns(messages: Sequence[Message]) -> str:
     return "\n".join(_serialize_message(m) for m in messages)
 
 
-def build_summary_user_message(
-    prev_summary: str,
-    run_messages: Sequence[Message],
+def build_summary_delta_message(
+    summary: SessionSummary,
+    turn_messages: Sequence[Message],
 ) -> str | None:
-    """Build the running-summary fold USER message (the summary prompt body) — PURE.
+    """The user message of a delta fold, to send under :data:`SUMMARY_DELTA_SYSTEM` — PURE.
 
-    Returns the ``PREVIOUS SUMMARY``-prefixed (when present) + ``SOURCE
-    MATERIAL`` string that the host feeds to :data:`SUMMARY_SYSTEM` for ONE
-    running-summary fold ``Mᵢ = LLM(Sᵢ, Mᵢ₋₁)``: the prior summary is the
-    PREVIOUS SUMMARY and ``run_messages`` is the SOURCE to fold into it.
-
-    ``run_messages`` is the new session turns to summarise. In the steady state
-    that is THIS run's local turns only (delta-only fold). On the ONE-TIME
-    catch-up first fold of a long session (the host crosses the lazy-fold
-    threshold while the running summary is still empty), the host passes the
-    WHOLE un-summarised prior history + this run as ``run_messages`` so the early
-    (lazy-skipped) turns are summarised before they leave the raw tail — so this
-    parameter is NOT always "this run only". The label is kept accurate for both
-    cases ("session transcript to fold in").
-
-    Returns ``None`` when the source serialises to nothing (empty transcript) —
-    the caller then skips the LLM call and keeps the prior summary. Core owns this
-    prompt assembly + serialisation so the host (which makes the async LLM
-    call) produces byte-identical input regardless of where the call lives — the
-    LLM running summary stays the SOLE semantic mechanism (no text-mining).
+    ``turn_messages`` are the turns leaving the raw window, oldest first — the
+    messages of :attr:`~protocore.runtime.context.session_seed.FoldPlan.turns`,
+    flattened. ``None`` when they render to nothing: there is no call to make.
     """
-    serialized = _serialize_turns(run_messages).strip()
+    serialized = _serialize_turns(turn_messages).strip()
     if not serialized:
         return None
+    existing = summary.render() or "(empty)"
     return (
-        (f"PREVIOUS SUMMARY:\n{prev_summary}\n\n" if prev_summary else "")
-        + "SOURCE MATERIAL (session transcript to fold in):\n"
-        + serialized
+        f"EXISTING SUMMARY (already recorded — do not repeat):\n{existing}\n\n"
+        f"NEW TURNS (leaving the agent's context now):\n{serialized}"
     )
 
 
+def build_summary_delta_request(
+    summary: SessionSummary,
+    turn_messages: Sequence[Message],
+    rc: LoopConstants,
+    *,
+    model: str,
+    temperature: float | None = None,
+) -> LLMRequest | None:
+    """The whole delta-fold request, ready for a provider's ``complete_text`` — PURE.
+
+    System prompt :data:`SUMMARY_DELTA_SYSTEM`, the user message of
+    :func:`build_summary_delta_message`, no tools, and an output bound of
+    ``session_memory_fold_max_output_tokens``: a delta is a few hundred
+    tokens, and a reply longer than what the summary can store would be paid
+    for and then shed. ``None`` when there is nothing to fold.
+    """
+    user = build_summary_delta_message(summary, turn_messages)
+    if user is None:
+        return None
+    return LLMRequest(
+        model=model,
+        messages=[
+            Message(role=MessageRole.system, content_blocks=[TextBlock(text=SUMMARY_DELTA_SYSTEM)]),
+            Message(role=MessageRole.user, content_blocks=[TextBlock(text=user)]),
+        ],
+        tools=[],
+        max_tokens=rc.session_memory_fold_max_output_tokens,
+        temperature=temperature,
+    )
+
+
+def fold_source_tokens(turn_messages: Sequence[Message], rc: LoopConstants) -> int:
+    """Estimated tokens of the turns as the summariser is shown them."""
+    return estimate_tokens(_serialize_turns(turn_messages), rc)
+
+
 # ---------------------------------------------------------------------------
-# Artifact registry — STRUCTURED tool-call field reads ONLY (no regex/text scan)
+# Artifact registry — structured tool-call field reads only
 # ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class ArtifactLedger:
+    """Files written in the session, read from tool-call arguments by role.
+
+    ``files`` is an ordered, de-duplicated ``path`` list (first-seen order);
+    ``content`` maps ``path`` -> the last verbatim content snapshot (capped).
+    """
+
+    files: list[str] = field(default_factory=list)
+    content: dict[str, str] = field(default_factory=dict)
+
+    def is_empty(self) -> bool:
+        return not self.files
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"files": list(self.files), "content": dict(self.content)}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> ArtifactLedger:
+        if not data:
+            return cls()
+        content = data.get("content") or {}
+        return cls(
+            files=[str(x) for x in (data.get("files") or [])],
+            content={str(k): str(v) for k, v in content.items()} if isinstance(content, dict) else {},
+        )
 
 
 def _parse_args(block: ToolUseBlock) -> dict[str, Any]:
-    """Parse the tool-call ``arguments`` JSON into a dict (structured field data).
-
-    JSON parsing is structured decoding, not text matching. A malformed payload
-    yields an empty dict (the call contributes nothing to the registry)."""
     try:
         parsed = json.loads(block.arguments_json)
     except (json.JSONDecodeError, TypeError):
@@ -387,14 +654,7 @@ def _parse_args(block: ToolUseBlock) -> dict[str, Any]:
 
 
 def _is_file_write_tool(name: str, roles: ToolRoleMap) -> bool:
-    """Identify a tool whose call records a written or edited artifact.
-
-    By ROLE, from the host's own registration — not by recognising a spelling.
-    The set of near-spellings this used to normalise against ("writefile",
-    "multiedit", and so on) was a guess at what somebody's tool might be
-    called; it matched an unrelated tool as readily as it missed a renamed
-    one.
-    """
+    """A tool whose call records a written or edited file — by its registered role."""
     return bool(roles.roles_of(name) & WORKSPACE_MUTATION_ROLES)
 
 
@@ -404,27 +664,20 @@ def extract_artifacts(
     base: ArtifactLedger | None = None,
     roles: ToolRoleMap = EMPTY_TOOL_ROLE_MAP,
 ) -> ArtifactLedger:
-    """Build the file registry from a run's messages, folding into ``base``.
+    """The file registry of ``messages``, folded into ``base``.
 
-    Reads ONLY structured tool-call fields by named key (the ``path`` argument of
-    a file-writing tool call names the file; the ``content`` argument is the
-    verbatim snapshot). Language-agnostic + heuristic-free: a path is a path in
-    any language, and we never scan message text for filenames/headings/symbols.
-
-    Order-preserving + de-duplicated; ``content`` keeps the LAST snapshot per
-    path (the agent's latest write wins), capped to ``_CONTENT_SNAPSHOT_MAX_CHARS``.
+    Reads the ``path`` and ``content`` argument slots of workspace-mutating
+    tool calls. Order-preserving and de-duplicated; the latest write of a path
+    wins its snapshot.
     """
     ledger = ArtifactLedger(
         files=list(base.files) if base else [],
         content=dict(base.content) if base else {},
     )
     seen = set(ledger.files)
-
     for message in messages:
         for block in message.content_blocks:
-            if not isinstance(block, ToolUseBlock):
-                continue
-            if not _is_file_write_tool(block.name, roles):
+            if not isinstance(block, ToolUseBlock) or not _is_file_write_tool(block.name, roles):
                 continue
             args = _parse_args(block)
             path_value = string_argument(args, ToolArgumentSlot.path, roles=roles) or ""
@@ -434,17 +687,14 @@ def extract_artifacts(
                 seen.add(path_value)
                 ledger.files.append(path_value)
             if path_value in seen:
-                content_value = string_argument(
-                    args, ToolArgumentSlot.content, roles=roles
-                )
+                content_value = string_argument(args, ToolArgumentSlot.content, roles=roles)
                 if content_value:
                     ledger.content[path_value] = content_value[:_CONTENT_SNAPSHOT_MAX_CHARS]
-
     return ledger
 
 
 def render_ledger(ledger: ArtifactLedger) -> str:
-    """Render the file registry verbatim as a compact, high-salience block."""
+    """The file registry as one compact block; empty when there are no files."""
     if ledger.is_empty():
         return ""
     lines = ["ARTIFACT REGISTRY — files created/edited this session (verbatim, authoritative):"]
@@ -458,383 +708,123 @@ def render_ledger(ledger: ArtifactLedger) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Running summary fold (UPDATE step): Mᵢ = LLM(Sᵢ, Mᵢ₋₁) — delta-only
+# The durable memory and the post-run update
 # ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
-class FoldResult:
-    """Outcome of a pure :func:`fold_run` (assembly only).
+class SessionMemory:
+    """The durable, per-session memory carried across runs.
 
-    ``summary_updated`` is True when ``new_summary_text`` replaced the prior
-    running summary; False when the prior summary was kept (no new text /
-    the host LLM call was skipped, timed out, or failed — the host logs the
-    reason). The artifact ledger always updates and ``turn_index`` always
-    advances regardless.
+    ``turn_index`` counts the runs recorded (0 = a fresh memory). Which turns
+    the summary covers is the host's record — a position in its own store —
+    and reaches the seed builder as a predicate; it is not kept here.
+
+    ``stale_fold_count`` counts consecutive folds that tried to add to the
+    summary and could not (a refused reply). The host, which knows which kind
+    of fold ran, owns the increment; :func:`fold_run` carries it through.
     """
+
+    summary: SessionSummary = field(default_factory=SessionSummary)
+    ledger: ArtifactLedger = field(default_factory=ArtifactLedger)
+    turn_index: int = 0
+    stale_fold_count: int = 0
+
+    def is_empty(self) -> bool:
+        return self.turn_index == 0 and self.summary.is_empty() and self.ledger.is_empty()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "summary": self.summary.to_dict(),
+            "ledger": self.ledger.to_dict(),
+            "turn_index": self.turn_index,
+            "stale_fold_count": self.stale_fold_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> SessionMemory:
+        if not data:
+            return cls()
+        return cls(
+            summary=SessionSummary.from_dict(data.get("summary")),
+            ledger=ArtifactLedger.from_dict(data.get("ledger")),
+            turn_index=int(data.get("turn_index") or 0),
+            stale_fold_count=int(data.get("stale_fold_count") or 0),
+        )
+
+
+@dataclass(slots=True)
+class FoldResult:
+    """Outcome of :func:`fold_run`."""
 
     memory: SessionMemory
     summary_updated: bool = False
+    """The delta added, replaced or shed something."""
+    report: MergeReport = field(default_factory=MergeReport)
     notes: dict[str, Any] = field(default_factory=dict)
-
-
-def _cap_running_summary(summary: str, rc: LoopConstants) -> str:
-    """Drift control: truncate the carried summary if it grew past the RC cap.
-
-    The NEXT fold is still delta-only (summary passed as PREVIOUS SUMMARY) — we
-    NEVER recompute from raw, which would reintroduce O(K²) cost + non-monotonic
-    fidelity. We only cap the carried artifact so it cannot itself overflow.
-    """
-    cap = rc.session_memory_running_summary_token_cap
-    if cap <= 0:
-        return summary
-    if estimate_tokens(summary, rc) <= cap:
-        return summary
-    # Truncate by characters proportionally to the token overshoot, preserving
-    # the head (where the structured original-ask/decisions live).
-    current = max(estimate_tokens(summary, rc), 1)
-    keep_chars = max(1, int(len(summary) * cap / current))
-    return summary[:keep_chars].rstrip()
 
 
 def fold_run(
     memory: SessionMemory,
     run_messages: Sequence[Message],
-    new_summary_text: str | None,
+    delta: SummaryDelta | None,
     rc: LoopConstants,
     roles: ToolRoleMap = EMPTY_TOOL_ROLE_MAP,
 ) -> FoldResult:
-    """Fold ONE finished run's messages into ``memory`` (the UPDATE step) — PURE.
+    """Record one finished run in ``memory`` — PURE; the input is not mutated.
 
-    Pure assembly: core does NOT call a model client. The host computes the
-    delta running summary by awaiting its async LLM provider DIRECTLY on the
-    event loop (under ``asyncio.wait_for``) — so a timeout cancels the awaitable
-    cleanly and the provider releases its inflight slot via its normal async
-    cancellation / ``finally`` path, with NO worker thread and NO leaked slot. The ALREADY-COMPUTED summary text (or ``None`` when the LLM
-    call was skipped / timed out / failed / produced nothing) is passed in here.
-
-    Core then:
-
-    * updates the structured artifact ledger (free, deterministic — no LLM);
-    * sets ``running_summary = new_summary_text or prior`` (the prior summary is
-      KEPT when ``new_summary_text`` is ``None``/blank — never crash the run /
-      no drift), applying the RC drift cap;
-    * accumulates THIS run's RAW message tokens into ``cumulative_raw_tokens``
-      (the actual session size the lazy-fold gate reads — NOT the compressed
-      summary size, which would under-summarise);
-    * advances ``turn_index`` so a SEED stays valid.
-
-    Returns a NEW :class:`SessionMemory` (the input is not mutated).
+    * The artifact registry takes the run's file writes (always; no model).
+    * ``delta`` — the parsed reply of a fold the planner asked for, or
+      ``None`` when no fold ran (the usual case) or it failed — is appended to
+      the summary and the result held to its cap.
+    * ``turn_index`` advances.
     """
-    new_ledger = extract_artifacts(run_messages, base=memory.ledger, roles=roles)
-
-    running = memory.running_summary
-    summary_updated = False
-    candidate = (new_summary_text or "").strip()
-    if candidate:
-        running = _cap_running_summary(candidate, rc)
-        summary_updated = True
-    # else: no new summary (skipped/timed-out/failed/empty) — keep the prior
-    # summary intact (no drift; the registry update + turn advance still land).
-
-    run_tokens = estimate_history_tokens(run_messages, rc)
+    ledger = extract_artifacts(run_messages, base=memory.ledger, roles=roles)
+    summary = memory.summary
+    report = MergeReport()
+    if delta is not None:
+        summary, report = merge_summary_delta(summary, delta, rc)
+    updated = summary != memory.summary
     new_memory = SessionMemory(
-        running_summary=running,
-        ledger=new_ledger,
+        summary=summary,
+        ledger=ledger,
         turn_index=memory.turn_index + 1,
-        cumulative_raw_tokens=memory.cumulative_raw_tokens + run_tokens,
+        stale_fold_count=memory.stale_fold_count,
     )
     return FoldResult(
         memory=new_memory,
-        summary_updated=summary_updated,
+        summary_updated=updated,
+        report=report,
         notes={
             "folded_messages": len(run_messages),
-            "ledger_files": len(new_ledger.files),
-            "running_summary_tokens": estimate_tokens(running, rc),
-            "cumulative_raw_tokens": new_memory.cumulative_raw_tokens,
+            "ledger_files": len(ledger.files),
+            "summary_tokens": estimate_tokens(summary.render(), rc),
+            "entries_added": report.added,
+            "entries_shed": report.shed,
         },
     )
 
 
-# ---------------------------------------------------------------------------
-# Lazy fold: only summarise once the session outgrows the raw tail
-# ---------------------------------------------------------------------------
-
-
-def summary_fold_threshold_tokens(seed_budget: int, rc: LoopConstants) -> int:
-    """Token threshold above which a session needs the LLM running summary.
-
-    Below this, the whole prior history still fits in :func:`build_seed`'s raw
-    tail (``seed_budget * session_memory_tail_budget_fraction``), so the running
-    summary would never be used — the fold can skip the LLM call entirely.
-
-    When ``session_memory_fold_min_tokens > 0`` it is used verbatim (operator
-    override); otherwise the threshold is DERIVED from the same tail budget
-    ``build_seed`` will hand the next run, so the lazy gate and the seed assembly
-    agree by construction. Pure: no I/O, no provider.
-    """
-    explicit = rc.session_memory_fold_min_tokens
-    if explicit > 0:
-        return explicit
-    return int(max(0, seed_budget) * rc.session_memory_tail_budget_fraction)
-
-
-def running_summary_needed(
-    cumulative_session_tokens: int,
-    seed_budget: int,
-    rc: LoopConstants,
-) -> bool:
-    """Whether the running-summary LLM fold is needed for this session.
-
-    ``cumulative_session_tokens`` MUST be the ACTUAL cumulative RAW token size of
-    the whole session AFTER this run is folded in (i.e.
-    ``SessionMemory.cumulative_raw_tokens + this_run_tokens``) — NOT a proxy
-    derived from the compressed running summary. A compressed ~900-token summary
-    can represent 15K+ tokens of source: using it as the proxy keeps short
-    subsequent runs below the threshold forever, so the fold is skipped while the
-    RAW history grows past :func:`build_seed`'s tail and is silently clipped —
-    runs 2..N content is then permanently lost.
-
-    When the raw cumulative does not exceed :func:`summary_fold_threshold_tokens`
-    (the tail budget :func:`build_seed` will carry), the verbatim raw tail still
-    covers the entire history, so the summary is dead weight — the host skips
-    the LLM call (ledger-only, ZERO LLM cost). Once it exceeds the threshold the
-    fold ALWAYS runs, so nothing is evicted unsummarised. Pure: no I/O.
-    """
-    return cumulative_session_tokens > summary_fold_threshold_tokens(seed_budget, rc)
-
-
-def bound_catchup_source(
-    messages: Sequence[Message],
-    budget_tokens: int,
-    rc: LoopConstants,
-) -> list[Message]:
-    """Bound the ONE-TIME catch-up fold's SOURCE MATERIAL to a token budget — PURE.
-
- The catch-up first fold (the host ``_maybe_update_session_memory``)
- summarises the WHOLE un-summarised prior history + this run so early
- lazy-skipped facts are preserved before they leave the raw tail. At the
- default-threshold crossover the source is bounded in practice (cumulative ≈
- the seed tail budget), but if an operator sets a HIGH
- ``session_memory_fold_min_tokens`` the crossover can fire when the prior
- history is large — an unbounded source could produce a very large
- summary-input string and a slow / truncated summary LLM call .
-
- This caps the source to ``budget_tokens`` by keeping BOTH ends and dropping
- only the MIDDLE (anti lost-in-the-middle): the OLDEST head turns (most likely
- to hold unstated early constraints/identifiers that exist nowhere else) AND
- the most-RECENT turns (this run's delta — the freshest content). When the
- middle is dropped a single explicit gap marker is inserted so the model knows
- the transcript is not contiguous; the registry + raw tail still cover the
- in-between turns elsewhere. Half the budget is reserved for each end; if the
- head alone already fits within the full budget the whole list is returned
- unchanged.
-
- ``budget_tokens <= 0`` means "no bound" → the input is returned unchanged
- (fail-open: a misconfigured zero budget never silently discards history).
- Pure: tokenizer only, no I/O, no provider, no text matching.
- """
-    msgs = list(messages)
-    if budget_tokens <= 0:
-        return msgs
-    if estimate_history_tokens(msgs, rc) <= budget_tokens:
-        return msgs
-
-    half = max(1, budget_tokens // 2)
-    # Oldest head turns, growing forward until half the budget is used.
-    head: list[Message] = []
-    used = 0
-    for message in msgs:
-        t = estimate_message_tokens(message, rc)
-        if used + t > half and head:
-            break
-        head.append(message)
-        used += t
-    # Most-recent turns, growing backward until the REMAINING budget is used.
-    remaining = max(0, budget_tokens - used)
-    tail = _tail_by_budget(msgs[len(head):], remaining, rc)
-
-    if not tail:
-        return head
-    gap = Message(
-        role=MessageRole.user,
-        content_blocks=[
-            TextBlock(
-                text=(
-                    "[… earlier middle turns omitted from this summary source to "
-                    "fit the catch-up budget; their files are in the artifact "
-                    "registry and recent turns are in the raw tail …]"
-                )
-            )
-        ],
-    )
-    return [*head, gap, *tail]
-
-
-# ---------------------------------------------------------------------------
-# Seed assembly (SEED step): head + summary + ledger + recent raw tail
-# ---------------------------------------------------------------------------
-
-
-def _tail_by_budget(
-    messages: Sequence[Message],
-    budget_tokens: int,
-    rc: LoopConstants,
-) -> list[Message]:
-    """Keep the newest messages until ``budget_tokens`` is reached, then repair
-    the tool-pair boundary so the tail never opens on an orphan tool-result
-    (which would 400 the provider). Token budgeting + a role check on the
-    boundary message — no content text matching."""
-    tail: list[Message] = []
-    used = 0
-    for message in reversed(messages):
-        t = estimate_message_tokens(message, rc)
-        if used + t > budget_tokens and tail:
-            break
-        tail.append(message)
-        used += t
-    tail.reverse()
-    # Don't open the tail on an orphan tool-role result.
-    while tail and tail[0].role is MessageRole.tool:
-        tail.pop(0)
-    return tail
-
-
-def _tag_seeded(message: Message) -> Message:
-    """Tag a message as a seeded prior-run turn (so finalization + compaction
-    treat it as a seed: excluded from re-persistence, protected from Tier-2
-    collapse, skipped by the first-user-turn guard)."""
-    return message.model_copy(
-        update={"metadata": {**message.metadata, SESSION_HISTORY_SEED_METADATA_KEY: True}}
-    )
-
-
-def _tag_seeded_reference(message: Message) -> Message:
-    """Dual-tag a synthetic seed block as BOTH a seeded prior-run turn AND a
-    runtime reference block.
-
-    The running-summary + artifact-ledger blocks are large ``role=user``
-    ``TextBlock`` messages synthesised by :func:`build_seed`; they are NOT the
-    user's original task. With ONLY the seed tag they were permanently immovable
-    once seeded into a live run — Tier-1 sheds only ``role=tool`` results or
-    :data:`COMPACTION_REFERENCE_METADATA_KEY`-tagged blocks, and Tier-2 skips
-    seed-tagged turns, so on a file-heavy session these blocks consumed window
- budget with no shed path (the D3 emergency-cliff edge).
-
- Carrying BOTH keys:
-
- * :data:`SESSION_HISTORY_SEED_METADATA_KEY` keeps the host finalization
- filter excluding them from re-persistence and keeps Tier-2 from collapsing
- them into an UNtagged ``<compacted-turn>`` (which would defeat that filter).
- * :data:`COMPACTION_REFERENCE_METADATA_KEY` opens the Tier-1 reference-shed
- path: when the block exceeds the Tier-1 truncation threshold
- under budget pressure, it is blobbed to a recoverable snapshot placeholder
- (recall via ``recall_artifact``), so it is no longer permanently immovable.
-
- Only the synthetic summary/ledger blocks are dual-tagged — NOT the protected
- head (the original task must stay verbatim, seed-tag only).
- """
-    return message.model_copy(
-        update={
-            "metadata": {
-                **message.metadata,
-                SESSION_HISTORY_SEED_METADATA_KEY: True,
-                COMPACTION_REFERENCE_METADATA_KEY: True,
-            }
-        }
-    )
-
-
-def _summary_message(running_summary: str) -> Message:
-    body = (
-        f"[Running session summary — built incrementally across prior runs]\n"
-        f"{running_summary}\n\n{END_OF_SUMMARY_MARKER}"
-    )
-    # Dual-tag (seed + reference) so Tier-1 A2(2) can shed this large block under
-    # budget pressure while Tier-2 still protects it from lossy summarisation.
-    return _tag_seeded_reference(
-        Message(role=MessageRole.user, content_blocks=[TextBlock(text=body)])
-    )
-
-
-def _ledger_message(ledger_text: str) -> Message:
-    # Dual-tag (seed + reference): see ``_tag_seeded_reference`` — on a file-heavy
-    # session the registry block can grow large; Tier-1 A2(2) must be able to
-    # blob-shed it rather than leaving it permanently immovable in the window.
-    return _tag_seeded_reference(
-        Message(role=MessageRole.user, content_blocks=[TextBlock(text=ledger_text)])
-    )
-
-
-def build_seed(
-    memory: SessionMemory,
-    recent_tail: Sequence[Message],
-    head: Sequence[Message],
-    budget: int,
-    rc: LoopConstants,
-) -> list[Message]:
-    """Assemble the structured-memory seed to PREPEND before the new task.
-
-    Ordering (high-salience anchors at the edges — anti lost-in-the-middle):
-
-      [head (verbatim original task/system)]
-      [running summary block + END-OF-SUMMARY marker]
-      [pinned file registry block]     ← near the task (bottom edge)
-      [recent raw tail (token-budget, tool-pair-safe)]
-
-    Every seeded message is tagged ``SESSION_HISTORY_SEED_METADATA_KEY`` so
-    the host finalization mirror excludes it from re-persistence (no
-    exponential growth / no prior-run mis-attribution) and compaction protects
-    the new task + the seeded turns.
-
-    NO-OP when the memory is empty AND there is no tail to carry → returns ``[]``
-    so a session's FIRST run is byte-identical to a cold start (the 99 single-run
-    no-op invariant).
-
-    ``budget`` is the token budget for the seed. The recent raw tail gets
-    ``session_memory_tail_budget_fraction`` of it; the head + summary + registry
-    carry the rest (they are bounded by their own RC caps / module caps).
-    """
-    if memory.is_empty() and not recent_tail:
-        return []
-
-    head_messages = [_tag_seeded(m) for m in head[: rc.session_memory_head_protect_messages]]
-
-    summary_block: list[Message] = []
-    if memory.running_summary.strip():
-        summary_block = [_summary_message(memory.running_summary.strip())]
-
-    ledger_block: list[Message] = []
-    ledger_text = render_ledger(memory.ledger)
-    if ledger_text:
-        ledger_block = [_ledger_message(ledger_text)]
-
-    head_tokens = sum(estimate_message_tokens(m, rc) for m in head_messages)
-    summary_tokens = sum(estimate_message_tokens(m, rc) for m in summary_block)
-    ledger_tokens = sum(estimate_message_tokens(m, rc) for m in ledger_block)
-
-    tail_budget = int(budget * rc.session_memory_tail_budget_fraction)
-    # Never let the fixed blocks + tail exceed the total budget: clamp the tail
-    # to whatever remains after the (bounded) head/summary/ledger.
-    remaining = max(0, budget - head_tokens - summary_tokens - ledger_tokens)
-    tail_budget = min(tail_budget, remaining) if remaining else 0
-    tail = [_tag_seeded(m) for m in _tail_by_budget(recent_tail, tail_budget, rc)]
-
-    return head_messages + summary_block + ledger_block + tail
-
-
 __all__ = [
     "END_OF_SUMMARY_MARKER",
-    "SUMMARY_SYSTEM",
+    "SUMMARY_DELTA_SYSTEM",
+    "SUMMARY_SECTIONS",
     "ArtifactLedger",
     "FoldResult",
+    "MergeReport",
+    "SectionMerge",
     "SessionMemory",
-    "bound_catchup_source",
-    "build_seed",
-    "build_summary_user_message",
+    "SessionSummary",
+    "SummaryDelta",
+    "SummaryDeltaError",
+    "SummarySection",
+    "build_summary_delta_message",
+    "build_summary_delta_request",
+    "cap_summary",
     "extract_artifacts",
     "fold_run",
+    "fold_source_tokens",
+    "merge_summary_delta",
+    "parse_summary_delta",
     "render_ledger",
-    "running_summary_needed",
-    "summary_fold_threshold_tokens",
 ]

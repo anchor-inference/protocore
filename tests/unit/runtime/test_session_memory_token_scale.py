@@ -1,17 +1,11 @@
-"""Session-memory gates are denominated in the ONE shared token estimate.
+"""Session-seed sizes are read on the ONE shared token estimate.
 
-This module's gates once ran on a private, narrower estimate that costed only
-text / tool_use / tool_result text plus ``reasoning_content`` and priced
-thinking blocks, image refs and unknown block kinds at ZERO. They now run on
+The seed builder and the fold planner size turns with
 :func:`~protocore.runtime.context.compaction.estimate_message_tokens`, which
-costs every block.
-
-That is a change of SCALE, not just of implementation: the same transcript
-reads higher than it used to, so ``session_memory_fold_min_tokens``,
-``summary_fold_threshold_tokens`` and ``session_memory_tail_budget_fraction``
-all bind on marginally less transcript. Nothing in an output assertion shows
-that, so it is pinned here — if the zero-cost blocks ever go back to costing
-nothing, these fail.
+costs every block: thinking blocks, re-emitted reasoning and image refs are not
+free. A session-memory estimate once priced those at zero and let a seed overrun
+the window it was measured against; nothing in an output assertion would show
+that coming back, so it is pinned here.
 """
 from __future__ import annotations
 
@@ -23,11 +17,9 @@ from protocore.contracts.types import (
     TextBlock,
     ThinkingBlock,
 )
-from protocore.runtime.context.compaction import (
-    estimate_history_tokens,
-    estimate_message_tokens,
-)
-from protocore.runtime.context.session_memory import SessionMemory, fold_run
+from protocore.runtime.context.compaction import estimate_message_tokens
+from protocore.runtime.context.session_memory import SessionMemory
+from protocore.runtime.context.session_seed import build_session_seed, plan_session_fold
 
 _TEXT = "the quick brown fox " * 20
 
@@ -48,31 +40,30 @@ def _with_thinking_and_image() -> Message:
     )
 
 
+def _question() -> Message:
+    return Message(role=MessageRole.user, content_blocks=[TextBlock(text="question")])
+
+
 def test_thinking_and_image_blocks_cost_tokens() -> None:
     rc = LoopConstants()
     text_only = estimate_message_tokens(_text_only(), rc)
     enriched = estimate_message_tokens(_with_thinking_and_image(), rc)
-
     assert text_only > 0
-    # The image is priced at the flat constant; the thinking block and the
-    # re-emitted reasoning are each priced as their own text.
     assert enriched == text_only * 3 + rc.token_count_image_tokens
-    assert enriched > text_only
 
 
-def test_the_folded_raw_size_is_read_on_the_shared_scale() -> None:
-    """``cumulative_raw_tokens`` — what the lazy-fold gate reads — moved too."""
-    rc = LoopConstants()
-    base = SessionMemory()
+def test_the_seed_and_the_plan_size_turns_on_the_shared_scale() -> None:
+    rc = LoopConstants(session_memory_running_summary_token_cap=0)
+    plain = [_question(), _text_only()]
+    rich = [_question(), _with_thinking_and_image()]
+    memory = SessionMemory(turn_index=1)
 
-    text_run = [_text_only()]
-    rich_run = [_with_thinking_and_image()]
+    plain_seed = build_session_seed(plain, memory, 100_000, rc)
+    rich_seed = build_session_seed(rich, memory, 100_000, rc)
+    assert rich_seed.tokens == sum(estimate_message_tokens(m, rc) for m in rich_seed.messages)
+    assert rich_seed.tokens > plain_seed.tokens
 
-    text_folded = fold_run(base, text_run, "summary", rc).memory
-    rich_folded = fold_run(base, rich_run, "summary", rc).memory
-
-    assert text_folded.cumulative_raw_tokens == estimate_history_tokens(text_run, rc)
-    assert rich_folded.cumulative_raw_tokens == estimate_history_tokens(rich_run, rc)
-    # The discriminating comparison: the same visible text costs strictly more
-    # once thinking / image / reasoning are carried alongside it.
-    assert rich_folded.cumulative_raw_tokens > text_folded.cumulative_raw_tokens
+    assert (
+        plan_session_fold(rich, memory, 100_000, rc).projected_tokens
+        > plan_session_fold(plain, memory, 100_000, rc).projected_tokens
+    )

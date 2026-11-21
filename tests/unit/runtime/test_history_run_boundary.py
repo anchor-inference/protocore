@@ -661,8 +661,14 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/context/session_memory.py::_serialize_turns": _whole(
         "renders the turns it is handed; it reaches no engine"
     ),
-    "protocore/runtime/context/session_memory.py::build_summary_user_message": _whole(
+    "protocore/runtime/context/session_memory.py::build_summary_delta_message": _whole(
         "renders the turns it is handed; it reaches no engine"
+    ),
+    "protocore/runtime/context/session_memory.py::build_summary_delta_request": _whole(
+        "renders the turns it is handed into one summariser request"
+    ),
+    "protocore/runtime/context/session_memory.py::fold_source_tokens": _whole(
+        "measures the rendering of the turns it is handed"
     ),
     "protocore/runtime/context/session_memory.py::extract_artifacts": _whole(
         "collects artifact references from the turns it is handed"
@@ -671,15 +677,35 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "folds the sequence it is handed into durable session memory; it "
         "reaches no engine and does no scoping of its own"
     ),
-    "protocore/runtime/context/session_memory.py::bound_catchup_source": _whole(
-        "bounds the sequence it is handed to a byte budget"
+    "protocore/runtime/context/session_seed.py::split_turns": _whole(
+        "splits the stored session messages it is handed into turns; it "
+        "reaches no engine"
     ),
-    "protocore/runtime/context/session_memory.py::_tail_by_budget": _whole(
-        "bounds the sequence it is handed to a byte budget"
+    "protocore/runtime/context/session_seed.py::repair_turn": _whole(
+        "pairs the tool calls and results of the one turn it is handed"
     ),
-    "protocore/runtime/context/session_memory.py::build_seed": _whole(
-        "assembles the seed from the sequence it is handed, treating every "
-        "message in it the same way; it reaches no engine"
+    "protocore/runtime/context/session_seed.py::_mask": _whole(
+        "rewrites the tool results of the one turn it is handed"
+    ),
+    "protocore/runtime/context/session_seed.py::mask_turn": _whole(
+        "rewrites the tool results of the one turn it is handed"
+    ),
+    "protocore/runtime/context/session_seed.py::_tokens": _whole(
+        "sums the estimate over the messages it is handed"
+    ),
+    "protocore/runtime/context/session_seed.py::_prepare": _whole(
+        "prepares every turn of the stored session messages it is handed"
+    ),
+    "protocore/runtime/context/session_seed.py::_covered_count": _whole(
+        "asks the host's coverage predicate of the turns it is handed"
+    ),
+    "protocore/runtime/context/session_seed.py::build_session_seed": _whole(
+        "assembles the seed from the stored session messages it is handed, "
+        "treating every turn by its position; it reaches no engine"
+    ),
+    "protocore/runtime/context/session_seed.py::plan_session_fold": _whole(
+        "sizes the next seed from the stored session messages it is handed; "
+        "it reaches no engine"
     ),
     "protocore/runtime/loop_strategies.py::DeepStrategy._fetch_plan_fallback": _whole(
         "re-drives the provider with the outbound message list it is handed"
@@ -1724,10 +1750,10 @@ _SEED_KEY_DERIVED_ELSEWHERE: dict[str, str] = {
     "protocore/runtime/context/compaction.py::run_tier3_fold": (
         "reactive folding transfers seed provenance from each indexed span"
     ),
-    "protocore/runtime/context/session_memory.py::_tag_seeded": (
+    "protocore/runtime/context/session_seed.py::_tag_seeded": (
         "writes the tag; this is where the boundary comes from"
     ),
-    "protocore/runtime/context/session_memory.py::_tag_seeded_reference": (
+    "protocore/runtime/context/session_seed.py::_tag_seeded_reference": (
         "writes the tag on a dual-tagged reference block"
     ),
 }

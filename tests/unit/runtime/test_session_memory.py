@@ -1,44 +1,42 @@
-"""Unit tests for the pure structured session-memory.
+"""Unit tests for the pure session memory: the delta summary and the registry.
 
-Covers the fold (delta-only + drift cap + graceful summarizer failure), the
-STRUCTURED artifact registry (files + content read ONLY from parsed tool-call
-arguments by key — no regex/text mining), build_seed assembly (head-protect +
-ordering + tail tool-pair safety), the empty single-run no-op, and the storage
-round-trip.
-
-NO-HEURISTICS RULE: this module + its tests must contain no regex / substring
-extraction in production code; the artifact registry reads structured tool-call
-fields by named key only, and semantic extraction is the LLM running summary.
+Covers the artifact registry (files and content read from tool-call arguments
+by role), the delta fold — its prompt, the parsing of a reply, the append
+merge — the cap that sheds whole entries oldest first instead of cutting the
+end, and the storage round trip.
 """
 from __future__ import annotations
 
 import json
 
+import pytest
+
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
-    COMPACTION_REFERENCE_METADATA_KEY,
-    SESSION_HISTORY_SEED_METADATA_KEY,
     Message,
     MessageRole,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
 )
-from protocore.runtime.context.compaction import estimate_history_tokens
 from protocore.runtime.context.session_memory import (
-    END_OF_SUMMARY_MARKER,
-    SUMMARY_SYSTEM,
+    SUMMARY_DELTA_SYSTEM,
+    SUMMARY_SECTIONS,
     ArtifactLedger,
     SessionMemory,
-    bound_catchup_source,
-    build_seed,
-    build_summary_user_message,
+    SessionSummary,
+    SummaryDelta,
+    SummaryDeltaError,
+    build_summary_delta_message,
+    build_summary_delta_request,
+    cap_summary,
     extract_artifacts,
     fold_run,
+    merge_summary_delta,
+    parse_summary_delta,
     render_ledger,
-    running_summary_needed,
-    summary_fold_threshold_tokens,
 )
+from protocore.runtime.token_counting import estimate_tokens
 from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 RC = LoopConstants()
@@ -147,380 +145,246 @@ def test_extract_content_snapshot_capped() -> None:
     assert len(led.content["big.txt"]) <= 4000
 
 
-# --- summary prompt assembly (pure; the input to the host's async LLM) ---
+# --- the delta prompt -------------------------------------------------------
 
 
-def test_build_summary_user_message_delta_only_prior_summary() -> None:
-    user = build_summary_user_message("PRIOR", [_user("new question"), _assistant("answer")])
-    assert user is not None
-    assert "PREVIOUS SUMMARY:\nPRIOR" in user
-    assert "SOURCE MATERIAL" in user
-    assert "new question" in user
+def test_delta_prompt_names_every_section_heading() -> None:
+    for section in SUMMARY_SECTIONS:
+        assert f"  {section.heading}:\n" in SUMMARY_DELTA_SYSTEM
 
 
-def test_build_summary_user_message_first_run_no_prior() -> None:
-    user = build_summary_user_message("", [_user("task"), _assistant("done")])
-    assert user is not None
-    assert "PREVIOUS SUMMARY" not in user
-    assert "task" in user
+def test_delta_prompt_asks_only_for_what_is_new_and_is_multilingual() -> None:
+    assert "ONLY what the NEW TURNS add" in SUMMARY_DELTA_SYSTEM
+    assert "Never repeat" in SUMMARY_DELTA_SYSTEM
+    assert "VERBATIM" in SUMMARY_DELTA_SYSTEM
+    assert "Русский" in SUMMARY_DELTA_SYSTEM
 
 
-def test_build_summary_user_message_empty_transcript_is_none() -> None:
-    # An empty run (no messages) serialises to nothing → no LLM call needed.
-    assert build_summary_user_message("PRIOR", []) is None
+def test_delta_message_carries_the_existing_summary_and_the_turns() -> None:
+    summary = SessionSummary(entries={"REQUESTS": ("find books on topic 1",)})
+    text = build_summary_delta_message(summary, [_user("new question"), _tool_result("result body")])
+    assert text is not None
+    assert "EXISTING SUMMARY (already recorded — do not repeat):\nREQUESTS:\n- find books on topic 1" in text
+    assert "NEW TURNS" in text and "new question" in text and "[tool result: result body]" in text
 
 
-def test_build_summary_user_message_label_is_accurate_for_catchup(
-) -> None:
-    # : the SOURCE MATERIAL label must NOT claim "the most recent run's
-    # transcript" — on the catch-up first fold ``run_messages`` carries the whole
-    # un-summarised history, not just the most recent run. The label is the
-    # case-agnostic "session transcript to fold in".
-    user = build_summary_user_message("", [_user("turn 1 fact"), _assistant("ok")])
-    assert user is not None
-    assert "SOURCE MATERIAL (session transcript to fold in):" in user
-    assert "most recent run's transcript" not in user
+def test_delta_message_with_no_summary_says_empty() -> None:
+    text = build_summary_delta_message(SessionSummary(), [_user("task")])
+    assert text is not None and "(empty)" in text
 
 
-def test_summary_system_prompt_label_is_accurate_for_catchup() -> None:
-    # : the SUMMARY_SYSTEM SOURCE MATERIAL description must be accurate for
-    # BOTH the catch-up first fold (whole history) and the steady-state delta.
-    assert "most recent run's transcript" not in SUMMARY_SYSTEM
-    assert "session transcript to fold in" in SUMMARY_SYSTEM
+def test_delta_request_is_bounded_by_what_the_summary_can_store() -> None:
+    rc = LoopConstants(session_memory_fold_max_output_tokens=700)
+    request = build_summary_delta_request(SessionSummary(), [_user("task")], rc, model="m", temperature=0.1)
+    assert request is not None
+    assert request.max_tokens == 700 and request.temperature == 0.1 and not request.tools
+    assert request.messages[0].role is MessageRole.system
+    assert request.messages[0].text == SUMMARY_DELTA_SYSTEM
+    assert build_summary_delta_request(SessionSummary(), [], rc, model="m") is None
 
 
-def test_summary_system_prompt_is_multilingual_verbatim() -> None:
-    # the SOLE semantic-extraction mechanism: a verbatim-preservation prompt that
-    # is explicitly multilingual (RU+EN). Owned by core, used by the host.
-    assert "VERBATIM" in SUMMARY_SYSTEM
-    assert "REGARDLESS OF LANGUAGE" in SUMMARY_SYSTEM
-    assert "Русский" in SUMMARY_SYSTEM
+def test_delta_message_for_nothing_is_none() -> None:
+    assert build_summary_delta_message(SessionSummary(), []) is None
 
 
-def test_summary_system_prompt_prioritises_constraints_over_artifacts() -> None:
-    # Crowding-out fix: the sections must place
-    # CONSTRAINTS & DECISIONS and KEY FACTS & IDENTIFIERS BEFORE ARTIFACTS so a
-    # verbose file/essay body (already preserved verbatim in the artifact ledger)
-    # can never crowd out the hard-to-recover prose constraints on the plain
-    # (schema-less) path used by deepseek-style providers.
-    assert "CONSTRAINTS & DECISIONS" in SUMMARY_SYSTEM
-    assert "KEY FACTS & IDENTIFIERS" in SUMMARY_SYSTEM
-    assert "ARTIFACTS" in SUMMARY_SYSTEM
-    # ordering: constraints + identifiers come before artifacts in the prompt
-    assert SUMMARY_SYSTEM.index("CONSTRAINTS & DECISIONS") < SUMMARY_SYSTEM.index(
-        "ARTIFACTS:"
+def test_delta_message_caps_long_tool_blocks() -> None:
+    text = build_summary_delta_message(SessionSummary(), [_write_call("a.py", "x" * 5000), _tool_result("y" * 5000)])
+    assert text is not None and len(text) < 2000
+
+
+# --- parsing a reply -------------------------------------------------------------
+
+
+def test_parse_reads_entries_under_headings_in_any_order() -> None:
+    reply = (
+        "KEY FACTS & IDENTIFIERS:\n- The second book is B1 (ISBN 978-5-0000-0000-1)\n"
+        "REQUESTS:\n- find books on topic 1\n\n"
+        "PENDING / NEXT:\n- compare editions\n"
     )
-    assert SUMMARY_SYSTEM.index("KEY FACTS & IDENTIFIERS") < SUMMARY_SYSTEM.index(
-        "ARTIFACTS:"
+    delta = parse_summary_delta(reply)
+    assert delta.entries["KEY FACTS & IDENTIFIERS"] == ("The second book is B1 (ISBN 978-5-0000-0000-1)",)
+    assert delta.entries["REQUESTS"] == ("find books on topic 1",)
+    assert delta.entries["PENDING / NEXT"] == ("compare editions",)
+
+
+def test_parse_tolerates_presentation() -> None:
+    reply = (
+        "## 1. **Constraints and Decisions**\n* answer in Russian\n"
+        "**key facts & identifiers:** port 8080\n"
+        "3) Pending/Next:\n1. check the index\n"
+        "• ARTIFACTS\n\u2013 notes.md: draft\n"
     )
-    # explicit "carry forward every prior fact verbatim; never replace facts with
-    # file contents" instruction (the plain rung sends no schema).
-    assert "Carry forward EVERY prior fact" in SUMMARY_SYSTEM
-    assert "shorten ARTIFACTS first" in SUMMARY_SYSTEM
+    delta = parse_summary_delta(reply)
+    assert delta.entries["CONSTRAINTS & DECISIONS"] == ("answer in Russian",)
+    assert delta.entries["KEY FACTS & IDENTIFIERS"] == ("port 8080",)
+    assert delta.entries["PENDING / NEXT"] == ("check the index",)
+    assert delta.entries["ARTIFACTS"] == ("notes.md: draft",)
 
 
-# --- catch-up source bound (— guard a large catch-up fold input) -----
+def test_parse_drops_punctuation_only_entries_and_counts_stray_lines() -> None:
+    delta = parse_summary_delta("preamble line\nREQUESTS:\n- —\n- real one\n")
+    assert delta.entries == {"REQUESTS": ("real one",)}
+    assert delta.unattributed_lines == 1
 
 
-def test_bound_catchup_source_returns_input_when_within_budget() -> None:
-    msgs = [_user("a"), _assistant("b"), _user("c")]
-    # A budget far above the tiny source → unchanged (no gap marker inserted).
-    out = bound_catchup_source(msgs, 100_000, RC)
-    assert out == msgs
+def test_parse_empty_reply_is_an_empty_delta() -> None:
+    assert parse_summary_delta("").is_empty()
+    assert parse_summary_delta("REQUESTS:\n\nARTIFACTS:\n").is_empty()
 
 
-def test_bound_catchup_source_zero_budget_is_no_bound() -> None:
-    # 0 (or negative) budget means "no bound" — fail-open: never silently drop
-    # history on a misconfigured zero budget.
-    msgs = [_user("a"), _assistant("b")]
-    assert bound_catchup_source(msgs, 0, RC) == msgs
-    assert bound_catchup_source(msgs, -5, RC) == msgs
+def test_parse_refuses_a_reply_with_no_heading() -> None:
+    with pytest.raises(SummaryDeltaError):
+        parse_summary_delta("Here is a summary of the conversation in prose.")
 
 
-def test_bound_catchup_source_caps_and_keeps_oldest_head_and_newest_tail() -> None:
-    # An over-budget source is capped: the OLDEST head turn (early facts) AND the
-    # most-RECENT turn (this run's delta) survive; the middle is dropped behind a
-    # single explicit gap marker, and the result fits the budget.
-    big = "word " * 400  # ~hundreds of tokens each
-    msgs = [
-        _user("OLDEST early constraint " + big),
-        _assistant("middle one " + big),
-        _user("middle two " + big),
-        _assistant("middle three " + big),
-        _user("NEWEST delta this run " + big),
-    ]
-    full = estimate_history_tokens(msgs, RC)
-    budget = full // 2  # force a cap that cannot hold every turn
-    out = bound_catchup_source(msgs, budget, RC)
-
-    joined = "\n".join(m.text for m in out)
-    assert "OLDEST early constraint" in joined  # head preserved (early facts)
-    assert "NEWEST delta this run" in joined  # most-recent preserved (delta)
-    assert "earlier middle turns omitted" in joined  # explicit gap marker present
-    # The bounded source genuinely shrank and is at most ~the budget (the head's
-    # last whole message can edge slightly over its half, but never the full size).
-    assert len(out) < len(msgs)
-    assert estimate_history_tokens(out, RC) <= full
+def test_parse_truncated_reply_drops_only_its_last_entry() -> None:
+    delta = parse_summary_delta("REQUESTS:\n- one\n- two\nKEY FACTS & IDENTIFIERS:\n- cut in the mid", truncated=True)
+    assert delta.entries == {"REQUESTS": ("one", "two")}
 
 
-def test_bound_catchup_source_always_keeps_oldest_and_newest_under_tiny_budget() -> None:
-    # Even under a tiny budget (well below one message) the bound never crashes and
-    # never drops BOTH ends: the OLDEST message (early facts) and the NEWEST
-    # message (this run's delta) are always present (each end keeps at least one
-    # whole message), with the gap marker between them.
-    big = "word " * 2000
-    msgs = [_user("OLDEST " + big), _user("MID-DROP " + big), _user("NEWEST " + big)]
-    out = bound_catchup_source(msgs, 1, RC)  # tiny budget → maximal cap
-    joined = "\n".join(m.text for m in out)
-    assert "OLDEST" in joined
-    assert "NEWEST" in joined
-    assert "earlier middle turns omitted" in joined
-    assert "MID-DROP" not in joined  # the middle turn was dropped
+def test_parse_clips_a_huge_entry() -> None:
+    delta = parse_summary_delta("KEY FACTS & IDENTIFIERS:\n- " + "z" * 5000)
+    assert len(delta.entries["KEY FACTS & IDENTIFIERS"][0]) <= 1000
 
 
-# --- fold (UPDATE step) — pure assembly over already-computed summary text --
+def test_summary_text_round_trip_keeps_shed_counts() -> None:
+    summary = SessionSummary(entries={"REQUESTS": ("a",), "KEY FACTS & IDENTIFIERS": ("b",)}, shed={"ARTIFACTS": 4, "REQUESTS": 2})
+    assert SessionSummary.from_text(summary.render()) == summary
+    assert SessionSummary.from_text("") == SessionSummary()
+    with pytest.raises(SummaryDeltaError):
+        SessionSummary.from_text("free prose")
 
 
-def test_fold_sets_new_summary_and_advances_turn() -> None:
-    mem = SessionMemory(running_summary="PRIOR", turn_index=1)
-    res = fold_run(mem, [_user("new question"), _assistant("answer")], "M1", RC, roles=CONVENTIONAL_TOOL_ROLES)
-    assert res.memory.running_summary == "M1"
-    assert res.summary_updated is True
-    assert res.memory.turn_index == 2
+def test_parse_reads_its_own_rendering_back() -> None:
+    summary = SessionSummary(
+        entries={"REQUESTS": ("a",), "CONSTRAINTS & DECISIONS": ("b", "c"), "ARTIFACTS": ("d",)}
+    )
+    assert parse_summary_delta(summary.render()).entries == summary.entries
 
 
-def test_fold_none_summary_keeps_prior_but_updates_ledger() -> None:
-    # ``None`` summary text == the host LLM call was skipped/timed-out/failed
-    # — keep the prior summary, but the deterministic registry still updates and
-    # the turn still advances (no LLM needed for the ledger).
-    mem = SessionMemory(running_summary="KEEP-ME", turn_index=2)
-    res = fold_run(mem, [_write_call("x.py", "y = 1")], None, RC, roles=CONVENTIONAL_TOOL_ROLES)
-    assert res.summary_updated is False
-    assert res.memory.running_summary == "KEEP-ME"  # prior preserved
-    assert "x.py" in res.memory.ledger.files
-    assert res.memory.turn_index == 3
+# --- merging and the cap ----------------------------------------------------------
 
 
-def test_fold_blank_summary_keeps_prior() -> None:
-    mem = SessionMemory(running_summary="PRIOR", turn_index=1)
-    res = fold_run(mem, [_user("q")], "   ", RC, roles=CONVENTIONAL_TOOL_ROLES)
-    assert res.memory.running_summary == "PRIOR"
-    assert res.summary_updated is False
+def test_merge_appends_and_skips_duplicates() -> None:
+    summary = SessionSummary(entries={"KEY FACTS & IDENTIFIERS": ("B1 is the second book",)})
+    delta = SummaryDelta(entries={"KEY FACTS & IDENTIFIERS": ("b1  is the SECOND book", "B2 is the third")})
+    merged, report = merge_summary_delta(summary, delta, RC)
+    assert merged.section("KEY FACTS & IDENTIFIERS") == ("B1 is the second book", "B2 is the third")
+    assert (report.added, report.duplicates) == (1, 1)
 
 
-def test_fold_drift_cap_truncates_oversized_summary() -> None:
-    rc = LoopConstants(session_memory_running_summary_token_cap=10)
-    huge = "word " * 500
-    # default (large) cap → kept whole (modulo the strip()).
-    res = fold_run(SessionMemory(), [_user("q")], huge, RC, roles=CONVENTIONAL_TOOL_ROLES)
-    assert res.memory.running_summary == huge.strip()
-    # tiny cap → truncated well below the original length.
-    res2 = fold_run(SessionMemory(), [_user("q")], huge, rc, roles=CONVENTIONAL_TOOL_ROLES)
-    assert len(res2.memory.running_summary) < len(huge.strip())
+def test_merge_replaces_pending_only_when_the_delta_writes_it() -> None:
+    summary = SessionSummary(entries={"PENDING / NEXT": ("old step",), "REQUESTS": ("r",)})
+    kept, _ = merge_summary_delta(summary, SummaryDelta(entries={"REQUESTS": ("r2",)}), RC)
+    assert kept.section("PENDING / NEXT") == ("old step",)
+    replaced, report = merge_summary_delta(summary, SummaryDelta(entries={"PENDING / NEXT": ("new step",)}), RC)
+    assert replaced.section("PENDING / NEXT") == ("new step",)
+    assert report.replaced_sections == ("PENDING / NEXT",)
 
 
-def test_fold_drift_cap_disabled_when_zero() -> None:
+def _big_summary() -> SessionSummary:
+    return SessionSummary(
+        entries={
+            "REQUESTS": tuple(f"request {i} " + "r" * 120 for i in range(6)),
+            "CONSTRAINTS & DECISIONS": tuple(f"constraint {i} " + "c" * 120 for i in range(6)),
+            "KEY FACTS & IDENTIFIERS": tuple(f"fact {i} " + "f" * 120 for i in range(6)),
+            "PENDING / NEXT": ("next step",),
+            "ARTIFACTS": tuple(f"file{i}.md: notes " + "a" * 120 for i in range(6)),
+        }
+    )
+
+
+def test_cap_sheds_whole_entries_oldest_first_and_keeps_every_section() -> None:
+    rc = LoopConstants(session_memory_running_summary_token_cap=600, session_memory_fold_max_output_tokens=600)
+    capped, shed, clipped = cap_summary(_big_summary(), rc)
+    assert estimate_tokens(capped.render(), rc) <= 600
+    assert shed > 0 and clipped == 0
+    rendered = capped.render()
+    # Nothing is cut from the end: the trailing sections are still there.
+    assert "PENDING / NEXT:\n- next step" in rendered
+    # ARTIFACTS give way first, then later REQUESTS; the original ask stays.
+    assert capped.section("REQUESTS")[0].startswith("request 0 ")
+    assert capped.shed.get("ARTIFACTS") == 6
+    assert "earlier entries of this section are no longer carried" in rendered
+    # Within a section the oldest go first.
+    facts = capped.section("KEY FACTS & IDENTIFIERS")
+    if facts and len(facts) < 6:
+        assert facts[-1].startswith("fact 5 ")
+
+
+def test_cap_order_is_artifacts_requests_facts_constraints_pending() -> None:
+    rc = LoopConstants(session_memory_running_summary_token_cap=200, session_memory_fold_max_output_tokens=200)
+    capped, _, _ = cap_summary(_big_summary(), rc)
+    # Facts went whole before constraints were touched; the original request
+    # and the pending list outlive both.
+    assert capped.shed["ARTIFACTS"] == 6 and capped.shed["KEY FACTS & IDENTIFIERS"] == 6
+    assert 0 < len(capped.section("CONSTRAINTS & DECISIONS")) < 6
+    assert capped.section("REQUESTS") == (_big_summary().section("REQUESTS")[0],)
+    assert capped.section("PENDING / NEXT") == ("next step",)
+    rc = LoopConstants(session_memory_running_summary_token_cap=60, session_memory_fold_max_output_tokens=60)
+    last, _, _ = cap_summary(_big_summary(), rc)
+    assert set(last.entries) == {"REQUESTS"}  # the original ask is the last to go
+
+
+def test_cap_clips_a_single_oversized_entry_instead_of_dropping_it() -> None:
+    rc = LoopConstants(session_memory_running_summary_token_cap=50, session_memory_fold_max_output_tokens=50)
+    summary = SessionSummary(entries={"REQUESTS": ("x " * 2000,)})
+    capped, shed, clipped = cap_summary(summary, rc)
+    assert shed == 0 and clipped == 1
+    assert capped.section("REQUESTS") and len(capped.section("REQUESTS")[0]) < 4000
+
+
+def test_cap_off_keeps_everything() -> None:
     rc = LoopConstants(session_memory_running_summary_token_cap=0)
-    huge = "word " * 500
-    res = fold_run(SessionMemory(), [_user("q")], huge, rc, roles=CONVENTIONAL_TOOL_ROLES)
-    assert res.memory.running_summary == huge.strip()
+    assert cap_summary(_big_summary(), rc)[0] == _big_summary()
 
 
-def test_fold_does_not_mutate_input_memory() -> None:
-    mem = SessionMemory(running_summary="OLD", turn_index=1)
-    fold_run(mem, [_user("q")], "NEW", RC, roles=CONVENTIONAL_TOOL_ROLES)
-    assert mem.running_summary == "OLD"
-    assert mem.turn_index == 1
+def test_fold_output_bound_cannot_exceed_what_can_be_stored() -> None:
+    with pytest.raises(ValueError, match="session_memory_fold_max_output_tokens"):
+        LoopConstants(session_memory_running_summary_token_cap=500, session_memory_fold_max_output_tokens=800)
+    LoopConstants(session_memory_running_summary_token_cap=0, session_memory_fold_max_output_tokens=8000)
 
 
-# --- lazy fold gate (running_summary_needed) -------------------------------
+def test_fold_target_must_be_below_trigger() -> None:
+    with pytest.raises(ValueError, match="session_seed_fold_target_ratio"):
+        LoopConstants(session_seed_fold_trigger_ratio=0.5, session_seed_fold_target_ratio=0.5)
 
 
-def test_lazy_fold_threshold_derived_from_tail_budget() -> None:
-    rc = LoopConstants(
-        session_memory_fold_min_tokens=0, session_memory_tail_budget_fraction=0.5
-    )
-    # derived: budget * tail_fraction.
-    assert summary_fold_threshold_tokens(1000, rc) == 500
+# --- fold_run -----------------------------------------------------------------------
 
 
-def test_lazy_fold_threshold_explicit_override() -> None:
-    rc = LoopConstants(session_memory_fold_min_tokens=123)
-    # a positive RC overrides the derived value verbatim.
-    assert summary_fold_threshold_tokens(1000, rc) == 123
+def test_fold_run_without_a_delta_updates_only_the_registry_and_turn() -> None:
+    memory = SessionMemory(summary=SessionSummary(entries={"REQUESTS": ("r",)}), turn_index=2, stale_fold_count=1)
+    result = fold_run(memory, [_write_call("a.py", "x")], None, RC, roles=CONVENTIONAL_TOOL_ROLES)
+    assert not result.summary_updated
+    assert result.memory.summary == memory.summary
+    assert result.memory.ledger.files == ["a.py"]
+    assert result.memory.turn_index == 3
+    assert result.memory.stale_fold_count == 1  # the host owns this counter
 
 
-def test_running_summary_needed_skips_short_session() -> None:
-    rc = LoopConstants(session_memory_fold_min_tokens=0, session_memory_tail_budget_fraction=0.5)
-    # below the derived threshold (500) → not needed (tail covers the history).
-    assert running_summary_needed(100, 1000, rc) is False
-    # above it → needed (the raw tail can no longer hold everything).
-    assert running_summary_needed(900, 1000, rc) is True
+def test_fold_run_appends_a_delta() -> None:
+    memory = SessionMemory(summary=SessionSummary(entries={"REQUESTS": ("r",)}), turn_index=2)
+    result = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("r2",)}), RC)
+    assert result.summary_updated
+    assert result.memory.summary.section("REQUESTS") == ("r", "r2")
+    assert result.report.added == 1
+    assert result.notes["entries_added"] == 1
 
 
-def test_fold_accumulates_cumulative_raw_tokens() -> None:
-    """``fold_run`` accumulates THIS run's RAW message tokens into
-    ``cumulative_raw_tokens`` — the actual session size the lazy gate reads (NOT
-    the compressed summary size)."""
-    mem = SessionMemory()
-    assert mem.cumulative_raw_tokens == 0
-    run1 = [_user("word " * 100), _assistant("ok " * 100)]
-    r1 = fold_run(mem, run1, "small summary", RC, roles=CONVENTIONAL_TOOL_ROLES)
-    t1 = r1.memory.cumulative_raw_tokens
-    assert t1 > 0
-    # A second run accumulates ON TOP of the first (monotonic raw total).
-    run2 = [_user("more " * 100), _assistant("done " * 100)]
-    r2 = fold_run(r1.memory, run2, "small summary", RC, roles=CONVENTIONAL_TOOL_ROLES)
-    assert r2.memory.cumulative_raw_tokens > t1
+def test_fold_run_with_an_empty_delta_changes_nothing_in_the_summary() -> None:
+    memory = SessionMemory(summary=SessionSummary(entries={"REQUESTS": ("r",)}), turn_index=2)
+    result = fold_run(memory, [], SummaryDelta(), RC)
+    assert not result.summary_updated
 
 
-def test_lazy_gate_does_not_under_summarize_via_cumulative_raw_tokens() -> None:
-    """Phase D2 review CRITICAL — no silent content loss.
-
-    A session whose CUMULATIVE RAW history has grown PAST the tail budget MUST
-    trigger a summary fold even though the COMPRESSED running summary is tiny and
-    the latest run is short. The old proxy (``run_tokens + summary_tokens``) saw a
-    small summary + small run and skipped FOREVER; the cumulative-raw tracking
-    crosses the threshold and forces the fold, so runs 2..N are never lost.
-    """
-    rc = LoopConstants(
-        session_memory_fold_min_tokens=0, session_memory_tail_budget_fraction=0.30
-    )
-    seed_budget = 1000  # → derived threshold = 300 tokens
-    threshold = summary_fold_threshold_tokens(seed_budget, rc)
-    assert threshold == 300
-
-    # Established session: a TINY compressed summary, but the raw history already
-    # exceeds the tail budget (e.g. many prior short runs accumulated to 5000).
-    mem = SessionMemory(
-        running_summary="port 8080",  # ~2 tokens compressed
-        turn_index=20,
-        cumulative_raw_tokens=5000,  # >> threshold (300)
-    )
-    short_run = [_user("ok"), _assistant("done")]  # tiny new run
-    run_tokens = estimate_history_tokens(short_run, rc)
-    assert run_tokens < threshold  # this run alone would NOT trip the old proxy
-
-    # The gate uses the ACTUAL cumulative-after-this-run, which is >> threshold:
-    cumulative_after = mem.cumulative_raw_tokens + run_tokens
-    assert running_summary_needed(cumulative_after, seed_budget, rc) is True
-
-    # And the fold keeps accumulating so it never silently stops summarising.
-    res = fold_run(mem, short_run, "updated summary with ok/done", rc, roles=CONVENTIONAL_TOOL_ROLES)
-    assert res.summary_updated is True
-    assert res.memory.running_summary  # non-empty → early content represented
-    assert res.memory.cumulative_raw_tokens == 5000 + run_tokens
+def test_fold_run_does_not_mutate_its_input() -> None:
+    memory = SessionMemory(turn_index=1)
+    fold_run(memory, [_write_call("a.py", "x")], SummaryDelta(entries={"REQUESTS": ("r",)}), RC, roles=CONVENTIONAL_TOOL_ROLES)
+    assert memory.summary.is_empty() and memory.ledger.is_empty() and memory.turn_index == 1
 
 
-# --- build_seed (SEED step) ------------------------------------------------
-
-
-def test_build_seed_empty_memory_no_tail_is_noop() -> None:
-    # The 99 single-run no-op: a fresh memory with no tail seeds nothing.
-    assert build_seed(SessionMemory(), [], [], 40_000, RC) == []
-
-
-def test_build_seed_ordering_and_tags() -> None:
-    head = [
-        Message(role=MessageRole.system, content_blocks=[TextBlock(text="SYS")]),
-        _user("ORIGINAL TASK"),
-        _assistant("ok"),
-    ]
-    mem = SessionMemory(
-        running_summary="the running summary",
-        ledger=ArtifactLedger(files=["a.py"], content={"a.py": "x = 1"}),
-        turn_index=2,
-    )
-    tail = [_user("recent question"), _assistant("recent answer")]
-    seed = build_seed(mem, tail, head, 40_000, RC)
-
-    assert all(m.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True for m in seed)
-    texts = [m.text for m in seed]
-    assert texts[0] == "SYS"
-    assert "ORIGINAL TASK" in texts[1]
-    summary_idx = next(i for i, t in enumerate(texts) if "running summary" in t)
-    ledger_idx = next(i for i, t in enumerate(texts) if "ARTIFACT REGISTRY" in t)
-    tail_idx = next(i for i, t in enumerate(texts) if "recent question" in t)
-    assert summary_idx < ledger_idx < tail_idx
-    assert END_OF_SUMMARY_MARKER in texts[summary_idx]
-    # the registry block carries the verbatim path + content snapshot.
-    assert "a.py" in texts[ledger_idx]
-    assert "x = 1" in texts[ledger_idx]
-
-
-def test_build_seed_dual_tags_summary_and_ledger_only() -> None:
-    """The synthetic summary + ledger seed blocks carry
-    BOTH the seed tag AND the compaction-reference tag (so Tier-1 A2(2) can shed
-    them under budget pressure), while the protected HEAD carries ONLY the seed
-    tag (the original task must never be reference-shed)."""
-    head = [
-        Message(role=MessageRole.system, content_blocks=[TextBlock(text="SYS")]),
-        _user("ORIGINAL TASK"),
-        _assistant("ok"),
-    ]
-    mem = SessionMemory(
-        running_summary="the running summary",
-        ledger=ArtifactLedger(files=["a.py"], content={"a.py": "x = 1"}),
-        turn_index=2,
-    )
-    tail = [_user("recent question"), _assistant("recent answer")]
-    seed = build_seed(mem, tail, head, 40_000, RC)
-
-    # Every seed message is still seed-tagged (unchanged invariant).
-    assert all(m.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True for m in seed)
-
-    def _is_summary(m: Message) -> bool:
-        return "running summary" in m.text
-
-    def _is_ledger(m: Message) -> bool:
-        return "ARTIFACT REGISTRY" in m.text
-
-    summary_msg = next(m for m in seed if _is_summary(m))
-    ledger_msg = next(m for m in seed if _is_ledger(m))
-    # The two large synthetic user-text blocks DUAL-TAG the reference key.
-    assert summary_msg.metadata.get(COMPACTION_REFERENCE_METADATA_KEY) is True
-    assert ledger_msg.metadata.get(COMPACTION_REFERENCE_METADATA_KEY) is True
-
-    # The protected head (system / original task / first assistant) and the raw
-    # tail are NOT reference-tagged — only seed-tagged.
-    non_synthetic = [m for m in seed if not _is_summary(m) and not _is_ledger(m)]
-    assert non_synthetic, "head + tail must be present"
-    assert all(
-        m.metadata.get(COMPACTION_REFERENCE_METADATA_KEY) is not True for m in non_synthetic
-    )
-    # In particular the original task is NOT reference-shed-eligible.
-    task_msg = next(m for m in seed if "ORIGINAL TASK" in m.text)
-    assert task_msg.metadata.get(COMPACTION_REFERENCE_METADATA_KEY) is not True
-
-
-def test_build_seed_head_protect_count_respected() -> None:
-    rc = LoopConstants(session_memory_head_protect_messages=2)
-    head = [_user("a"), _assistant("b"), _user("c"), _assistant("d")]
-    mem = SessionMemory(running_summary="s", turn_index=1)
-    seed = build_seed(mem, [], head, 40_000, rc)
-    head_texts = [m.text for m in seed if "summary" not in m.text and "REGISTRY" not in m.text]
-    assert head_texts == ["a", "b"]
-
-
-def test_build_seed_tail_does_not_open_on_orphan_tool_result() -> None:
-    rc = LoopConstants(session_memory_tail_budget_fraction=1.0)
-    big = "x" * 4000
-    tail = [_assistant("call"), _write_call("a.py", "y=1", call_id="z"), _tool_result(big, call_id="z")]
-    mem = SessionMemory(running_summary="s", turn_index=1)
-    seed = build_seed(mem, tail, [], 200, rc)
-    tail_msgs = [m for m in seed if "summary" not in m.text and "REGISTRY" not in m.text]
-    if tail_msgs:
-        assert tail_msgs[0].role is not MessageRole.tool
-
-
-def test_build_seed_only_summary_when_ledger_empty() -> None:
-    mem = SessionMemory(running_summary="just a summary", turn_index=1)
-    seed = build_seed(mem, [], [], 40_000, RC)
-    assert any("just a summary" in m.text for m in seed)
-    assert not any("ARTIFACT REGISTRY" in m.text for m in seed)
-
-
-# --- render + round-trip ---------------------------------------------------
+# --- registry rendering and storage ---------------------------------------------------
 
 
 def test_render_ledger_verbatim() -> None:
@@ -537,27 +401,28 @@ def test_render_empty_ledger_is_blank() -> None:
 
 def test_session_memory_round_trip() -> None:
     mem = SessionMemory(
-        running_summary="s",
+        summary=SessionSummary(entries={"REQUESTS": ("s",)}, shed={"ARTIFACTS": 2}),
         ledger=ArtifactLedger(files=["x.py"], content={"x.py": "def f(): ..."}),
         turn_index=3,
-        cumulative_raw_tokens=4242,
+        stale_fold_count=3,
     )
-    restored = SessionMemory.from_dict(mem.to_dict())
-    assert restored.running_summary == "s"
+    restored = SessionMemory.from_dict(json.loads(json.dumps(mem.to_dict())))
+    assert restored.summary == mem.summary
     assert restored.ledger.files == ["x.py"]
     assert restored.ledger.content == {"x.py": "def f(): ..."}
     assert restored.turn_index == 3
-    # Phase D2 review CRITICAL — cumulative raw token total persists in the
-    # existing memory JSON (NO migration).
-    assert restored.cumulative_raw_tokens == 4242
+    assert restored.stale_fold_count == 3
 
 
 def test_session_memory_from_empty_dict() -> None:
     assert SessionMemory.from_dict(None).is_empty()
     assert SessionMemory.from_dict({}).is_empty()
-    # A legacy row written before the field existed → 0 (folds conservatively
-    # until it exceeds the threshold once — safe, never under-summarises).
-    assert SessionMemory.from_dict({"running_summary": "s", "turn_index": 2}).cumulative_raw_tokens == 0
+
+
+def test_summary_from_dict_ignores_unknown_sections() -> None:
+    restored = SessionSummary.from_dict({"entries": {"NOT A SECTION": ["x"], "REQUESTS": ["r"]}, "shed": {"X": 1}})
+    assert restored.entries == {"REQUESTS": ("r",)} and restored.shed == {}
+    assert SessionSummary.from_dict(None).is_empty()
 
 
 def test_artifact_ledger_round_trip_via_json() -> None:
@@ -565,21 +430,3 @@ def test_artifact_ledger_round_trip_via_json() -> None:
     raw = json.dumps(led.to_dict())
     restored = ArtifactLedger.from_dict(json.loads(raw))
     assert restored.to_dict() == led.to_dict()
-
-
-def test_session_memory_carries_a_stale_fold_count_across_runs() -> None:
-    """The stuck-memory counter survives the round trip through storage.
-
-    It rides in the same JSON envelope as the rest of the memory, so a session
-    that has been stuck for three folds still knows that after a pod restart —
-    a counter that reset on reload would never reach any threshold worth
-    reporting.
-    """
-    memory = SessionMemory(running_summary="s", turn_index=4, stale_fold_count=3)
-    assert SessionMemory.from_dict(memory.to_dict()).stale_fold_count == 3
-
-
-def test_session_memory_stale_fold_count_defaults_to_zero_for_legacy_rows() -> None:
-    """Rows written before the field existed load as "not stuck"."""
-    legacy = {"running_summary": "s", "ledger": {}, "turn_index": 2}
-    assert SessionMemory.from_dict(legacy).stale_fold_count == 0
