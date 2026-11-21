@@ -403,37 +403,52 @@ turns, and makes the summariser call.
   shorter than the result, and without telling the model to do anything.
   Tool images are dropped and counted, string arguments longer than
   `session_seed_mask_arg_max_chars` are cut to a head (the JSON stays valid),
-  and earlier reasoning is dropped: a masked turn is never the tool loop in
-  progress.
+  and earlier reasoning is dropped: a masked turn is a completed turn, never
+  the tool loop in progress (the OpenAI-compatible adapter does send earlier
+  reasoning back to an endpoint configured to receive it, so such an endpoint
+  sees less of the masked turns).
 - **The summary covers only what left the window.** Layout:
   `[head turns][summary][window turns, masked … full][artifact registry]`.
   The first `session_memory_head_protect_turns` turns are never folded. The
-  summary carries its own coverage (`SessionSummary.covered_through`), so a
-  turn leaves the window only when the summary records it, and a reset
-  summary brings every turn back.
+  summary carries its own coverage (`SessionSummary.coverage`, a range of the
+  host's message positions that starts after the head), so a turn leaves the
+  window only when the summary records it, a reset summary brings every turn
+  back, and a head turn whose protection lapses is carried and then folded.
+  The stored forms (`SessionSummary.to_text`, `to_dict`) carry a format
+  marker; anything without it loads as a fresh summary.
 - **Under pressure** the older full turns are masked first, then the newest
   turn's result text is cut to the longest head that fits (its images stay),
-  then it is masked; a seed still over budget reports `over_budget_tokens`.
+  then it is masked; then window turns are left out oldest first, then the
+  head, the newest turn, the registry and the summary, and one notice says
+  what is not in context. The seed always fits its budget; the fold plan,
+  which counts every turn the summary does not record, folds what was left
+  out in batches over the following runs.
 - **Prefix-stable.** A masked turn is the same bytes in every seed, and the
   summary only changes when a fold lands, so consecutive seeds share
   everything up to the previous seed's full tail, on the messages and on the
   wire. The masking boundary moves in steps of
   `session_seed_mask_batch_turns`; the registry, which changes when a file is
   written, sits after the window.
-- **A fold keeps room for the newest turn.** `plan_session_fold` sizes the
-  next seed with the older turns masked, the summary at its cap and the
-  newest turn in full when the budget can hold it, and once that passes
-  `session_seed_fold_trigger_ratio` of the budget plans the oldest window
-  turns down to `session_seed_fold_target_ratio`. Older turns are folded
-  early rather than the newest one cut.
+- **A fold keeps room for the newest turn, but not at the price of a fold on
+  every run.** `plan_session_fold` sizes the next seed with the older turns
+  masked, the summary at its cap and the newest turn in full — as long as,
+  with every older turn folded, there would still be room below
+  `session_seed_fold_trigger_ratio` for `session_seed_fold_min_turns_between`
+  more turns of the newest turn's masked size; otherwise it counts the newest
+  turn masked. Once the size passes the trigger it plans the oldest
+  unrecorded turns down to `session_seed_fold_target_ratio` (or to what the
+  head, summary, registry and newest turn need).
 - **Delta folds.** The summariser is shown the stored summary and the turns
   leaving the window in their masked form (`build_summary_delta_request`,
   `SUMMARY_DELTA_SYSTEM`) and writes only new entries under fixed sections,
-  or `NOTHING NEW`. `parse_summary_delta` refuses an empty, all-reasoning or
-  cut-off-before-its-first-entry reply, so no coverage advances on it; a
-  cut-off reply never supersedes PENDING / NEXT. `fold_run` appends the
-  entries and records the coverage, and applying the same delta again changes
-  nothing. Over `session_memory_running_summary_token_cap`, whole entries are
+  or `NOTHING NEW`; under PENDING / NEXT, `- nothing open` empties the list
+  and `- DONE: <item>` closes one item. `parse_summary_delta` refuses an
+  empty, all-reasoning or cut-off-before-its-first-entry reply, so no
+  coverage advances on it. A reply cut off at its output bound only adds: its
+  complete entries are kept, nothing is replaced, cleared or closed, and
+  coverage does not advance, so the turns are folded again. `fold_run`
+  merges the entries, records the coverage, keeps the stale-fold count, and
+  applying the same delta again changes nothing. Over `session_memory_running_summary_token_cap`, whole entries are
   shed oldest first, ARTIFACTS before later REQUESTS before KEY FACTS &
   IDENTIFIERS before CONSTRAINTS & DECISIONS, PENDING / NEXT last, and a
   section says how many it shed. *Why.* A summary rewritten whole on every run
@@ -595,6 +610,7 @@ nothing or keep nothing; point the same code at a real provider to measure it.
 | `session_seed_mask_identifier_lines` | 8 | identifier lines the default masking rule keeps |
 | `session_seed_fold_trigger_ratio` | 0.9 | share of the seed budget at which a fold is planned |
 | `session_seed_fold_target_ratio` | 0.6 | share a planned fold brings the seed down to |
+| `session_seed_fold_min_turns_between` | 1 | runs a fold must leave free, in newest-turn masked sizes |
 | `session_memory_head_protect_turns` | 1 | leading turns always seeded raw and never folded |
 | `session_memory_head_max_tokens` | 3,000 | largest masked size of that head |
 | `session_memory_running_summary_token_cap` | 1,900 | summary size past which whole entries are shed |

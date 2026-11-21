@@ -295,14 +295,15 @@ and `session_seed_mask_arg_preview_chars` a masked call's arguments. `session_se
 and `session_seed_fold_target_ratio` (0.6, below the trigger) are the
 hysteresis of the summary fold, against the seed budget the host passes; the
 planner counts the newest full turns at their full size, so older turns are
-folded before the newest is cut. The
+folded before the newest is cut, unless that would leave room for fewer than
+`session_seed_fold_min_turns_between` (1) runs before the next fold. The
 summary they reserve room for is held to
 `session_memory_running_summary_token_cap` (1,900), which also bounds
 `session_memory_fold_max_output_tokens` (1,000) from above (an approximate
 comparison: the cap is the calibrated estimate, the bound the provider's count).
 `session_memory_head_protect_turns` (1) and `session_memory_head_max_tokens`
 (3,000) protect the session's first turns. The defaults suit a window of
-about 48k tokens and chats of a few tool-heavy turns. See
+a few tens of thousands of tokens and chats of a few tool-heavy turns. See
 [`compaction.md`](compaction.md#seeding-the-next-run).
 
 ## See also
