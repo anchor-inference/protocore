@@ -299,6 +299,22 @@ if iteration >= 50:
 стоит `token_count_image_tokens`. См.
 [`contracts.md`](contracts.md#изображения-в-результатах-инструментов).
 
+Поля посева сессии — пятый такой набор. `session_seed_full_turns` (1) и
+`session_seed_mask_batch_turns` (1) решают, сколько новейших прежних ходов
+сессии сеются с результатами инструментов и насколько за раз сдвигается
+граница маскирования; `session_seed_mask_min_tokens`,
+`session_seed_mask_preview_chars` и `session_seed_mask_identifier_lines`
+задают вид заглушки маскированного результата.
+`session_seed_fold_trigger_ratio` (0.9) и `session_seed_fold_target_ratio`
+(0.6, ниже триггера) — гистерезис fold выжимки относительно бюджета посева,
+который передаёт хост, а выжимка, под которую они резервируют место,
+держится в `session_memory_running_summary_token_cap` (1 900), который же
+ограничивает сверху `session_memory_fold_max_output_tokens` (1 000).
+`session_memory_head_protect_turns` (1) и `session_memory_head_max_tokens`
+(3 000) защищают первые ходы сессии. Значения по умолчанию подобраны под окно
+около 49k токенов и диалоги из нескольких ходов с инструментами. См.
+[`compaction.md`](compaction.md#посев-следующего-запуска).
+
 ## Смотрите также
 
 - [`architecture.md`](architecture.md) — система LoopConstants в полной

@@ -202,7 +202,10 @@
   прекращают её раньше); в реактивном проходе он передаёт ход лестнице лимита
   вывода, и лишь когда меньшего лимита не осталось, цикл переходит в `FAILED`. Операторский `/compact`
   — отдельный путь `CompactCheckpoint` (`runtime/compact_checkpoint.py`,
-  `compaction_manual_enabled` по умолчанию `False`). Межзапусковый fold живёт в
+  `compaction_manual_enabled` по умолчанию `False`). Межзапусковый посев (прежние ходы
+  сырыми, результаты инструментов старых ходов маскированы) живёт в
+  `runtime/context/session_seed.py` (`build_session_seed`,
+  `plan_session_fold`), дельта-выжимка и реестр артефактов — в
   `runtime/context/session_memory.py` (`fold_run`). Триггеры и соотношения
   управляются RC и выводятся в `runtime/context/budgets.py`. См.
   [Управление контекстом и двухъярусное уплотнение](architecture.md#инвентаризация-технологий).

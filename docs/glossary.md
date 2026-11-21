@@ -196,8 +196,10 @@ Finalization gate (host-owned)
   does the loop go to `FAILED`. Operator
   `/compact` is a separate `CompactCheckpoint` path
   (`runtime/compact_checkpoint.py`, `compaction_manual_enabled` default
-  `False`). Cross-run fold lives in `runtime/context/session_memory.py`
-  (`fold_run`). Triggers and ratios are RC-driven and derived in
+  `False`). The cross-run seed (earlier turns raw, older tool results
+  masked) lives in `runtime/context/session_seed.py` (`build_session_seed`,
+  `plan_session_fold`), the delta summary and the artifact registry in
+  `runtime/context/session_memory.py` (`fold_run`). Triggers and ratios are RC-driven and derived in
   `runtime/context/budgets.py`. See
   [Context management and two-tier compaction](architecture.md#technology-inventory).
 
