@@ -12,41 +12,50 @@ All notable changes to this project are recorded here. The format follows
   summary stands in only for what no longer fits.**
   `runtime/context/session_seed.py` is new.
   `build_session_seed(history, memory, budget, rc, position=..., rule=...,
-  cache=..., drop_uncovered=False)` carries every earlier turn whole: user and
-  assistant text and tool calls verbatim, calls and results paired in order
-  (an unpaired or out-of-order one is taken out). In all but the newest
+  cache=...)` carries every earlier turn whole: user and assistant text and
+  tool calls verbatim, calls and results paired in order (an unpaired or
+  out-of-order one is taken out). In all but the newest
   `session_seed_full_turns` turns a long tool result becomes a placeholder —
   the tool, the size of what is missing, the lines a `MaskingRule` names (by
   default lines starting with one of `tool_result_stale_trim_protected_prefixes`
   and lines carrying an identifier) and the head of the result — used only
   when it is shorter and worded as a statement, not an instruction; tool
-  images are dropped and counted, string arguments past
-  `session_seed_mask_arg_max_chars` are cut to a head in valid JSON, and the
-  turn's reasoning is dropped. The layout is head turns, summary, window,
-  artifact registry; a masked turn is the same bytes in every seed, so
-  consecutive seeds share everything up to the previous seed's full tail and a
-  provider's prefix cache can serve it. `plan_session_fold(...)` says after a
-  run which turns need folding: it counts the newest turn at its full size
-  when the budget can hold it, and folds older turns once the seed passes
+  images are dropped and counted, long call arguments (strings, keys, lists)
+  are cut to a head in valid JSON, and the turn's reasoning is dropped. The
+  layout is head turns, summary, window, artifact registry; a masked turn is
+  the same bytes in every seed, so consecutive seeds share everything up to
+  the previous seed's full tail and a provider's prefix cache can serve it.
+  The seed always fits its budget: past masking and cutting the newest
+  turn, the oldest unrecorded turns, then the head, the newest turn, the
+  registry and the summary give way, and one notice says what is not in
+  context. `plan_session_fold(...)` says after a run which turns need
+  folding: it counts the newest turn at its full size while that still
+  leaves `session_seed_fold_min_turns_between` runs before the next fold, and
+  folds the oldest unrecorded turns once the seed passes
   `session_seed_fold_trigger_ratio` of the budget, down to
-  `session_seed_fold_target_ratio`. A `SeedCache` kept per session makes a run
-  cost only its new turns; both calls are CPU-bound and belong off an event
-  loop.
+  `session_seed_fold_target_ratio`; a backlog is folded in bounded batches. A
+  thread-safe `SeedCache` kept per session makes a run cost only its new
+  turns; both calls are CPU-bound and belong off an event loop.
 - **The running summary grows by deltas and carries its own coverage.**
   `SessionMemory.summary` is a `SessionSummary`: entries under five fixed
   sections (REQUESTS, CONSTRAINTS & DECISIONS, KEY FACTS & IDENTIFIERS,
-  PENDING / NEXT, ARTIFACTS) and `covered_through`, the session position the
-  summary records up to. A summary that is reset covers nothing, so no turn
-  can be dropped from a seed on its strength. A fold is shown the turns
-  leaving the window in their masked form and asked only for what they add
-  (`SUMMARY_DELTA_SYSTEM`, `build_summary_delta_request`, which takes the
-  host's thinking switch and bounds output by the new
-  `session_memory_fold_max_output_tokens`, 1000). `parse_summary_delta`
-  refuses an empty or all-reasoning reply and one cut off before its first
-  complete entry, so no coverage advances on it; a cut-off reply never
-  replaces PENDING / NEXT. `fold_run(memory, run_messages, delta, rc, roles,
-  covers_through=...)` appends the entries and records the coverage, and a
-  delta the memory already covers is not applied twice. Past
+  PENDING / NEXT, ARTIFACTS) and `coverage`, the range of the host's message
+  positions it records. The range starts after the protected head, so a head
+  turn whose protection lapses comes back into the seed; a reset summary
+  covers nothing. Its stored forms (`to_text`, `to_dict`) carry
+  `SUMMARY_FORMAT_VERSION`, and anything without it — blank, older or foreign
+  — loads as a fresh summary. A fold is shown the turns leaving the window in
+  their masked form and asked only for what they add (`SUMMARY_DELTA_SYSTEM`,
+  `build_summary_delta_request`, which takes the host's thinking switch and
+  bounds output by the new `session_memory_fold_max_output_tokens`, 1000).
+  Under PENDING / NEXT a fold can empty the list (`- nothing open`) or close
+  items (`- DONE: …`). `parse_summary_delta` refuses an empty or
+  all-reasoning reply and one cut off before its first complete entry; a
+  reply cut off later only adds its complete entries and does not advance
+  coverage. `fold_run(memory, run_messages, delta, rc, roles, coverage=...,
+  fold_attempted=...)` merges the delta, records the coverage, keeps the
+  stale-fold count and reports `NOTHING NEW` folds; a delta the memory
+  already covers is not applied twice. Past
   `session_memory_running_summary_token_cap` whole entries are shed oldest
   first — ARTIFACTS, later REQUESTS, KEY FACTS & IDENTIFIERS, CONSTRAINTS &
   DECISIONS, PENDING / NEXT last — instead of cutting characters from the
@@ -64,10 +73,8 @@ All notable changes to this project are recorded here. The format follows
   and the constants `session_memory_tail_budget_fraction`,
   `session_memory_head_protect_messages` and `session_memory_fold_min_tokens`.
   A memory stored by the earlier format loads with a fresh summary that
-  covers nothing (`SessionMemory.from_dict` reads only the new keys, and
-  `SessionSummary.from_text` refuses text it did not write), so the next seed
-  carries every stored turn again; its artifact registry and counters still
-  load.
+  covers nothing; its turns are carried again as far as the budget allows
+  and folded back over the following runs.
 
 ## [2.0.0b1] - 2026-11-20
 

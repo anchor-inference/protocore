@@ -1048,10 +1048,11 @@ class LoopConstants(BaseModel):
         default=400,
         gt=0,
         description=(
-            "In masked turns, a string argument of a tool call longer than "
-            "this is cut to its head and the number of characters not "
-            "carried; keys and shorter values (paths, ids) stay whole and the "
-            "arguments stay valid JSON. A file a call wrote is still in the "
+            "In masked turns, a string argument (or key) of a tool call "
+            "longer than this is cut to its head and the number of characters "
+            "not carried, and a list whose JSON is longer keeps its leading "
+            "items and a count of the rest; shorter values (paths, ids) stay "
+            "whole and the arguments stay valid JSON. A file a call wrote is still in the "
             "artifact registry, which is built from the run as it happened."
         ),
     )
@@ -1086,14 +1087,33 @@ class LoopConstants(BaseModel):
             "is made."
         ),
     )
+    session_seed_fold_min_turns_between: int = Field(
+        default=1,
+        ge=0,
+        description=(
+            "Runs a fold must leave before the next one, counted in turns of "
+            "the newest turn's masked size. The planner counts the newest "
+            "turn at its full size — folding older turns early so that the "
+            "previous turn's tool results reach the next run uncut — only "
+            "while the head, the summary at its cap, the registry and that "
+            "turn leave room below the trigger for this many more masked "
+            "turns; each run turns the newest turn into one of them. A newest "
+            "turn too large for that would make every run fold, so it is "
+            "counted masked instead and the seed cuts it when the window has "
+            "grown. 1 keeps the newest turn uncut whenever that costs at most "
+            "a fold every second run; larger values fold less often and cut "
+            "large newest turns more often."
+        ),
+    )
     session_seed_fold_target_ratio: float = Field(
         default=0.6,
         ge=0.0,
         lt=1.0,
         description=(
             "Share of the seed budget a planned fold brings the next seed down "
-            "to: the oldest turns after the summary are folded until the rest "
-            "fits this share. The gap to session_seed_fold_trigger_ratio is "
+            "to: the oldest turns the summary does not record are folded until "
+            "the rest fits this share (or, while the newest turn is counted in "
+            "full, what the head, summary, registry and newest turn need). The gap to session_seed_fold_trigger_ratio is "
             "the hysteresis: the seed then grows by appending for several "
             "turns before the next fold moves its front, which is what lets a "
             "provider's prefix cache serve it. Must be below the trigger."

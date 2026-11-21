@@ -20,10 +20,12 @@ from protocore.contracts.types import (
     ToolUseBlock,
 )
 from protocore.runtime.context.session_memory import (
-    NOTHING_COVERED,
+    PENDING_NOTHING_OPEN,
     SUMMARY_DELTA_SYSTEM,
+    SUMMARY_FORMAT_VERSION,
     SUMMARY_SECTIONS,
     ArtifactLedger,
+    Coverage,
     SessionMemory,
     SessionSummary,
     SummaryDelta,
@@ -33,6 +35,7 @@ from protocore.runtime.context.session_memory import (
     cap_summary,
     extract_artifacts,
     fold_run,
+    is_stored_summary_text,
     merge_summary_delta,
     parse_summary_delta,
     render_ledger,
@@ -267,11 +270,18 @@ def test_placeholder_entries_are_dropped() -> None:
 
 
 def test_a_bulleted_entry_naming_a_section_stays_in_its_section() -> None:
-    reply = "KEY FACTS & IDENTIFIERS:\n- Requests: limited to 3 per minute\n- LP-1234\n- db-7.internal:5432"
+    reply = "KEY FACTS & IDENTIFIERS:\n- Requests: limited to 3 per minute\n- ID-1234\n- db-7.internal:5432"
     delta = parse_summary_delta(reply)
     assert delta.entries == {
-        "KEY FACTS & IDENTIFIERS": ("Requests: limited to 3 per minute", "LP-1234", "db-7.internal:5432")
+        "KEY FACTS & IDENTIFIERS": ("Requests: limited to 3 per minute", "ID-1234", "db-7.internal:5432")
     }
+
+
+def test_an_unbulleted_entry_naming_a_section_stays_in_its_section() -> None:
+    reply = "KEY FACTS & IDENTIFIERS:\nRequests: limited to 3 per minute\nID-1234\nREQUESTS: find the report"
+    delta = parse_summary_delta(reply)
+    assert delta.entries["KEY FACTS & IDENTIFIERS"] == ("Requests: limited to 3 per minute", "ID-1234")
+    assert delta.entries["REQUESTS"] == ("find the report",)
 
 
 def test_parse_refuses_a_reply_with_no_heading() -> None:
@@ -293,26 +303,55 @@ def test_summary_text_round_trip_is_exact() -> None:
     summary = SessionSummary(
         entries={"REQUESTS": ("a",), "KEY FACTS & IDENTIFIERS": ("b", "PENDING / NEXT: was discussed")},
         shed={"ARTIFACTS": 4, "REQUESTS": 2},
-        covered_through=17,
+        coverage=Coverage(5, 17),
     )
-    assert SessionSummary.from_text(summary.render(), covered_through=17) == summary
-    assert SessionSummary.from_text("", covered_through=3) == SessionSummary(covered_through=3)
+    text = summary.to_text()
+    assert text.startswith(f"[session summary format {SUMMARY_FORMAT_VERSION}; covers 5-17]\n")
+    assert SessionSummary.from_text(text) == summary
+    assert is_stored_summary_text(text)
 
 
-def test_text_of_an_earlier_format_is_refused_not_half_read() -> None:
-    legacy = "ORIGINAL ASK:\nfind the items\nCONSTRAINTS & DECISIONS:\nanswer briefly\n"
-    with pytest.raises(SummaryDeltaError):
-        SessionSummary.from_text(legacy, covered_through=40)
-    with pytest.raises(SummaryDeltaError):
-        SessionSummary.from_text("free prose", covered_through=0)
+def test_an_empty_summary_that_covers_turns_is_still_self_describing() -> None:
+    summary = SessionSummary(coverage=Coverage(3, 9))
+    text = summary.to_text()
+    assert text == f"[session summary format {SUMMARY_FORMAT_VERSION}; covers 3-9]"
+    assert SessionSummary.from_text(text) == summary
+    fresh = SessionSummary().to_text()
+    assert SessionSummary.from_text(fresh) == SessionSummary() and is_stored_summary_text(fresh)
 
 
-def test_a_memory_dict_of_an_earlier_format_loads_covering_nothing() -> None:
+def test_blank_old_or_foreign_text_loads_as_a_fresh_summary() -> None:
+    for text in (
+        "",
+        "   ",
+        "ORIGINAL ASK:\nfind the items\nCONSTRAINTS & DECISIONS:\nanswer briefly\n",
+        "free prose",
+        "[session summary format 999; covers 0-40]",
+        f"[session summary format {SUMMARY_FORMAT_VERSION}; covers 9-3]",
+        f"[session summary format {SUMMARY_FORMAT_VERSION}; covers 0-4]\nnot a line of this format",
+    ):
+        assert SessionSummary.from_text(text) == SessionSummary(), text
+        assert not is_stored_summary_text(text)
+
+
+def test_a_memory_dict_without_the_format_marker_loads_covering_nothing() -> None:
     legacy = {"running_summary": "ORIGINAL ASK: x", "ledger": {"files": ["a.md"]}, "turn_index": 4, "cumulative_raw_tokens": 9}
     memory = SessionMemory.from_dict(legacy)
-    assert memory.summary == SessionSummary()
-    assert memory.summary.covered_through == NOTHING_COVERED
+    assert memory.summary == SessionSummary() and memory.summary.coverage is None
     assert memory.ledger.files == ["a.md"] and memory.turn_index == 4
+    unmarked = {"summary": {"entries": {"REQUESTS": ["r"]}, "coverage": [0, 30]}}
+    assert SessionMemory.from_dict(unmarked).summary == SessionSummary()
+    marked = SessionMemory(summary=SessionSummary(entries={"REQUESTS": ("r",)}, coverage=Coverage(0, 30)))
+    assert SessionMemory.from_dict(json.loads(json.dumps(marked.to_dict()))).summary == marked.summary
+
+
+def test_coverage_is_a_valid_range() -> None:
+    with pytest.raises(ValueError):
+        Coverage(5, 4)
+    with pytest.raises(ValueError):
+        Coverage(-1, 4)
+    assert Coverage(2, 5).union(Coverage(6, 9)) == Coverage(2, 9)
+    assert Coverage(0, 9).includes(Coverage(2, 5)) and not Coverage(2, 5).includes(Coverage(0, 9))
 
 
 def test_parse_reads_its_own_rendering_back() -> None:
@@ -424,50 +463,110 @@ def test_fold_run_without_a_delta_updates_only_the_registry_and_turn() -> None:
 
 
 def test_fold_run_appends_a_delta_and_advances_coverage() -> None:
-    memory = SessionMemory(summary=SessionSummary(entries={"REQUESTS": ("r",)}, covered_through=3), turn_index=2)
-    result = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("r2",)}), RC, covers_through=9)
+    memory = SessionMemory(summary=SessionSummary(entries={"REQUESTS": ("r",)}, coverage=Coverage(2, 3)), turn_index=2)
+    result = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("r2",)}), RC, coverage=Coverage(4, 9))
     assert result.summary_updated
     assert result.memory.summary.section("REQUESTS") == ("r", "r2")
-    assert result.memory.summary.covered_through == 9
+    assert result.memory.summary.coverage == Coverage(2, 9)
     assert result.report.added == 1
     assert result.notes["entries_added"] == 1
 
 
-def test_fold_run_needs_the_coverage_a_delta_advances_to() -> None:
-    with pytest.raises(ValueError, match="covers_through"):
+def test_fold_run_needs_the_coverage_a_delta_records() -> None:
+    with pytest.raises(ValueError, match="coverage"):
         fold_run(SessionMemory(), [], SummaryDelta(entries={"REQUESTS": ("r",)}), RC)
 
 
 def test_applying_the_same_delta_twice_changes_nothing_the_second_time() -> None:
     rc = LoopConstants(session_memory_running_summary_token_cap=200, session_memory_fold_max_output_tokens=200)
     delta = SummaryDelta(entries={"ARTIFACTS": tuple(f"file{i}.md: " + "a" * 100 for i in range(6))})
-    once = fold_run(SessionMemory(), [], delta, rc, covers_through=10).memory
-    twice = fold_run(once, [], delta, rc, covers_through=10)
+    once = fold_run(SessionMemory(), [], delta, rc, coverage=Coverage(0, 10)).memory
+    twice = fold_run(once, [], delta, rc, coverage=Coverage(0, 10))
     assert twice.report.already_applied
     assert twice.memory.summary == once.summary
     assert twice.memory.turn_index == once.turn_index + 1
 
 
-def test_a_truncated_reply_does_not_supersede_pending() -> None:
-    stored = SessionSummary(entries={"PENDING / NEXT": ("report to the lead", "fix LP-9", "reserve the room")})
-    delta = parse_summary_delta("PENDING / NEXT:\n- report to the lead\n- fix LP-9\n- reserve the ro", truncated=True)
-    assert delta.truncated
-    merged, report = merge_summary_delta(stored, delta, RC)
-    assert merged.section("PENDING / NEXT") == ("report to the lead", "fix LP-9", "reserve the room")
-    assert report.kept_on_truncation == ("PENDING / NEXT",)
-    assert report.replaced_sections == ()
+_STORED_PENDING = ("send the report", "fix the build")
 
 
-def test_fold_run_with_nothing_new_advances_only_coverage() -> None:
+def _pending_after(reply: str, *, truncated: bool = False) -> tuple[tuple[str, ...], object]:
+    stored = SessionSummary(entries={"PENDING / NEXT": _STORED_PENDING})
+    merged, report = merge_summary_delta(stored, parse_summary_delta(reply, truncated=truncated), RC)
+    return merged.section("PENDING / NEXT"), report
+
+
+def test_pending_can_be_emptied() -> None:
+    for reply in (
+        f"PENDING / NEXT:\n- {PENDING_NOTHING_OPEN}",
+        "PENDING / NEXT:\n- none",
+        "PENDING / NEXT:\n- nothing",
+        "PENDING / NEXT: none",
+        "PENDING / NEXT:\n- Nothing open.",
+    ):
+        pending, report = _pending_after(reply)
+        assert pending == (), reply
+        assert report.cleared_sections == ("PENDING / NEXT",)  # type: ignore[attr-defined]
+
+
+def test_a_bare_pending_heading_leaves_the_list_as_stored() -> None:
+    assert _pending_after("PENDING / NEXT:\nREQUESTS:\n- something new")[0] == _STORED_PENDING
+
+
+def test_closed_items_leave_the_stored_list() -> None:
+    pending, report = _pending_after("PENDING / NEXT:\n- DONE: send the report")
+    assert pending == ("fix the build",)
+    assert report.closed_items == 1  # type: ignore[attr-defined]
+
+
+def test_a_new_complete_list_replaces_the_stored_one() -> None:
+    assert _pending_after("PENDING / NEXT:\n- fix the build\n- call the supplier")[0] == ("fix the build", "call the supplier")
+
+
+def test_the_prompt_says_how_to_empty_and_close_pending() -> None:
+    assert f"- {PENDING_NOTHING_OPEN}" in SUMMARY_DELTA_SYSTEM
+    assert "DONE:" in SUMMARY_DELTA_SYSTEM
+
+
+def test_a_truncated_reply_adds_new_pending_items_and_removes_none() -> None:
+    reply = "PENDING / NEXT:\n- send the report\n- send the invoice to the supplier\n- book the ro"
+    pending, report = _pending_after(reply, truncated=True)
+    assert pending == ("send the report", "fix the build", "send the invoice to the supplier")
+    assert report.kept_on_truncation == ("PENDING / NEXT",)  # type: ignore[attr-defined]
+    for reply in ("PENDING / NEXT:\n- none\nREQUESTS:\n- a\n- b", "PENDING / NEXT:\n- DONE: fix the build\nREQUESTS:\n- a\n- b"):
+        assert _pending_after(reply, truncated=True)[0] == _STORED_PENDING
+
+
+def test_a_truncated_fold_keeps_its_entries_but_does_not_advance_coverage() -> None:
+    memory = SessionMemory(summary=SessionSummary(entries={"REQUESTS": ("r",)}, coverage=Coverage(0, 4)), stale_fold_count=2)
+    delta = parse_summary_delta("REQUESTS:\n- open request from the user\n- cut mid-sen", truncated=True)
+    result = fold_run(memory, [], delta, RC, coverage=Coverage(5, 20), fold_attempted=True)
+    assert result.memory.summary.section("REQUESTS") == ("r", "open request from the user")
+    assert result.memory.summary.coverage == Coverage(0, 4)
+    assert result.report.coverage_held
+    assert result.memory.stale_fold_count == 3
+
+
+def test_fold_run_keeps_the_stale_fold_count() -> None:
+    memory = SessionMemory(stale_fold_count=2)
+    failed = fold_run(memory, [], None, RC, fold_attempted=True).memory
+    assert failed.stale_fold_count == 3
+    landed = fold_run(failed, [], SummaryDelta(entries={"REQUESTS": ("r",)}), RC, coverage=Coverage(0, 3), fold_attempted=True).memory
+    assert landed.stale_fold_count == 0
+    assert fold_run(failed, [], None, RC).memory.stale_fold_count == 3  # no fold attempted
+
+
+def test_fold_run_with_nothing_new_advances_coverage_and_says_so() -> None:
     memory = SessionMemory(summary=SessionSummary(entries={"REQUESTS": ("r",)}), turn_index=2)
-    result = fold_run(memory, [], parse_summary_delta("NOTHING NEW"), RC, covers_through=5)
+    result = fold_run(memory, [], parse_summary_delta("NOTHING NEW"), RC, coverage=Coverage(0, 5))
     assert result.memory.summary.entries == memory.summary.entries
-    assert result.memory.summary.covered_through == 5
+    assert result.memory.summary.coverage == Coverage(0, 5)
+    assert result.report.nothing_new and result.notes["nothing_new"]
 
 
 def test_fold_run_does_not_mutate_its_input() -> None:
     memory = SessionMemory(turn_index=1)
-    fold_run(memory, [_write_call("a.py", "x")], SummaryDelta(entries={"REQUESTS": ("r",)}), RC, roles=CONVENTIONAL_TOOL_ROLES, covers_through=1)
+    fold_run(memory, [_write_call("a.py", "x")], SummaryDelta(entries={"REQUESTS": ("r",)}), RC, roles=CONVENTIONAL_TOOL_ROLES, coverage=Coverage(0, 1))
     assert memory.summary.is_empty() and memory.ledger.is_empty() and memory.turn_index == 1
 
 
@@ -507,7 +606,9 @@ def test_session_memory_from_empty_dict() -> None:
 
 
 def test_summary_from_dict_ignores_unknown_sections() -> None:
-    restored = SessionSummary.from_dict({"entries": {"NOT A SECTION": ["x"], "REQUESTS": ["r"]}, "shed": {"X": 1}})
+    restored = SessionSummary.from_dict(
+        {"format": SUMMARY_FORMAT_VERSION, "entries": {"NOT A SECTION": ["x"], "REQUESTS": ["r"]}, "shed": {"X": 1}}
+    )
     assert restored.entries == {"REQUESTS": ("r",)} and restored.shed == {}
     assert SessionSummary.from_dict(None).is_empty()
 

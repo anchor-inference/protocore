@@ -141,10 +141,8 @@ _UNMARKED_ON_PURPOSE: dict[tuple[str, str], str] = {
     ("context/compaction.py", "_run_summariser"): "the summariser's own request, never put into history",
     ("context/session_compaction.py", "call"): "a session summariser's own request, never put into history",
     ("context/session_memory.py", "build_summary_delta_request"): "a session summariser's own request, never put into history",
-    ("context/session_seed.py", "_summary_message"): "a cross-run seed, tagged by _tag_seeded_reference",
-    ("context/session_seed.py", "_notice_message"): "a cross-run seed, tagged by _tag_seeded_reference",
+    ("context/session_seed.py", "_block"): "a cross-run seed block, tagged by _tag_seeded_reference",
     ("context/session_seed.py", "_summary_reserve"): "a wrapper only measured, never put into history",
-    ("context/session_seed.py", "_ledger_message"): "a cross-run seed, tagged by _tag_seeded_reference",
     ("loop_strategies.py", "_fetch_plan_fallback"): "a one-off structured request, never put into history",
     ("loop_strategies.py", "_append_plan_turn"): "the model's own plan, recorded as its turn",
 }

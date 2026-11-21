@@ -697,14 +697,24 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "splits the stored session messages it is handed into turns and "
         "asks the summary's coverage of each"
     ),
-    "protocore/runtime/context/session_seed.py::_head_count": _whole(
-        "measures the leading turns of the stored session it is handed"
+    "protocore/runtime/context/session_seed.py::_known": _whole(
+        "reads the positions of the one stored turn it is handed"
+    ),
+    "protocore/runtime/context/session_seed.py::_materialise": _whole(
+        "rebuilds the masked form of the one stored turn it is handed"
+    ),
+    "protocore/runtime/context/session_seed.py::_Preparer._prepare": _whole(
+        "masks and measures the one stored turn it is handed"
+    ),
+    "protocore/runtime/context/session_seed.py::_settings_key": _Declaration(
+        reason="reads named constants from the run configuration; it is handed no messages",
+        claim=_Claim.NOT_THE_TRANSCRIPT,
     ),
     "protocore/runtime/context/session_seed.py::_Preparer.prepare": _whole(
         "prepares the one stored turn it is handed"
     ),
-    "protocore/runtime/context/session_seed.py::SeedCache._turn_key": _whole(
-        "keys the one stored turn it is handed"
+    "protocore/runtime/context/session_seed.py::_turn_digest": _whole(
+        "digests the one stored turn it is handed"
     ),
     "protocore/runtime/context/session_seed.py::_pairing": _whole(
         "pairs the tool calls and results of the one turn it is handed"

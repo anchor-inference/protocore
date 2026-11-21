@@ -10,7 +10,22 @@ Both entry points are CPU-bound: they split, mask and estimate messages and do
 no I/O. An async host runs them off its event loop (``asyncio.to_thread``)
 and keeps a :class:`SeedCache` per session, so that the work per run is
 proportional to the turns added since the last call, not to the session's
-length.
+length. The cache is thread-safe; the seed of one run and the fold plan of
+the previous one may use it at the same time.
+
+Positions
+---------
+
+``position(message)`` is the host's session position of a stored message: a
+non-negative integer, strictly increasing in session order, the same number
+for the same message on every call, or ``None`` when the host does not know
+it. Coverage (:class:`~protocore.runtime.context.session_memory.Coverage`) is
+a range of these positions. A turn is recorded by the summary when it has at
+least one known position and every known position lies in the range; a
+message without a position rides along with its turn. A turn none of whose
+messages has a position can never be recorded: it is carried while the budget
+allows and otherwise counted among the turns not in context, and it does not
+stop later turns from being folded.
 
 What a seed carries
 -------------------
@@ -34,17 +49,21 @@ changes with age is the tool exchanges. The newest
   states what is missing; it never tells the model to do anything;
 * every tool image is dropped, and the result says how many and of which
   type;
-* a string argument of a tool call longer than ``session_seed_mask_arg_max_chars``
-  is replaced by its head and the count of characters not carried; the
-  arguments stay valid JSON, shorter values (paths, ids) stay whole. The
-  artifact registry is built from the run as it happened and keeps the files;
+* long tool-call arguments are cut to a head (strings, keys and lists past
+  ``session_seed_mask_arg_max_chars``); the arguments stay valid JSON and
+  shorter values (paths, ids) stay whole. The artifact registry is built
+  from the run as it happened and keeps the files;
 * the reasoning of assistant messages (``reasoning_content``, thinking
-  blocks, opaque reasoning records) is dropped. That is safe for tool-call
-  pairing on every provider the core speaks to: a masked turn is a completed
-  turn followed by later user messages, never the tool loop in progress, and
-  the core's own adapters already send earlier turns without their reasoning
-  (an OpenAI-compatible endpoint that requires the field gets it empty;
-  opaque records go back only to the endpoint that wrote them).
+  blocks, opaque reasoning records) is dropped. The core's OpenAI-compatible
+  adapter does send earlier turns' reasoning back when an endpoint is
+  configured to (``ReasoningReplay.when_present``, or ``required`` with
+  thinking on, where a message without it is sent with an empty field), so
+  dropping it changes what such an endpoint receives. It is safe for the
+  request because a masked turn is a completed turn — its tool calls are all
+  answered and a later user message follows it — and the reasoning that
+  providers require is that of the tool loop in progress, which is never in
+  a masked turn: the newest full turns keep theirs, and the run's own turns
+  are not seeded at all.
 
 The masked form of a turn depends only on that turn and the configuration, so
 the same turn is the same bytes in every seed.
@@ -55,40 +74,54 @@ shown in their masked form (:func:`plan_session_fold`).
 
 Layout::
 
-    [head]     the first session_memory_head_protect_turns turns, never folded
-    [summary]  the running summary, when it covers turns past the head
+    [head]     the first session_memory_head_protect_turns turns, never folded,
+               and any turn older than the summary's range it does not record
+    [summary]  the running summary, when it has entries or covers turns
                                             (dual-tagged reference block)
-    [notice]   only with drop_uncovered: how many turns are not available
-    [window]   every turn the summary does not cover, oldest first:
+    [notice]   only when something did not fit: how many turns (and whether
+               the summary or the registry) are not in this context
+    [window]   every later turn the summary does not record, oldest first:
                masked … masked | full (newest session_seed_full_turns)
     [registry] the artifact registry, when the session wrote files
                                             (dual-tagged reference block)
     ← the host then appends its preludes and the new task
 
-Which turns are in the window is decided by the summary's coverage
-(:attr:`SessionSummary.covered_through`), not by the budget: a turn leaves the
-window only when the summary records it. A turn the summary does not cover is
-therefore always carried (at worst masked, and over budget) unless the host
-asks otherwise (``drop_uncovered``). A summary that is reset covers nothing,
-so a reset brings every turn back rather than losing any.
+Which turns are in the window is decided by the summary's coverage, not by
+the budget: a turn leaves the window only when the summary records it. A
+summary that is reset covers nothing, so a reset brings every turn back
+rather than losing any; and coverage is a range that starts after the head,
+so a head turn whose protection lapses (a settings or rule change, a head
+that grew past ``session_memory_head_max_tokens``) moves to the window and is
+folded like any other, never into neither place.
 
-The seed puts user-role blocks next to user turns (summary before the first
-window question, registry before the host's task), as the core's own
-compaction does inside a run. An endpoint whose chat template insists on
-alternating roles must merge adjacent user messages in its adapter, which is
-the one place that knows the template; folding the summary into the user's
-question here would make the summary unsheddable and the question no longer
-the stored message.
+The seed always fits its budget. Under pressure, in order: older full turns
+are masked; the newest turn's result text is cut to the longest head that
+fits (its images stay); it is masked; then window turns are left out oldest
+first, then head turns, then the newest turn, then the registry, then the
+summary — and one notice says what is not in context. Turns left out this
+way are not recorded anywhere yet; the fold plan, which counts every turn the
+summary does not record, folds them in bounded batches over the following
+runs (see :func:`plan_session_fold`).
+
+Adjacent user messages: the summary, the notice and the registry are
+user-role blocks, so a seed can put two user messages next to each other
+(summary before the first window question, registry before the host's task),
+as the core's own in-run compaction also does. The core does not merge them,
+and its OpenAI-compatible adapter sends them as separate user messages. An
+endpoint whose chat template rejects consecutive user messages is not
+supported by that adapter as it stands; a host serving one must merge
+adjacent user messages itself before the request is sent.
 
 Prefix stability
 ----------------
 
 A provider's prefix cache serves a request up to its first differing byte, so
 the seed is built to grow by appending. Between two consecutive runs of one
-session, when no fold has landed in between, the next seed starts with the
-previous one byte for byte through its last masked turn: the head, the
-summary and every masked window turn are unchanged and in the same positions,
-and the next seed adds turns after them. What is NOT stable, and when:
+session, when no fold has landed in between and nothing had to be left out,
+the next seed starts with the previous one byte for byte through its last
+masked turn: the head, the summary and every masked window turn are
+unchanged and in the same positions, and the next seed adds turns after
+them. What is NOT stable, and when:
 
 * **The full tail.** A turn that crosses the masking boundary is shown masked
   from then on, so the prefix breaks at its first message that masking
@@ -104,15 +137,14 @@ and the next seed adds turns after them. What is NOT stable, and when:
   the first such image the limit elides once newer images arrive.
 * **The registry.** It changes when a file is written, and sits after the
   window for that reason.
-* **A fold landing.** The summary changes and the turns it now covers leave
+* **A fold landing.** The summary changes and the turns it now records leave
   the window: the prefix is stable only through the head. Folds are planned
-  with hysteresis (see below), so in a short tool-heavy chat this happens
-  rarely or not at all.
+  with hysteresis (see below).
+* **Leaving turns out.** When the budget cannot hold the masked window, the
+  front of the window moves on every run that does it, until the folds catch
+  up.
 * **A changed history.** A turn edited, regenerated or removed changes the
   seed from that turn on.
-* **``drop_uncovered``.** Leaving out window turns to fit the budget moves the
-  window's front on every run that does it; it is for a session whose summary
-  was lost, not for the steady state.
 
 The masking rule must be a pure function of its arguments; one that is not
 makes masked turns differ between runs and gives the cache nothing.
@@ -121,20 +153,28 @@ When a fold is needed
 ---------------------
 
 :func:`plan_session_fold`, after a run, measures the seed the next run would
-get with this run included: head, the summary at its cap, the registry, every
-older window turn masked, and the newest full turns at their full size when
-the budget could hold them with nothing older (otherwise masked). Answer
-quality comes first, so the newest turn's tool results are what the budget is
-kept for: once that sum passes ``session_seed_fold_trigger_ratio`` of the
-budget, the oldest window turns are planned until it is at or below
-``session_seed_fold_target_ratio``. Otherwise the plan is empty and the host
-makes no summariser call. The plan is computed from the same preparation the
-seed builder uses, so the two cannot disagree about what the seed carries.
+get with this run included: the head (masked), the summary at its cap, the
+registry, every turn the summary does not record (masked), and the newest
+full turns. Answer quality comes first, so the newest turn is counted at its
+full size — older turns are folded early so that the previous turn's tool
+results reach the next run uncut — whenever, with every older turn folded,
+there would still be room below the trigger for
+``session_seed_fold_min_turns_between`` more turns of the newest turn's masked
+size: each run turns the newest turn into an older, masked one, so that room
+is what keeps two folds at least that many runs apart. When the newest turn is
+too large for that, counting it in full would fold on every run, so it is
+counted masked instead and the seed cuts it when the window has grown. Once the measured size passes
+``session_seed_fold_trigger_ratio`` of the budget, the oldest unrecorded
+turns are planned until it is at or below ``session_seed_fold_target_ratio``
+(or, with the newest counted in full, at or below what the head, summary,
+registry and newest turn need). Otherwise the plan is empty and the host
+makes no summariser call.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -157,7 +197,9 @@ from protocore.runtime.context.compaction import estimate_message_tokens
 from protocore.runtime.context.ledger import extract_identifiers
 from protocore.runtime.context.session_memory import (
     END_OF_SUMMARY_MARKER,
+    Coverage,
     SessionMemory,
+    SessionSummary,
     fold_source_tokens,
     render_ledger,
 )
@@ -168,10 +210,25 @@ _KEPT_LINE_MAX_CHARS: Final[int] = 400
 _KEPT_LINES_MAX: Final[int] = 40
 _ELLIPSIS: Final[str] = "…"
 
+#: The constants preparing a turn reads (masking and the token estimate). The
+#: cache is keyed on these and nothing else, so a change to an unrelated
+#: setting keeps every prepared turn.
+_PREPARATION_FIELDS: Final[tuple[str, ...]] = (
+    "session_seed_mask_min_chars",
+    "session_seed_mask_preview_chars",
+    "session_seed_mask_arg_max_chars",
+    "session_seed_mask_arg_preview_chars",
+    "token_count_chars_per_token_latin",
+    "token_count_chars_per_token_cyrillic",
+    "token_count_chars_per_token_cyrillic_json_escape",
+    "token_count_chars_per_token_cjk",
+    "token_count_chars_per_token_json_struct",
+    "token_count_image_tokens",
+    "token_estimate_calibration",
+)
+
 MessagePosition = Callable[[Message], int | None]
-"""Where a stored message sits in the session (the host's position, the same
-numbering as :attr:`SessionSummary.covered_through`); ``None`` when unknown,
-which makes the message's turn uncoverable."""
+"""Where a stored message sits in the session — see "Positions" above."""
 
 KeptLines = Callable[[ToolUseBlock | None, ToolResultBlock], Sequence[str]]
 """Lines of a tool result its placeholder must keep verbatim."""
@@ -195,10 +252,11 @@ class MaskingRule:
     turn holds no such call) and must be pure: the seed's prefix stability
     rests on a masked turn being the same bytes every time.
 
-    ``key`` names the rule for :class:`SeedCache`: two rules with the same
-    non-empty key must mask identically. An empty key keys the cache on the
-    two callables' identities, which is safe and simply misses when the host
-    builds the rule anew for every call.
+    ``key`` names what the rule does, for :class:`SeedCache`: two rules with
+    the same key must mask identically, and a rule whose behaviour depends on
+    configuration puts that configuration into its key. A rule with an empty
+    key is never cached — every call prepares its turns afresh — so it cannot
+    be served another rule's masking.
     """
 
     kept_lines: KeptLines
@@ -238,7 +296,7 @@ def default_masking_rule(rc: LoopConstants) -> MaskingRule:
                 identified += 1
         return kept
 
-    return MaskingRule(kept_lines=kept_lines, key=f"default|{'|'.join(prefixes)}|{limit}")
+    return MaskingRule(kept_lines=kept_lines, key=json.dumps(["default", list(prefixes), limit]))
 
 
 # ---------------------------------------------------------------------------
@@ -352,39 +410,85 @@ def _placeholder(
     return "\n".join(lines)
 
 
-def _mask_args(call: ToolUseBlock, rc: LoopConstants) -> ToolUseBlock:
-    """``call`` with string arguments past ``session_seed_mask_arg_max_chars`` cut to a head.
+class _NotFinite(ValueError):
+    """A number JSON cannot carry (``NaN``, ``Infinity``, or a float past the range)."""
 
-    Keys and shorter values stay as they are; the result is valid JSON. A
-    call whose arguments are not JSON, or that would not get shorter, is
-    returned unchanged.
+
+def _finite_float(token: str) -> float:
+    value = float(token)
+    if value in (float("inf"), float("-inf")):
+        raise _NotFinite(token)
+    return value
+
+
+def _reject_constant(token: str) -> Any:
+    raise _NotFinite(token)
+
+
+def _head(text: str, chars: int) -> str:
+    """The first ``chars`` characters, never ending on half of a surrogate pair."""
+    head = text[:chars]
+    if head and "\ud800" <= head[-1] <= "\udbff":
+        head = head[:-1]
+    return head
+
+
+def _mask_args(call: ToolUseBlock, rc: LoopConstants) -> ToolUseBlock:
+    """``call`` with its long arguments cut to a head — always valid JSON, never longer.
+
+    In the parsed arguments: a string longer than
+    ``session_seed_mask_arg_max_chars`` becomes its first
+    ``session_seed_mask_arg_preview_chars`` characters and the count of the
+    rest; a key that long is cut the same way (unless that would make two
+    keys equal); a list whose JSON is that long keeps its leading items up to
+    the preview and ends with one string counting the items not carried.
+    Shorter values (paths, ids) stay whole. Arguments that are not JSON, that
+    hold a number JSON cannot carry, or that masking would not make shorter
+    are returned unchanged. Output is compact JSON, so number spelling may
+    change (``1E2`` becomes ``100.0``) but nothing else does.
     """
     limit = rc.session_seed_mask_arg_max_chars
     raw = call.arguments_json
     if len(raw) <= limit:
         return call
     try:
-        parsed = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+        parsed = json.loads(raw, parse_float=_finite_float, parse_constant=_reject_constant)
+    except (_NotFinite, json.JSONDecodeError, TypeError, ValueError):
         return call
     preview = rc.session_seed_mask_arg_preview_chars
-    changed = False
+
+    def cut(text: str) -> str:
+        return f"{_head(text, preview)}{_ELLIPSIS} [{len(text)} characters, not carried]"
 
     def walk(value: Any) -> Any:
-        nonlocal changed
-        if isinstance(value, str) and len(value) > limit:
-            changed = True
-            return f"{value[:preview]}{_ELLIPSIS} [{len(value)} characters, not carried]"
+        if isinstance(value, str):
+            return cut(value) if len(value) > limit else value
         if isinstance(value, dict):
-            return {key: walk(item) for key, item in value.items()}
+            out: dict[str, Any] = {}
+            for key, item in value.items():
+                new_key = cut(key) if len(key) > limit else key
+                if new_key in out or (new_key != key and new_key in value):
+                    new_key = key
+                out[new_key] = walk(item)
+            return out
         if isinstance(value, list):
-            return [walk(item) for item in value]
+            items = [walk(item) for item in value]
+            if len(json.dumps(items, ensure_ascii=False, separators=(",", ":"))) <= limit:
+                return items
+            kept: list[Any] = []
+            used = 0
+            for item in items:
+                size = len(json.dumps(item, ensure_ascii=False, separators=(",", ":"))) + 1
+                if kept and used + size > preview:
+                    break
+                kept.append(item)
+                used += size
+            if len(kept) < len(items):
+                kept.append(f"[{len(items) - len(kept)} more items, not carried]")
+            return kept
         return value
 
-    masked = walk(parsed)
-    if not changed:
-        return call
-    text = json.dumps(masked, ensure_ascii=False)
+    text = json.dumps(walk(parsed), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     if len(text) >= len(raw):
         return call
     return call.model_copy(update={"arguments_json": text})
@@ -414,10 +518,14 @@ def _mask(
     preview: int,
     whole_turn: bool,
     kept_memo: dict[tuple[int, int], list[str]],
-) -> list[Message]:
-    """The masked (``whole_turn``) or cut (only the result text) form of a repaired turn."""
+) -> list[tuple[int, Message]]:
+    """The masked (``whole_turn``) or cut (only the result text) form of a repaired turn.
+
+    Each message comes with the index of the message of ``turn`` it stands for
+    (a message that is only reasoning is left out).
+    """
     answered = _pairing(turn)
-    out: list[Message] = []
+    out: list[tuple[int, Message]] = []
     for mi, message in enumerate(turn):
         if message.role is MessageRole.assistant and whole_turn:
             stripped = _strip_reasoning(message)
@@ -428,10 +536,10 @@ def _mask(
             )
             if any(new is not old for new, old in zip(blocks_a, stripped.content_blocks, strict=True)):
                 stripped = stripped.model_copy(update={"content_blocks": blocks_a})
-            out.append(stripped)
+            out.append((mi, stripped))
             continue
         if message.role is not MessageRole.tool:
-            out.append(message)
+            out.append((mi, message))
             continue
         blocks: list[Any] = []
         changed = False
@@ -472,7 +580,7 @@ def _mask(
                 )
             )
             changed = True
-        out.append(message.model_copy(update={"content_blocks": tuple(blocks)}) if changed else message)
+        out.append((mi, message.model_copy(update={"content_blocks": tuple(blocks)}) if changed else message))
     return out
 
 
@@ -493,7 +601,7 @@ def mask_turn(
     ``session_seed_mask_preview_chars``.
     """
     preview = rc.session_seed_mask_preview_chars if preview_chars is None else preview_chars
-    return _mask(turn, rc, rule, preview=preview, whole_turn=True, kept_memo={})
+    return [message for _, message in _mask(turn, rc, rule, preview=preview, whole_turn=True, kept_memo={})]
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +611,24 @@ def mask_turn(
 
 @dataclass(frozen=True, slots=True)
 class _Prepared:
+    """What masking and estimating one turn produced, independent of message identity.
+
+    ``masked`` lists, per message of the masked form, the index of the
+    repaired message it comes from and the replacement (``None`` when the
+    message is carried as it is). Materialising it against the turn being
+    seeded keeps each message's own metadata, so two identical turns never
+    share one another's.
+    """
+
+    masked: tuple[tuple[int, Message | None], ...]
+    full_tokens: int
+    masked_tokens: int
+    repaired_blocks: int
+    longest_result: int
+
+
+@dataclass(frozen=True, slots=True)
+class _Turn:
     full: tuple[Message, ...]
     masked: tuple[Message, ...]
     full_tokens: int
@@ -511,54 +637,77 @@ class _Prepared:
     longest_result: int
 
 
-class SeedCache:
-    """What preparing a session's turns produced, kept between calls — owned by the host.
+def _materialise(full: Sequence[Message], prepared: _Prepared) -> tuple[Message, ...]:
+    out: list[Message] = []
+    for index, replacement in prepared.masked:
+        source = full[index]
+        if replacement is None:
+            out.append(source)
+        elif replacement.metadata == source.metadata and replacement.created_at == source.created_at:
+            out.append(replacement)
+        else:
+            out.append(
+                replacement.model_copy(update={"metadata": dict(source.metadata), "created_at": source.created_at})
+            )
+    return tuple(out)
 
-    Keyed by a turn's identity (the host's ``identity`` of each message when
-    it gives one for all of them, otherwise a digest of the messages' content),
-    the masking rule's key and the configuration, so a changed turn, rule or
-    setting is simply not found. Holding one per session makes a run's seed
-    and fold plan cost proportional to the turns added since the previous
-    call. Bounded (``max_entries``, oldest dropped first). Not thread-safe:
-    one call at a time per cache, which the one-fold-per-session contract
-    gives anyway.
+
+class SeedCache:
+    """Prepared turns of one session, kept between calls — owned by the host.
+
+    Keyed by a digest of the turn's whole content (every message, every block;
+    not the messages' metadata or timestamps, which are re-applied from the
+    messages being seeded), by the masking rule's :attr:`MaskingRule.key`, and
+    by the constants preparation reads — so a changed message, rule or
+    relevant setting is simply not found, and an unrelated setting changes
+    nothing. A rule with an empty key is never cached.
+
+    Holding one per session makes a run's seed and fold plan cost
+    proportional to the turns added since the previous call. Each entry holds
+    the masked copies of one turn's changed messages (placeholders, cut
+    arguments — small) and four numbers; the full messages are not kept.
+    Bounded by ``max_entries`` (least recently used dropped first).
+    Thread-safe: one session's seed and fold plan may run at the same time on
+    different threads.
     """
 
-    def __init__(
-        self,
-        *,
-        identity: Callable[[Message], str | None] | None = None,
-        max_entries: int = MAX_SESSION_SEED_CACHE_ENTRIES,
-    ) -> None:
-        self._identity = identity
+    def __init__(self, *, max_entries: int = MAX_SESSION_SEED_CACHE_ENTRIES) -> None:
+        if max_entries <= 0:
+            raise ValueError("max_entries must be positive")
         self._max_entries = max_entries
         self._entries: OrderedDict[str, _Prepared] = OrderedDict()
+        self._lock = threading.Lock()
 
     def __len__(self) -> int:
-        return len(self._entries)
-
-    def _turn_key(self, turn: Sequence[Message], settings: str) -> str:
-        digest = hashlib.sha256(settings.encode())
-        ids = [self._identity(m) for m in turn] if self._identity is not None else []
-        if ids and all(ids):
-            for value in ids:
-                digest.update(b"\x00" + str(value).encode())
-        else:
-            for message in turn:
-                digest.update(b"\x01" + message.model_dump_json(exclude={"metadata", "created_at"}).encode())
-        return digest.hexdigest()
+        with self._lock:
+            return len(self._entries)
 
     def _get(self, key: str) -> _Prepared | None:
-        found = self._entries.get(key)
-        if found is not None:
-            self._entries.move_to_end(key)
-        return found
+        with self._lock:
+            found = self._entries.get(key)
+            if found is not None:
+                self._entries.move_to_end(key)
+            return found
 
     def _put(self, key: str, value: _Prepared) -> None:
-        self._entries[key] = value
-        self._entries.move_to_end(key)
-        while len(self._entries) > self._max_entries:
-            self._entries.popitem(last=False)
+        with self._lock:
+            self._entries[key] = value
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+
+def _turn_digest(turn: Sequence[Message], settings: str) -> str:
+    digest = hashlib.sha256(settings.encode())
+    for message in turn:
+        digest.update(b"\x00")
+        digest.update(message.model_dump_json(exclude={"metadata", "created_at"}).encode())
+    return digest.hexdigest()
+
+
+def _settings_key(rc: LoopConstants, rule: MaskingRule) -> str:
+    values = [getattr(rc, name) for name in _PREPARATION_FIELDS]
+    return json.dumps([rule.key, values])
 
 
 def _tokens(messages: Sequence[Message], rc: LoopConstants) -> int:
@@ -568,19 +717,30 @@ def _tokens(messages: Sequence[Message], rc: LoopConstants) -> int:
 class _Preparer:
     """Prepares turns for one call, estimating every message at most once."""
 
-    def __init__(self, rc: LoopConstants, rule: MaskingRule, cache: SeedCache) -> None:
+    def __init__(self, rc: LoopConstants, rule: MaskingRule, cache: SeedCache | None) -> None:
         self.rc = rc
         self.rule = rule
-        self.cache = cache
-        rule_key = rule.key or f"id:{id(rule.kept_lines)}:{id(rule.keep_whole)}"
-        self.settings = hashlib.sha256((rc.model_dump_json() + "\x00" + rule_key).encode()).hexdigest()
+        self.cache = cache if rule.key else None
+        self.settings = _settings_key(rc, rule)
 
-    def prepare(self, turn: Sequence[Message]) -> _Prepared:
-        key = self.cache._turn_key(turn, self.settings)
-        found = self.cache._get(key)
-        if found is not None:
-            return found
+    def prepare(self, turn: Sequence[Message]) -> _Turn:
         full, removed = repair_turn(turn)
+        key = _turn_digest(turn, self.settings) if self.cache is not None else ""
+        prepared = self.cache._get(key) if self.cache is not None else None
+        if prepared is None:
+            prepared = self._prepare(full, removed)
+            if self.cache is not None:
+                self.cache._put(key, prepared)
+        return _Turn(
+            full=tuple(full),
+            masked=_materialise(full, prepared),
+            full_tokens=prepared.full_tokens,
+            masked_tokens=prepared.masked_tokens,
+            repaired_blocks=prepared.repaired_blocks,
+            longest_result=prepared.longest_result,
+        )
+
+    def _prepare(self, full: list[Message], removed: int) -> _Prepared:
         masked = _mask(
             full,
             self.rc,
@@ -589,24 +749,27 @@ class _Preparer:
             whole_turn=True,
             kept_memo={},
         )
-        weights = {id(m): estimate_message_tokens(m, self.rc) for m in full}
-        masked_tokens = sum(
-            weights[id(m)] if id(m) in weights else estimate_message_tokens(m, self.rc) for m in masked
-        )
+        weights = [estimate_message_tokens(m, self.rc) for m in full]
+        entries: list[tuple[int, Message | None]] = []
+        masked_tokens = 0
+        for index, message in masked:
+            if message is full[index]:
+                entries.append((index, None))
+                masked_tokens += weights[index]
+            else:
+                entries.append((index, message))
+                masked_tokens += estimate_message_tokens(message, self.rc)
         longest = max(
             (len(b.content) for m in full for b in m.content_blocks if isinstance(b, ToolResultBlock)),
             default=0,
         )
-        prepared = _Prepared(
-            full=tuple(full),
-            masked=tuple(masked),
-            full_tokens=sum(weights.values()),
+        return _Prepared(
+            masked=tuple(entries),
+            full_tokens=sum(weights),
             masked_tokens=masked_tokens,
             repaired_blocks=removed,
             longest_result=longest,
         )
-        self.cache._put(key, prepared)
-        return prepared
 
 
 def _tag_seeded(message: Message) -> Message:
@@ -638,6 +801,10 @@ def _tag_seeded_reference(message: Message) -> Message:
     )
 
 
+def _block(text: str) -> list[Message]:
+    return [_tag_seeded_reference(Message(role=MessageRole.user, content_blocks=[TextBlock(text=text)]))]
+
+
 def _summary_body(text: str) -> str:
     return (
         "[Running summary of the earlier turns of this conversation that are "
@@ -645,15 +812,14 @@ def _summary_body(text: str) -> str:
     )
 
 
-_NOTHING_RECORDED: Final[str] = "(those turns added nothing that needed recording)"
+_NOTHING_RECORDED: Final[str] = "(the summary holds no entries for those turns)"
 
 
 def _summary_message(memory: SessionMemory, summarized_turns: int) -> list[Message]:
     text = memory.summary.render()
     if not text and summarized_turns <= 0:
         return []
-    body = _summary_body(text or _NOTHING_RECORDED)
-    return [_tag_seeded_reference(Message(role=MessageRole.user, content_blocks=[TextBlock(text=body)]))]
+    return _block(_summary_body(text or _NOTHING_RECORDED))
 
 
 def _summary_reserve(memory: SessionMemory, rc: LoopConstants) -> int:
@@ -665,19 +831,31 @@ def _summary_reserve(memory: SessionMemory, rc: LoopConstants) -> int:
     return cap + estimate_message_tokens(wrapper, rc)
 
 
-def _notice_message(dropped: int) -> list[Message]:
-    text = (
-        f"[{dropped} earlier turn{'s' if dropped != 1 else ''} of this conversation "
-        f"{'are' if dropped != 1 else 'is'} not available here and not in the summary.]"
-    )
-    return [_tag_seeded_reference(Message(role=MessageRole.user, content_blocks=[TextBlock(text=text)]))]
+def _notice_message(dropped: int, registry: bool, summary: bool) -> list[Message]:
+    parts: list[str] = []
+    if dropped:
+        parts.append(
+            f"{dropped} earlier turn{'s' if dropped != 1 else ''} of this conversation "
+            f"{'are' if dropped != 1 else 'is'} not in this context and not in the summary."
+        )
+    if summary:
+        parts.append("The summary of earlier turns is not in this context.")
+    if registry:
+        parts.append("The registry of files written in this conversation is not in this context.")
+    return _block(f"[{' '.join(parts)}]") if parts else []
 
 
 def _ledger_message(memory: SessionMemory) -> list[Message]:
     text = render_ledger(memory.ledger)
-    if not text:
-        return []
-    return [_tag_seeded_reference(Message(role=MessageRole.user, content_blocks=[TextBlock(text=text)]))]
+    return _block(text) if text else []
+
+
+def _known(turn: Sequence[Message], position: MessagePosition) -> list[int]:
+    return [p for m in turn if (p := position(m)) is not None]
+
+
+def _recorded(summary: SessionSummary, known: Sequence[int]) -> bool:
+    return bool(known) and summary.coverage is not None and all(summary.covers(p) for p in known)
 
 
 @dataclass(frozen=True, slots=True)
@@ -685,22 +863,14 @@ class _Layout:
     turns: list[list[Message]]
     fragment: int
     head: int
-    start: int
-    prepared: dict[int, _Prepared]
-
-
-def _head_count(turns: Sequence[list[Message]], prep: _Preparer) -> tuple[int, dict[int, _Prepared]]:
-    rc = prep.rc
-    count = 0
-    used = 0
-    prepared: dict[int, _Prepared] = {}
-    for index, turn in enumerate(turns[: rc.session_memory_head_protect_turns]):
-        prepared[index] = prep.prepare(turn)
-        if used + prepared[index].masked_tokens > rc.session_memory_head_max_tokens:
-            break
-        used += prepared[index].masked_tokens
-        count += 1
-    return count, {i: p for i, p in prepared.items() if i < count}
+    known: list[list[int]]
+    recorded: list[bool]
+    pre: list[int]
+    """Carried turns placed before the summary: the head, and unrecorded
+    turns older than the first recorded one."""
+    window: list[int]
+    summarized: int
+    prepared: dict[int, _Turn]
 
 
 def _layout(
@@ -710,16 +880,30 @@ def _layout(
     fragment = 0
     if turns and not opens_turn(turns[0][0]):
         fragment = len(turns.pop(0))
-    head, prepared = _head_count(turns, prep)
-    covered = 0
-    for turn in turns:
-        if not all(memory.summary.covers(position(m)) for m in turn):
+    rc = prep.rc
+    prepared: dict[int, _Turn] = {}
+    head = 0
+    used = 0
+    for index, turn in enumerate(turns[: rc.session_memory_head_protect_turns]):
+        prepared[index] = prep.prepare(turn)
+        if used + prepared[index].masked_tokens > rc.session_memory_head_max_tokens:
             break
-        covered += 1
-    start = max(head, covered)
-    for index in range(start, len(turns)):
-        prepared[index] = prep.prepare(turns[index])
-    return _Layout(turns, fragment, head, start, prepared)
+        used += prepared[index].masked_tokens
+        head += 1
+    known = [_known(turn, position) for turn in turns]
+    recorded = [_recorded(memory.summary, k) for k in known]
+    carried = [i for i in range(len(turns)) if i < head or not recorded[i]]
+    first_recorded = next((i for i in range(head, len(turns)) if recorded[i]), None)
+    if first_recorded is None:
+        pre = [i for i in carried if i < head]
+    else:
+        pre = [i for i in carried if i < first_recorded]
+    window = [i for i in carried if i not in set(pre)]
+    for index in carried:
+        if index not in prepared:
+            prepared[index] = prep.prepare(turns[index])
+    summarized = sum(1 for i in range(len(turns)) if recorded[i] and i >= head)
+    return _Layout(turns, fragment, head, known, recorded, pre, window, summarized, prepared)
 
 
 def mask_boundary(turn_count: int, rc: LoopConstants) -> int:
@@ -749,23 +933,28 @@ class SessionSeed:
     tokens: int = 0
     head_turns: int = 0
     summarized_turns: int = 0
-    """Turns between the head and the window: the summary stands for them."""
+    """Turns the summary records and the seed does not carry."""
     window_turns: int = 0
+    """Carried turns after the summary (the head and older unrecorded turns
+    before it are not counted here)."""
     full_turns: int = 0
     trimmed_turns: int = 0
     """Newest turns carried with result text cut to fit rather than masked."""
     masked_turns: int = 0
     dropped_turns: int = 0
-    """Uncovered turns left out because ``drop_uncovered`` allowed it; a notice says so."""
+    """Unrecorded turns left out to fit the budget; the notice says how many."""
+    dropped_summary: bool = False
+    dropped_registry: bool = False
     repaired_blocks: int = 0
     """Unpaired tool calls / results taken out of carried turns."""
     fragment_messages: int = 0
     """Messages before the session's first user message, not carried."""
     over_budget_tokens: int = 0
+    """Above zero only when the budget cannot hold even the notice."""
 
 
 def _fit_preview(
-    prepared: _Prepared, room: int, rc: LoopConstants, rule: MaskingRule
+    turn: _Turn, room: int, rc: LoopConstants, rule: MaskingRule
 ) -> tuple[tuple[Message, ...], int] | None:
     """The newest turn with result text cut to the longest head that fits ``room``.
 
@@ -773,21 +962,19 @@ def _fit_preview(
     when not even the shortest head fits.
     """
     low = rc.session_seed_mask_preview_chars
-    if prepared.longest_result <= low:
+    if turn.longest_result <= low:
         return None
     memo: dict[tuple[int, int], list[str]] = {}
-    weights = {id(m): estimate_message_tokens(m, rc) for m in prepared.full}
+    weights = {id(m): estimate_message_tokens(m, rc) for m in turn.full}
 
     def weight(messages: Sequence[Message]) -> int:
-        return sum(
-            weights[id(m)] if id(m) in weights else estimate_message_tokens(m, rc) for m in messages
-        )
+        return sum(weights[id(m)] if id(m) in weights else estimate_message_tokens(m, rc) for m in messages)
 
     best: tuple[tuple[Message, ...], int] | None = None
-    high = prepared.longest_result - 1
+    high = turn.longest_result - 1
     while low <= high:
         mid = (low + high) // 2
-        cut = tuple(_mask(prepared.full, rc, rule, preview=mid, whole_turn=False, kept_memo=memo))
+        cut = tuple(m for _, m in _mask(turn.full, rc, rule, preview=mid, whole_turn=False, kept_memo=memo))
         cost = weight(cut)
         if cost <= room:
             best = (cut, cost)
@@ -806,61 +993,33 @@ def build_session_seed(
     position: MessagePosition,
     rule: MaskingRule | None = None,
     cache: SeedCache | None = None,
-    drop_uncovered: bool = False,
 ) -> SessionSeed:
     """The seed to put in front of a run's new task — PURE, CPU-bound.
 
     ``history`` is the session's earlier messages as stored, oldest first,
-    without the new run's. ``position`` gives each its session position: a
-    turn is left to the summary only when the summary's
-    :attr:`~SessionSummary.covered_through` reaches every message of it, and
-    coverage is a prefix, so the first turn it does not reach ends it. ``rule``
-    is the masking rule (:func:`default_masking_rule` when ``None``); ``cache``
-    the session's :class:`SeedCache`. ``budget`` is the token budget of the
-    seed; see the module docstring for the layout and for what is stable
-    across runs.
+    without the new run's. ``position`` gives each its session position (see
+    "Positions" in the module docstring). ``rule`` is the masking rule
+    (:func:`default_masking_rule` when ``None``); ``cache`` the session's
+    :class:`SeedCache`. ``budget`` is the token budget of the seed.
 
-    Under budget pressure, in order: the older full turns are masked, then the
-    newest turn's result text is cut to the longest head that fits (its images
-    stay), then it is masked. A seed still over budget is returned as it is,
-    with ``over_budget_tokens`` set — unless ``drop_uncovered``, when window
-    turns are left out oldest first (never the head, never the newest turn)
-    and one notice says how many; that is for a session whose summary was
-    lost and whose turns would otherwise all be carried far past the budget.
-
-    An empty memory and an empty history give an empty seed, so a session's
-    first run is exactly a cold start.
+    The seed's estimated size never exceeds ``budget`` (unless the budget
+    cannot hold even the notice): see the module docstring for the layout,
+    the order in which content gives way, and what is stable across runs. An
+    empty memory and an empty history give an empty seed, so a session's first
+    run is exactly a cold start.
     """
     rule = rule or default_masking_rule(rc)
-    prep = _Preparer(rc, rule, cache if cache is not None else SeedCache())
+    prep = _Preparer(rc, rule, cache)
     layout = _layout(history, memory, position, prep)
-    turns, head, start, prepared = layout.turns, layout.head, layout.start, layout.prepared
+    turns, prepared = layout.turns, layout.prepared
     if not turns and memory.is_empty():
         return SessionSeed(fragment_messages=layout.fragment)
 
-    count = len(turns)
-    boundary = mask_boundary(count, rc)
-    carried = [*range(head), *range(start, count)]
+    boundary = mask_boundary(len(turns), rc)
+    carried = [*layout.pre, *layout.window]
     forms: dict[int, tuple[Message, ...]] = {}
     weights: dict[int, int] = {}
     state: dict[int, str] = {}
-    for index in carried:
-        if index >= boundary:
-            forms[index], weights[index], state[index] = prepared[index].full, prepared[index].full_tokens, "full"
-        else:
-            forms[index], weights[index], state[index] = (
-                prepared[index].masked,
-                prepared[index].masked_tokens,
-                "masked",
-            )
-
-    summarized = max(0, start - head)
-    summary = _summary_message(memory, summarized)
-    ledger = _ledger_message(memory)
-    fixed = _tokens(summary, rc) + _tokens(ledger, rc)
-
-    def total() -> int:
-        return fixed + sum(weights[i] for i in carried)
 
     def mask(index: int) -> None:
         forms[index], weights[index], state[index] = (
@@ -868,6 +1027,24 @@ def build_session_seed(
             prepared[index].masked_tokens,
             "masked",
         )
+
+    for index in carried:
+        if index >= boundary:
+            forms[index], weights[index], state[index] = prepared[index].full, prepared[index].full_tokens, "full"
+        else:
+            mask(index)
+
+    summary = _summary_message(memory, layout.summarized)
+    ledger = _ledger_message(memory)
+    dropped: list[int] = []
+    drop_summary = drop_registry = False
+
+    def notice() -> list[Message]:
+        return _notice_message(len(dropped), drop_registry, drop_summary)
+
+    def total() -> int:
+        blocks = ([] if drop_summary else summary) + ([] if drop_registry else ledger) + notice()
+        return _tokens(blocks, rc) + sum(weights[i] for i in carried)
 
     full_indices = [i for i in carried if state[i] == "full"]
     for index in full_indices[:-1]:
@@ -884,35 +1061,41 @@ def build_session_seed(
         else:
             mask(newest)
 
-    dropped = 0
-    notice: list[Message] = []
-    if drop_uncovered:
-        for index in [i for i in carried if i >= start][:-1]:
-            if total() + _tokens(notice, rc) <= budget:
+    if carried and total() > budget:
+        newest_index = max(carried)
+        order = [i for i in layout.window if i != newest_index] + [i for i in layout.pre if i != newest_index]
+        for index in [*order, newest_index]:
+            if total() <= budget:
                 break
             carried.remove(index)
-            dropped += 1
-            notice = _notice_message(dropped)
+            dropped.append(index)
+    if total() > budget and ledger:
+        drop_registry = True
+    if total() > budget and summary:
+        drop_summary = True
 
+    kept = set(carried)
     messages = (
-        [_tag_seeded(m) for i in carried if i < head for m in forms[i]]
-        + summary
-        + notice
-        + [_tag_seeded(m) for i in carried if i >= start for m in forms[i]]
-        + ledger
+        [_tag_seeded(m) for i in layout.pre if i in kept for m in forms[i]]
+        + ([] if drop_summary else summary)
+        + notice()
+        + [_tag_seeded(m) for i in layout.window if i in kept for m in forms[i]]
+        + ([] if drop_registry else ledger)
     )
-    tokens = total() + _tokens(notice, rc)
+    tokens = total()
     kinds = [state[i] for i in carried]
     return SessionSeed(
         messages=messages,
         tokens=tokens,
-        head_turns=head,
-        summarized_turns=summarized,
-        window_turns=sum(1 for i in carried if i >= start),
+        head_turns=layout.head,
+        summarized_turns=layout.summarized,
+        window_turns=sum(1 for i in layout.window if i in kept),
         full_turns=kinds.count("full"),
         trimmed_turns=kinds.count("trimmed"),
         masked_turns=kinds.count("masked"),
-        dropped_turns=dropped,
+        dropped_turns=len(dropped),
+        dropped_summary=drop_summary,
+        dropped_registry=drop_registry,
         repaired_blocks=sum(prepared[i].repaired_blocks for i in carried),
         fragment_messages=layout.fragment,
         over_budget_tokens=max(0, tokens - budget),
@@ -926,28 +1109,33 @@ def build_session_seed(
 
 @dataclass(frozen=True, slots=True)
 class FoldPlan:
-    """Which turns a summary fold must cover now, and the numbers behind it."""
+    """Which turns a summary fold must record now, and the numbers behind it."""
 
     turns: tuple[tuple[Message, ...], ...] = ()
     """The turns to fold, oldest first, as stored. Empty: make no call."""
     source: tuple[tuple[Message, ...], ...] = ()
-    """The same turns in the masked form the seed carried them in: what the
+    """The same turns in the masked form the seed carries them in: what the
     summariser is shown (:func:`build_summary_delta_request`)."""
-    covers_through: int | None = None
-    """The session position of the last message of the planned turns — the
-    coverage :func:`fold_run` records with the delta."""
+    coverage: Coverage | None = None
+    """The session positions of the planned turns — what :func:`fold_run`
+    records with the delta."""
     projected_tokens: int = 0
     """The next seed, as the planner sized it, before the fold."""
     remaining_tokens: int = 0
     """The same after the fold lands."""
     fresh_tokens: int = 0
-    """What the planner kept for the newest full turns (their full size when
-    the budget can hold them, otherwise their masked size)."""
+    """What the planner kept for the newest full turns."""
+    newest_counted_full: bool = False
+    """The newest turns were counted at their full size (False: masked,
+    because counting them in full would fold on every run)."""
     trigger_tokens: int = 0
-    target_tokens: int = 0
+    goal_tokens: int = 0
+    """What the fold brings the seed down to."""
     deferred_turns: int = 0
-    """Turns the target asked for that the source budget, or a message with no
-    known position, left to a later fold."""
+    """Turns the goal asked for that ``max_source_tokens`` left to a later fold."""
+    backlog_turns: int = 0
+    """Unrecorded foldable turns older than the newest full turns, this plan
+    included — the catch-up still owed."""
 
     @property
     def needed(self) -> bool:
@@ -964,9 +1152,7 @@ class FoldPlan:
         return [m for turn in self.source for m in turn]
 
 
-def _fresh_hold(
-    fresh: Sequence[_Prepared], fixed: int, budget: int
-) -> int:
+def _fresh_hold(fresh: Sequence[_Turn], fixed: int, budget: int) -> int:
     """What the seed would carry for the full candidates with nothing older in front."""
     weights = [p.full_tokens for p in fresh]
     for index in range(len(fresh) - 1):
@@ -994,75 +1180,97 @@ def plan_session_fold(
     Called after a run, with ``history`` the session's stored messages
     INCLUDING that run's — exactly what the next seed will be built from —
     and the same ``position``, ``rule``, ``cache`` and base ``budget`` the
-    seed uses. Sizes the next seed: the head (masked), the summary at
-    ``session_memory_running_summary_token_cap`` plus its wrapper (its
-    current size when the cap is off), the registry, every older window turn
-    masked, and the newest full turns at their full size when the budget can
-    hold them with nothing older in front (masked otherwise). Above
-    ``session_seed_fold_trigger_ratio`` of ``budget`` the oldest older window
-    turns are planned until the rest fits ``session_seed_fold_target_ratio``;
-    the head and the full turns are never planned.
+    seed uses. See "When a fold is needed" in the module docstring for how the
+    next seed is sized and when the newest turn is counted in full.
 
-    A planned turn must have a known position for every message (coverage is
-    recorded by position); the plan stops before the first that does not.
-    ``max_source_tokens`` (0 = unbounded) bounds what one summariser call is
-    shown, measured as it will be rendered; the plan stops before the turn
-    that would pass it, but always takes at least one. The turns it leaves
-    stay uncovered and are carried; the next plan picks them up.
+    The turns planned are always the oldest unrecorded turns that can be
+    recorded (not the head, not the newest full turns, at least one known
+    position), in order, so the coverage they add joins the summary's range
+    without a gap. ``max_source_tokens`` (0 = unbounded) bounds what one
+    summariser call is shown, measured as it will be rendered: the plan stops
+    before the turn that would pass it, but always takes at least one turn,
+    and always every unrecorded turn older than the summary's range (a lapsed
+    head) so the range stays whole.
+
+    Convergence: every plan that is needed records at least one turn, and the
+    turns it leaves stay counted, so a backlog of B source tokens (after a
+    reset, a run of failed folds, or turns left out of the seed) is recorded
+    within ``ceil(B / max_source_tokens)`` successful folds; a host that
+    plans again right after a fold lands catches up within one run.
     """
     rule = rule or default_masking_rule(rc)
-    prep = _Preparer(rc, rule, cache if cache is not None else SeedCache())
+    prep = _Preparer(rc, rule, cache)
     layout = _layout(history, memory, position, prep)
-    turns, head, start, prepared = layout.turns, layout.head, layout.start, layout.prepared
+    turns, prepared, head = layout.turns, layout.prepared, layout.head
     count = len(turns)
-    boundary = max(mask_boundary(count, rc), count - max(1, rc.session_seed_full_turns), start)
+    boundary = max(mask_boundary(count, rc), count - max(1, rc.session_seed_full_turns))
+    carried = [*layout.pre, *layout.window]
     fixed = (
-        sum(prepared[i].masked_tokens for i in range(head))
+        sum(prepared[i].masked_tokens for i in carried if i < head)
         + _summary_reserve(memory, rc)
         + _tokens(_ledger_message(memory), rc)
     )
-    older = [i for i in range(start, count) if i < boundary]
-    fresh = [prepared[i] for i in range(boundary, count)]
-    fresh_tokens = _fresh_hold(fresh, fixed, budget)
-    projected = fixed + sum(prepared[i].masked_tokens for i in older) + fresh_tokens
+    fresh = [i for i in carried if i >= boundary and i >= head]
+    older = [i for i in carried if i >= head and i not in set(fresh) and layout.known[i]]
+    hold_full = _fresh_hold([prepared[i] for i in fresh], fixed, budget)
+    hold_masked = sum(prepared[i].masked_tokens for i in fresh)
     trigger = int(budget * rc.session_seed_fold_trigger_ratio)
     target = int(budget * rc.session_seed_fold_target_ratio)
-    if projected <= trigger:
-        return FoldPlan(
-            projected_tokens=projected,
-            remaining_tokens=projected,
-            fresh_tokens=fresh_tokens,
-            trigger_tokens=trigger,
-            target_tokens=target,
-        )
-    wanted: list[int] = []
-    remaining = projected
-    for index in older:
-        if remaining <= target:
-            break
-        wanted.append(index)
-        remaining -= prepared[index].masked_tokens
+    # Each run turns the newest turn into an older, masked one; room for
+    # that many of them below the trigger is what keeps folds apart.
+    spacing = rc.session_seed_fold_min_turns_between * hold_masked
+    counted_full = bool(fresh) and fixed + hold_full + spacing <= trigger
+    if counted_full:
+        fresh_tokens, goal = hold_full, max(target, fixed + hold_full)
+    else:
+        fresh_tokens, goal = hold_masked, target
+    projected = fixed + sum(prepared[i].masked_tokens for i in older) + fresh_tokens
+    base = FoldPlan(
+        projected_tokens=projected,
+        remaining_tokens=projected,
+        fresh_tokens=fresh_tokens,
+        newest_counted_full=counted_full,
+        trigger_tokens=trigger,
+        goal_tokens=goal,
+        backlog_turns=len(older),
+    )
+    if projected <= trigger or not older:
+        return base
+    coverage = memory.summary.coverage
+    mandatory = {i for i in older if coverage is not None and max(layout.known[i]) < coverage.first}
     chosen: list[int] = []
+    remaining = projected
     source_tokens = 0
-    for index in wanted:
-        if any(position(m) is None for m in turns[index]):
+    wanted = 0
+    for index in older:
+        if remaining <= goal and index not in mandatory:
             break
+        wanted += 1
         weight = fold_source_tokens(prepared[index].masked, rc)
-        if chosen and max_source_tokens > 0 and source_tokens + weight > max_source_tokens:
+        over = max_source_tokens > 0 and source_tokens + weight > max_source_tokens
+        if chosen and over and index not in mandatory:
             break
         chosen.append(index)
         source_tokens += weight
-    covers = max((p for i in chosen for m in turns[i] if (p := position(m)) is not None), default=None)
+        remaining -= prepared[index].masked_tokens
+    if not chosen:
+        return base
+    positions = [p for i in chosen for p in layout.known[i]]
+    deferred = 0
+    if remaining > goal:
+        deferred = sum(1 for i in older if i not in set(chosen))
     return FoldPlan(
         turns=tuple(tuple(turns[i]) for i in chosen),
         source=tuple(prepared[i].masked for i in chosen),
-        covers_through=covers,
+        coverage=Coverage(min(positions), max(positions)),
         projected_tokens=projected,
-        remaining_tokens=projected - sum(prepared[i].masked_tokens for i in chosen),
+        remaining_tokens=remaining,
         fresh_tokens=fresh_tokens,
+        newest_counted_full=counted_full,
         trigger_tokens=trigger,
-        target_tokens=target,
-        deferred_turns=len(wanted) - len(chosen),
+        goal_tokens=goal,
+        deferred_turns=deferred,
+        backlog_turns=len(older),
     )
 
 
