@@ -973,6 +973,28 @@ class LoopConstants(BaseModel):
             "off, or a reasoning model can spend the bound before it writes."
         ),
     )
+    session_memory_registry_max_tokens: int = Field(
+        default=2000,
+        ge=0,
+        description=(
+            "Ceiling, in estimated tokens, on the artifact registry block a "
+            "seed carries (the files the session wrote, with their last "
+            "content). Over it, snapshots give way oldest file first: to the "
+            "path, the size and a short head, then to the path alone, then "
+            "the oldest paths are counted instead of listed. The fold planner "
+            "reserves this much of the seed budget for the registry, so it is "
+            "also what keeps a coding session's files from making every run "
+            "fold. 0 carries no registry."
+        ),
+    )
+    session_memory_registry_head_chars: int = Field(
+        default=240,
+        ge=0,
+        description=(
+            "Characters of a file's content the registry keeps when the "
+            "snapshot no longer fits session_memory_registry_max_tokens."
+        ),
+    )
     session_memory_head_protect_turns: int = Field(
         default=1,
         ge=0,
@@ -1103,6 +1125,44 @@ class LoopConstants(BaseModel):
             "grown. 1 keeps the newest turn uncut whenever that costs at most "
             "a fold every second run; larger values fold less often and cut "
             "large newest turns more often."
+        ),
+    )
+    session_seed_fold_cuts_before_pin: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "Consecutive folds of one single turn that may come back cut off "
+            "at the output bound before that turn is pinned: recorded in the "
+            "summary's range as not summarised and carried masked from then "
+            "on, with no further summariser call for it. The planner halves "
+            "its batch for every consecutive fold that did not land, so a "
+            "summariser that keeps being cut reaches one turn per fold first."
+        ),
+    )
+    session_seed_budget_ratio: float = Field(
+        default=0.75,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Share of the room between the run's fixed overhead (system "
+            "prompt, tools, preludes, the new task) and the compaction "
+            "trigger that recommend_seed_budget gives the seed. The rest is "
+            "the run's own room. The seed's newest full turns are tagged so "
+            "that in-run compaction re-masks them first, to exactly the form "
+            "the next seed would carry, which hands the run their full minus "
+            "masked size back before it touches the run's own work; so the "
+            "seed can carry the previous turn uncut without starving a run "
+            "that does new tool work."
+        ),
+    )
+    session_seed_run_reserve_min_tokens: int = Field(
+        default=6000,
+        ge=0,
+        description=(
+            "Least room, in estimated tokens, that recommend_seed_budget "
+            "leaves between the seed and the compaction trigger for the run's "
+            "own work, before what re-masking the seeded newest turn hands "
+            "back."
         ),
     )
     session_seed_fold_target_ratio: float = Field(

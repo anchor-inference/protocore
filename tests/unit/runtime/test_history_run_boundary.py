@@ -677,6 +677,10 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "folds the sequence it is handed into durable session memory; it "
         "reaches no engine and does no scoping of its own"
     ),
+    "protocore/runtime/context/compaction.py::remask_seeded_turns": _whole(
+        "puts the masked form of every seeded message that carries one in place; "
+        "the tag it reads is written only on a seed's newest unmasked turns"
+    ),
     "protocore/runtime/context/session_seed.py::split_turns": _whole(
         "splits the stored session messages it is handed into turns; it "
         "reaches no engine"
@@ -697,9 +701,6 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "splits the stored session messages it is handed into turns and "
         "asks the summary's coverage of each"
     ),
-    "protocore/runtime/context/session_seed.py::_known": _whole(
-        "reads the positions of the one stored turn it is handed"
-    ),
     "protocore/runtime/context/session_seed.py::_materialise": _whole(
         "rebuilds the masked form of the one stored turn it is handed"
     ),
@@ -713,8 +714,21 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/context/session_seed.py::_Preparer.prepare": _whole(
         "prepares the one stored turn it is handed"
     ),
-    "protocore/runtime/context/session_seed.py::_turn_digest": _whole(
-        "digests the one stored turn it is handed"
+    "protocore/runtime/context/session_seed.py::_known_positions": _whole(
+        "reads the positions of the stored turns it is handed, in order"
+    ),
+    "protocore/runtime/context/session_seed.py::_tag_masked_form": _whole(
+        "tags the one carried turn it is handed"
+    ),
+    "protocore/runtime/context/session_seed.py::_text_only": _whole(
+        "reduces the one stored turn it is handed to its words"
+    ),
+    "protocore/runtime/context/session_seed.py::build_session_seed.cost": _Declaration(
+        reason="measures a synthetic seed block (summary, notice or registry) it is handed",
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
+    "protocore/runtime/context/session_seed.py::_ensure_encodable": _whole(
+        "rewrites the seed messages it is handed so that each encodes"
     ),
     "protocore/runtime/context/session_seed.py::_pairing": _whole(
         "pairs the tool calls and results of the one turn it is handed"

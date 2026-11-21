@@ -20,8 +20,11 @@ from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     COMPACTION_REFERENCE_METADATA_KEY,
     COMPACTION_SUMMARY_METADATA_KEY,
+    IMAGE_REFS_METADATA_KEY,
     SESSION_HISTORY_SEED_METADATA_KEY,
+    SESSION_SEED_MASKED_FORM_METADATA_KEY,
     CompactionSourceRef,
+    ImageRefBlock,
     Message,
     MessageRole,
     TextBlock,
@@ -38,6 +41,7 @@ from protocore.runtime.context.session_memory import (
     END_OF_SUMMARY_MARKER,
     ArtifactLedger,
     Coverage,
+    CoverageStep,
     SessionMemory,
     SessionSummary,
     SummaryDelta,
@@ -46,15 +50,18 @@ from protocore.runtime.context.session_memory import (
     fold_source_tokens,
 )
 from protocore.runtime.context.session_seed import (
+    CUT_ARGUMENT_SUFFIX,
     MaskingRule,
     SeedCache,
     SessionSeed,
     build_session_seed,
     default_masking_rule,
+    has_cut_marker,
     mask_boundary,
     mask_turn,
     opens_turn,
     plan_session_fold,
+    recommend_seed_budget,
     repair_turn,
     split_turns,
 )
@@ -587,7 +594,7 @@ def test_head_protection_off() -> None:
 
 def test_no_fold_while_the_seed_fits() -> None:
     plan = plan_session_fold(_session(*(_turn(i, result_chars=2000) for i in range(3))), SessionMemory(turn_index=3), BUDGET, RC, position=_position)
-    assert not plan.needed and plan.messages == [] and plan.coverage is None
+    assert not plan.needed and plan.messages == [] and plan.step is None
     assert plan.projected_tokens <= plan.trigger_tokens
 
 
@@ -603,7 +610,7 @@ def test_fold_plans_oldest_window_turns_and_spares_head_and_newest() -> None:
     numbers = [int(t[0].text.split()[1].rstrip(":")) for t in plan.turns]
     assert numbers == list(range(1, 1 + len(numbers)))
     assert 13 not in numbers
-    assert plan.coverage == Coverage(_position(plan.turns[0][0]) or 0, _position(plan.turns[-1][-1]) or 0)
+    assert plan.step is not None and plan.step.after == Coverage(_position(plan.turns[0][0]) or 0, _position(plan.turns[-1][-1]) or 0)
 
 
 def test_the_fold_is_shown_what_the_seed_carried_including_kept_lines() -> None:
@@ -633,7 +640,7 @@ def test_a_turn_without_positions_does_not_stop_later_turns_from_folding() -> No
     plan = plan_session_fold(history, memory, BUDGET, RC, position=_position)
     numbers = [int(t[0].text.split()[1].rstrip(":")) for t in plan.turns]
     assert numbers[:3] == [1, 3, 4]
-    memory = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("r",)}), RC, coverage=plan.coverage).memory
+    memory = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("r",)}), RC, step=plan.step).memory
     again = plan_session_fold(history, memory, BUDGET, RC, position=_position)
     assert not again.needed or all(t[0].text != history[size * 2].text for t in again.turns)
     seed = build_session_seed(history, memory, BUDGET, RC, position=_position)
@@ -647,7 +654,7 @@ def test_the_plan_keeps_room_for_the_newest_turn_uncut() -> None:
     memory = SessionMemory(turn_index=9)
     plan = plan_session_fold(history, memory, BUDGET, RC, position=_position)
     assert plan.needed and plan.fresh_tokens > 5000
-    memory = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("x" * 400,) * 1}), RC, coverage=plan.coverage).memory
+    memory = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("x" * 400,) * 1}), RC, step=plan.step).memory
     seed = build_session_seed(history, memory, BUDGET, RC, position=_position)
     assert seed.full_turns == 1 and seed.trimmed_turns == 0
     assert seed.summarized_turns == len(plan.turns)
@@ -664,7 +671,7 @@ def test_the_summary_reserve_includes_its_wrapper() -> None:
 
     capped, _, _ = cap_summary(full, rc)
     memory = SessionMemory(summary=capped, turn_index=1)
-    carried = sum(estimate_message_tokens(m, rc) for m in _summary_message(memory, 1))
+    carried = sum(estimate_message_tokens(m, rc) for m in _summary_message(memory, 1, 0))
     assert _summary_reserve(memory, rc) >= carried
 
 
@@ -692,7 +699,7 @@ def _simulate(rc: LoopConstants, runs: int, *, budget: int = BUDGET, seed: int =
         history = [*history, *turn]
         plan = plan_session_fold(history, memory, budget, rc, position=_position, cache=cache)
         delta = SummaryDelta(entries={"KEY FACTS & IDENTIFIERS": (f"fact from fold at run {run}",)}) if plan.needed else None
-        memory = fold_run(memory, turn, delta, rc, coverage=plan.coverage).memory
+        memory = fold_run(memory, turn, delta, rc, step=plan.step).memory
         landed = plan.needed
     return seeds, folded_before, turns
 
@@ -960,6 +967,15 @@ def test_a_cut_argument_never_splits_a_character() -> None:
     assert json.loads(out)["body"].startswith("\U0001f600" * 7 + "…")
 
 
+def test_an_escaped_lone_surrogate_in_arguments_is_left_escaped() -> None:
+    raw = '{"content": "\\ud83d' + "x" * 2000 + '"}'
+    out = _masked_args(raw)
+    out.encode("utf-8")
+    assert out == raw
+    head_only = '{"content": "' + "y" * 2000 + '\\ud83d"}'
+    _masked_args(head_only).encode("utf-8")
+
+
 def test_argument_masking_never_makes_the_call_longer() -> None:
     fields = {f"f{i}": i for i in range(300)}
     fields["body"] = "z" * 401
@@ -980,7 +996,7 @@ def test_a_head_whose_protection_lapses_is_carried_and_then_folded_never_lost() 
     memory = SessionMemory(turn_index=14)
     plan = plan_session_fold(history, memory, BUDGET, RC, position=_position)
     assert plan.needed and plan.turns[0][0].text.startswith("question 1")
-    memory = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("r",)}), RC, coverage=plan.coverage).memory
+    memory = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("r",)}), RC, step=plan.step).memory
     assert memory.summary.coverage is not None and memory.summary.coverage.first == len(_turn(0))
     for lapsed in (LoopConstants(session_memory_head_protect_turns=0), LoopConstants(session_memory_head_max_tokens=10)):
         seed = build_session_seed(history, memory, BUDGET, lapsed, position=_position)
@@ -990,27 +1006,30 @@ def test_a_head_whose_protection_lapses_is_carried_and_then_folded_never_lost() 
         again = plan_session_fold(history, memory, BUDGET, lapsed, position=_position)
         if again.needed:
             assert again.turns[0][0].text.startswith("question 0")
-            folded = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("q0",)}), lapsed, coverage=again.coverage).memory
+            folded = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("q0",)}), lapsed, step=again.step).memory
             assert folded.summary.coverage is not None and folded.summary.coverage.first == 0
 
 
-def test_lapsed_head_turns_are_folded_together_so_the_range_never_spans_an_unrecorded_turn() -> None:
+def test_lapsed_head_turns_are_folded_nearest_first_within_the_source_bound_and_never_leave_a_gap() -> None:
     two_heads = LoopConstants(session_memory_head_protect_turns=2)
     history = _session(*(_turn(i) for i in range(14)))
     memory = SessionMemory(turn_index=14)
     plan = plan_session_fold(history, memory, BUDGET, two_heads, position=_position)
     assert plan.turns[0][0].text.startswith("question 2")
-    memory = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("r",)}), two_heads, coverage=plan.coverage).memory
+    memory = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("r",)}), two_heads, step=plan.step).memory
     for i in range(14, 22):
         history = [*history, *_stamp(_turn(i), len(history))]
     lapsed = LoopConstants(session_memory_head_protect_turns=0)
-    again = plan_session_fold(history, memory, BUDGET, lapsed, position=_position, max_source_tokens=1)
-    assert again.needed
-    assert [t[0].text.split(":")[0] for t in again.turns[:2]] == ["question 0", "question 1"]
-    memory = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("q",)}), lapsed, coverage=again.coverage).memory
-    seed = build_session_seed(history, memory, 400_000, lapsed, position=_position)
-    carried = sum(1 for m in seed.messages if m.text.startswith("question"))
-    assert carried + seed.summarized_turns == 22
+    seen: list[str] = []
+    for _ in range(3):
+        again = plan_session_fold(history, memory, BUDGET, lapsed, position=_position, max_source_tokens=1)
+        assert again.needed and len(again.turns) == 1  # the source bound holds, lapsed turns too
+        seen.append(again.turns[0][0].text.split(":")[0])
+        memory = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("q",)}), lapsed, step=again.step).memory
+        seed = build_session_seed(history, memory, 400_000, lapsed, position=_position)
+        carried = sum(1 for m in seed.messages if m.text.startswith("question"))
+        assert carried + seed.summarized_turns == 22  # nothing in neither place, at every step
+    assert seen[:2] == ["question 1", "question 0"]
 
 
 # --- convergence -----------------------------------------------------------------------
@@ -1032,7 +1051,7 @@ def _fold_rate(result_chars: int, runs: int = 20) -> tuple[int, int, list[int]]:
         if plan.needed:
             folds.append(run)
         delta = SummaryDelta(entries={"KEY FACTS & IDENTIFIERS": (f"fact {run}",)}) if plan.needed else None
-        memory = fold_run(memory, turn, delta, RC, coverage=plan.coverage).memory
+        memory = fold_run(memory, turn, delta, RC, step=plan.step).memory
     return len(folds), cut, folds
 
 
@@ -1070,6 +1089,261 @@ def test_after_a_reset_every_seed_fits_and_the_backlog_is_folded_in_bounded_batc
         if not plan.needed:
             break
         assert fold_source_tokens(plan.source_messages, RC) <= source or len(plan.turns) == 1
-        memory = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": (f"batch {runs}",)}), RC, coverage=plan.coverage).memory
+        memory = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": (f"batch {runs}",)}), RC, step=plan.step).memory
     assert runs <= bound
     assert build_session_seed(history, memory, BUDGET, RC, position=_position, cache=cache).dropped_turns == 0
+
+
+# --- round-three behaviour ------------------------------------------------------------
+
+
+def test_the_cut_marker_is_exported_and_recognised() -> None:
+    body = "x = 1\n" * 4000
+    turn = [_user("q"), _calls(("w", "Write", {"path": "/srv/a.py", "content": body})), _results(("w", "ok")), _assistant("a")]
+    call = mask_turn(turn, RC, default_masking_rule(RC))[1].content_blocks[0]
+    assert isinstance(call, ToolUseBlock)
+    content = json.loads(call.arguments_json)["content"]
+    assert content.endswith(CUT_ARGUMENT_SUFFIX) and has_cut_marker(content)
+    assert not has_cut_marker(body) and not has_cut_marker("[many characters, not carried]")
+    assert has_cut_marker(json.loads(_masked_args(json.dumps({"items": [f"short {i}" for i in range(400)]})))["items"][-1])
+
+
+def test_two_turns_that_differ_only_in_an_attached_image_are_not_confused_by_the_cache() -> None:
+    images = [ImageRefBlock(blob_ref=f"img-{k}").model_dump(mode="json") for k in range(8)]
+    plain = [_user("what is in the picture?"), _assistant("A cat.")]
+    with_images = [plain[0].model_copy(update={"metadata": {IMAGE_REFS_METADATA_KEY: images}}), plain[1]]
+    cache = SeedCache()
+    first = build_session_seed(_session(plain), SessionMemory(turn_index=1), 400_000, RC, position=_position, cache=cache)
+    second = build_session_seed(_session(with_images), SessionMemory(turn_index=1), 400_000, RC, position=_position, cache=cache)
+    assert second.tokens == sum(estimate_message_tokens(m, RC) for m in second.messages)
+    assert second.tokens > first.tokens + 8 * RC.token_count_image_tokens - 10
+
+
+def test_every_seed_encodes_whatever_the_input_holds() -> None:
+    rng = random.Random(11)
+    pieces = ["plain", "\ud83d", "\udc00", "\U0001f600", "кириллица", "\\ud83d", "\n", "Cite: x"]
+    failures = 0
+    for case in range(160):
+        def text(n: int) -> str:
+            return "".join(rng.choice(pieces) for _ in range(n))
+        turns = []
+        for t in range(rng.randint(1, 4)):
+            args_raw = json.dumps({"q": text(3), "body": text(rng.randint(0, 120)) * rng.randint(1, 12)})
+            turns.append([
+                _user(text(5)),
+                Message(role=MessageRole.assistant, content_blocks=[ToolUseBlock(tool_call_id=f"c{case}-{t}", name="Tool", arguments_json=args_raw)], reasoning_content=text(4) or None),
+                _results((f"c{case}-{t}", text(rng.randint(1, 300)) * rng.randint(1, 4))),
+                _assistant(text(10)),
+            ])
+        history = _session(*turns)
+        memory = SessionMemory(summary=SessionSummary(entries={"REQUESTS": (text(4) or "r",)}), turn_index=len(turns))
+        seed = build_session_seed(history, memory, rng.choice([300, 3000, 60_000]), RC, position=_position)
+        plan = plan_session_fold(history, memory, rng.choice([300, 3000]), RC, position=_position)
+        try:
+            for message in seed.messages:
+                message.model_dump_json().encode("utf-8")
+            text_in = build_summary_delta_message(memory.summary, plan.source_messages or [m for t in turns for m in t])
+            if text_in is not None:
+                text_in.encode("utf-8")
+        except (UnicodeEncodeError, ValueError):
+            failures += 1
+    assert failures == 0
+
+
+def test_a_large_registry_never_costs_the_previous_answer() -> None:
+    files = [f"src/module_{i}.py" for i in range(40)]
+    ledger = ArtifactLedger(files=files, content={f: "def f():\n    return 1\n" * 200 for f in files})
+    first = [_user("list the three reports"), _assistant("1. Alpha report\n2. Beta report\n3. Gamma report")]
+    history = _session(*(_turn(i) for i in range(3)), first)
+    memory = SessionMemory(summary=SessionSummary(entries={"REQUESTS": ("r " * 300,)}), ledger=ledger, turn_index=4)
+    rc = LoopConstants(session_memory_registry_max_tokens=12_000)
+    for budget in (16_000, 4_000, 900, 200):
+        seed = build_session_seed(history, memory, budget, rc, position=_position)
+        assert seed.tokens <= budget
+        assert any("2. Beta report" in m.text for m in seed.messages), budget
+    tight = build_session_seed(history, memory, 900, rc, position=_position)
+    assert tight.registry_reduced and not tight.dropped_registry and tight.dropped_turns >= 3
+    tighter = build_session_seed(history, memory, 200, rc, position=_position)
+    assert tighter.dropped_registry and tighter.dropped_summary
+
+
+def test_the_newest_turn_reduced_to_its_words_keeps_question_and_answer() -> None:
+    history = _session(_turn(0, result_chars=30_000, answer_chars=200))
+    seed = build_session_seed(history, SessionMemory(turn_index=1), 400, RC, position=_position)
+    assert seed.words_only_turns == 1 and seed.tokens <= 400
+    texts = [m.text for m in seed.messages]
+    assert texts[0].startswith("question 0") and texts[1].startswith("Answer 0")
+    assert "tool calls and results of the latest earlier turn are not in this context" in texts[2]
+    assert all(m.role is not MessageRole.tool for m in seed.messages)
+
+
+def test_repeated_cut_folds_shrink_the_batch_to_one_turn_and_then_pin_it() -> None:
+    history = _session(*(_turn(i) for i in range(16)))
+    memory = SessionMemory(turn_index=16)
+    sizes: list[int] = []
+    pinned = False
+    for _ in range(12):
+        plan = plan_session_fold(history, memory, BUDGET, RC, position=_position)
+        assert plan.step is not None
+        sizes.append(len(plan.turns))
+        if plan.pin:
+            assert not plan.needed
+            memory = fold_run(memory, [], None, RC, step=plan.step).memory
+            pinned = True
+            break
+        cut = SummaryDelta(entries={"KEY FACTS & IDENTIFIERS": ("partial fact",)}, truncated=True)
+        memory = fold_run(memory, [], cut, RC, step=plan.step, fold_attempted=True).memory
+    assert pinned
+    assert sizes == sorted(sizes, reverse=True) and sizes[-1] == 1
+    assert sizes[0] > 1 and len(sizes) <= 2 + sizes[0].bit_length() + RC.session_seed_fold_cuts_before_pin
+    seed = build_session_seed(history, memory, 400_000, RC, position=_position)
+    assert seed.pinned_turns == 1
+    assert any("could not be summarised" in m.text for m in seed.messages)
+    after = plan_session_fold(history, memory, BUDGET, RC, position=_position)
+    assert after.step is None or after.turns[0] != plan.turns[0]
+    assert memory.summary.entries["KEY FACTS & IDENTIFIERS"] == ("partial fact",)  # not re-added per retry
+
+
+def _check_no_gap(history: list[Message], memory: SessionMemory, before: SessionMemory, planned: set[int]) -> None:
+    turns = split_turns(history)
+    if turns and not opens_turn(turns[0][0]):
+        turns = turns[1:]
+    known = seed_module._known_positions(turns, _position)
+    for index, positions in enumerate(known):
+        if not positions:
+            continue
+        was = all(before.summary.covers(p) for p in positions)
+        now = all(memory.summary.covers(p) for p in positions)
+        partly = any(memory.summary.covers(p) for p in positions) and not now
+        assert not partly, index
+        if now and not was:
+            assert index in planned, index
+
+
+def test_coverage_never_spans_a_turn_it_did_not_plan_under_random_histories_and_stale_steps() -> None:
+    rng = random.Random(3)
+    for case in range(80):
+        turns = [_turn(i, tools=rng.randint(0, 2), result_chars=rng.randint(500, 6000)) for i in range(rng.randint(2, 14))]
+        history = _session(*turns)
+        for _ in range(rng.randint(0, 4)):  # missing or broken positions
+            at = rng.randrange(len(history))
+            meta = {} if rng.random() < 0.5 else {POS: rng.randint(0, len(history))}
+            history[at] = history[at].model_copy(update={"metadata": meta})
+        rc = LoopConstants(session_memory_head_protect_turns=rng.randint(0, 2))
+        memory = SessionMemory(turn_index=len(turns))
+        old_steps: list[tuple[CoverageStep, set[int]]] = []
+        for _ in range(6):
+            budget = rng.choice([2_000, 6_000, 16_000])
+            plan = plan_session_fold(history, memory, budget, rc, position=_position, max_source_tokens=rng.choice([0, 500, 4000]))
+            if plan.step is None:
+                continue
+            firsts = {id(turn[0]) for turn in plan.turns}
+            mine = {index for index, turn in enumerate(_turns_of(history)) if id(turn[0]) in firsts}
+            old_steps.append((plan.step, mine))
+            step, planned = old_steps[-1] if rng.random() < 0.7 else rng.choice(old_steps)
+            delta = SummaryDelta(entries={"REQUESTS": (f"case {case}",)}, truncated=rng.random() < 0.2)
+            before = memory
+            result = fold_run(memory, [], None if step.pin else delta, rc, step=step, fold_attempted=True)
+            memory = result.memory
+            _check_no_gap(history, memory, before, planned)
+            if rng.random() < 0.3:
+                rc = LoopConstants(session_memory_head_protect_turns=rng.randint(0, 2))
+
+
+def _turns_of(history: list[Message]) -> list[list[Message]]:
+    turns = split_turns(history)
+    return turns[1:] if turns and not opens_turn(turns[0][0]) else turns
+
+
+def test_positions_that_break_the_contract_count_as_unknown() -> None:
+    history = _session(_turn(0), _turn(1), _turn(2))
+    size = len(_turn(0))
+    swapped = list(history)
+    swapped[size], swapped[size + 1] = (
+        swapped[size].model_copy(update={"metadata": {POS: size + 1}}),
+        swapped[size + 1].model_copy(update={"metadata": {POS: size}}),
+    )
+    turns = _turns_of(swapped)
+    known = seed_module._known_positions(turns, _position)
+    assert known[0] and known[1] == [] and known[2]
+    seed = build_session_seed(swapped, _covering(size, 10**6), 60_000, RC, position=_position)
+    assert sum(1 for m in seed.messages if m.text.startswith("question 1")) == 1
+
+
+def test_in_run_compaction_remasks_the_seeded_newest_turn_first_to_the_next_seeds_form() -> None:
+    import asyncio
+
+    from protocore.runtime.context.compaction import remask_seeded_turns, run_tier1_truncation
+    from protocore.tests_support.adapters import InMemoryBlobStore
+
+    history = _session(_turn(0), _turn(1, rounds=2, reasoning=20))
+    seed = build_session_seed(history, SessionMemory(turn_index=2), 200_000, RC, position=_position)
+    assert seed.full_turns == 1 and seed.reclaimable_tokens > 5_000
+    tagged = [m for m in seed.messages if SESSION_SEED_MASKED_FORM_METADATA_KEY in m.metadata]
+    assert tagged
+    later = [*history, *_stamp(_turn(2, tools=0), len(history))]
+    next_seed = build_session_seed(later, SessionMemory(turn_index=3), 200_000, RC, position=_position)
+    run = [*seed.messages, _user("the new task")]
+    before = sum(estimate_message_tokens(m, RC) for m in run)
+    freed = remask_seeded_turns(list(run), RC)
+    assert freed > 5_000
+    result = asyncio.run(
+        run_tier1_truncation(run, InMemoryBlobStore(), "t", RC, truncation_threshold_tokens=10**9, keep_recent_turns=1)
+    )
+    assert result.tokens_freed >= freed
+    assert sum(estimate_message_tokens(m, RC) for m in run) <= before - freed
+    wire_run = [_wire(m) for m in run[:-1]]
+    wire_next = [_wire(m) for m in next_seed.messages if not m.text.startswith("question 2")][: len(wire_run)]
+    assert wire_run == wire_next
+    assert not any(SESSION_SEED_MASKED_FORM_METADATA_KEY in m.metadata for m in run)
+    assert _pairs_valid(run)
+
+
+def test_recommend_seed_budget_splits_the_room_up_to_the_trigger() -> None:
+    rc = LoopConstants(model_context_window=49_152)
+    budget = recommend_seed_budget(rc, 8_000)
+    assert budget.trigger_tokens == 39_117
+    assert budget.seed_tokens + budget.run_reserve_tokens == 39_117 - 8_000
+    assert budget.run_reserve_tokens >= rc.session_seed_run_reserve_min_tokens
+    assert budget.seed_tokens == int((39_117 - 8_000) * rc.session_seed_budget_ratio)
+    starved = recommend_seed_budget(rc, 36_000)
+    assert starved.seed_tokens == 0 and starved.run_reserve_tokens == 3_117
+
+
+def test_without_fold_spacing_a_large_newest_turn_folds_every_run() -> None:
+    def rate(rc: LoopConstants) -> int:
+        history: list[Message] = []
+        memory = SessionMemory()
+        folds = 0
+        for run in range(16):
+            turn = _stamp(_turn(run, tools=3, result_chars=14_400, answer_chars=1500), len(history))
+            history = [*history, *turn]
+            plan = plan_session_fold(history, memory, BUDGET, rc, position=_position)
+            folds += plan.needed
+            delta = SummaryDelta(entries={"KEY FACTS & IDENTIFIERS": (f"fact {run}",)}) if plan.needed else None
+            memory = fold_run(memory, turn, delta, rc, step=plan.step if delta else None).memory
+        return folds
+
+    assert rate(LoopConstants(session_seed_fold_min_turns_between=0)) >= 12
+    assert rate(RC) <= 8
+
+
+def test_the_convergence_bound_holds() -> None:
+    history = _session(*(_turn(i, result_chars=rng_size) for i, rng_size in enumerate([2000, 9000, 4000, 7000] * 10)))
+    memory = SessionMemory(turn_index=40)
+    source = 2_500
+    first = plan_session_fold(history, memory, BUDGET, RC, position=_position, max_source_tokens=source)
+    backlog = first.backlog_turns
+    largest = max(fold_source_tokens(seed_module._Preparer(RC, default_masking_rule(RC), None).prepare(t).masked, RC) for t in _turns_of(history))
+    folds = 0
+    folded_source = 0
+    while True:
+        plan = plan_session_fold(history, memory, BUDGET, RC, position=_position, max_source_tokens=source)
+        if not plan.needed:
+            break
+        folds += 1
+        folded_source += fold_source_tokens(plan.source_messages, RC)
+        memory = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": (f"b{folds}",)}), RC, step=plan.step).memory
+    assert folds <= backlog
+    if source > largest:
+        assert folds <= -(-folded_source // (source - largest)) + 1
