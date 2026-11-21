@@ -358,7 +358,7 @@ async def test_sheds_summary_seed_block_via_reference_path() -> None:
         turn_index=3,
     )
     head = [Message(role=MessageRole.user, content_blocks=[TextBlock(text="ORIGINAL TASK")])]
-    seed = build_session_seed(head, mem, 40_000, rc).messages
+    seed = build_session_seed(head, mem, 40_000, rc, position=lambda message: None).messages
     # A fresh task turn after the seed (the recent window the guard keeps).
     history = [
         *seed,

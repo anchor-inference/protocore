@@ -12,28 +12,40 @@ older ones masked. The memory here stands in only for what that raw window no
 longer carries:
 
 1. **The running summary** (:class:`SessionSummary`) — entries under five fixed
-   sections, recording the turns that have left the raw window. It is grown by
-   *delta folds*: the summariser is shown the existing summary and the turns
-   leaving the window, and asked only for what those turns add
-   (:data:`SUMMARY_DELTA_SYSTEM`, :func:`build_summary_delta_message`). The
-   reply is parsed into entries (:func:`parse_summary_delta`) and appended
-   (:func:`merge_summary_delta`). The summary is never rewritten whole, so a
-   fold costs the decode of a few hundred tokens instead of the whole summary,
-   and nothing already recorded can be lost to a rewrite that forgot it.
+   sections, recording the turns that have left the raw window, and
+   :attr:`SessionSummary.covered_through`, the session position of the last
+   message those turns hold. Coverage lives on the summary on purpose: a
+   summary that is reset (``SessionSummary()``) covers nothing, so no turn can
+   be left out of a seed on the strength of a summary that no longer records
+   it. The summary grows by *delta folds*: the summariser is shown the
+   existing summary and the turns leaving the window (in the masked form the
+   seed carried them in), and asked only for what those turns add
+   (:data:`SUMMARY_DELTA_SYSTEM`, :func:`build_summary_delta_request`). The
+   reply is parsed into entries (:func:`parse_summary_delta`) and appended by
+   :func:`fold_run`. The summary is never rewritten whole, so a fold costs the
+   decode of a few hundred tokens, and nothing already recorded can be lost to
+   a rewrite that forgot it.
 2. **The artifact registry** (:class:`ArtifactLedger`) — ``path`` -> last
    verbatim ``content`` of every file a workspace-mutating tool wrote, read by
-   role from the tool-call arguments (no text scanning). Updated after every
-   run, with or without a fold.
+   role from the tool-call arguments of the run as it happened (never from a
+   masked seed). Updated after every run, with or without a fold.
 
 The cap. Past ``session_memory_running_summary_token_cap`` the summary sheds
 whole entries, oldest first, from the sections in :data:`SUMMARY_SECTIONS`
 order of ``shed_rank`` — ARTIFACTS (the registry keeps the files) before
 later REQUESTS before KEY FACTS & IDENTIFIERS before CONSTRAINTS & DECISIONS,
 PENDING / NEXT last — and every section that lost entries says how many. The
-first REQUESTS entry, the user's original ask, is the last thing to go. It
-used to be cut from the end by characters, which removed the trailing sections
-whole and handed the next fold a summary missing headings it was required to
-keep.
+first REQUESTS entry, the user's original ask, is the last thing to go.
+
+Concurrency contract. One fold per session at a time. The host loads the
+memory once, plans the fold against that memory and the stored history
+(:func:`~protocore.runtime.context.session_seed.plan_session_fold`), builds the
+request from the same memory, and calls :func:`fold_run` on that same memory
+before saving it with a compare-and-set on its own revision. A delta carries
+the coverage it advances to, so applying it to a memory that already covers
+that far changes nothing: a retry after a lost acknowledgement cannot apply
+the same delta twice. A save that loses the compare-and-set reloads and plans
+again.
 
 Parsing a reply is reading the format the prompt asked for — headings this
 module named and one entry per line — not mining text for meaning. There is no
@@ -71,14 +83,14 @@ from protocore.runtime.tool_arguments import string_argument
 # field.
 # ---------------------------------------------------------------------------
 
+NOTHING_COVERED: Final[int] = -1
+""":attr:`SessionSummary.covered_through` of a summary that covers no turn.
+Session positions are the host's and must be non-negative and increase in
+session order."""
+
 #: Cap on how many files the registry pins, and on each content snapshot.
 _MAX_FILES: Final[int] = 60
 _CONTENT_SNAPSHOT_MAX_CHARS: Final[int] = 4000
-
-#: Per-block caps when a turn is rendered as text for the summariser, so one
-#: huge block cannot dominate the fold's input.
-_SERIALIZE_TOOL_ARGS_MAX_CHARS: Final[int] = 240
-_SERIALIZE_TOOL_RESULT_MAX_CHARS: Final[int] = 600
 
 #: Longest single summary entry kept. An entry is one fact; a reply that put a
 #: page on one line is clipped rather than allowed to crowd out every other.
@@ -94,12 +106,26 @@ _ELLIPSIS: Final[str] = " …"
 #: entries: ``  (N earlier entries of this section are no longer carried)``.
 _SHED_NOTE: Final[str] = "earlier entries of this section are no longer carried"
 
-#: Characters a heading line may be decorated with by a model (markdown marks,
-#: quote marks, bullets) and that are stripped before it is compared.
-_HEADING_DECORATION: Final[str] = "#*_`>-•+ \t"
+#: What the summariser answers when the turns add nothing (and what makes that
+#: answer different from an empty or cut-off reply).
+NOTHING_NEW: Final[str] = "NOTHING NEW"
 
-#: Bullet marks stripped from the start of an entry line.
+#: Characters a heading line may be decorated with by a model (markdown marks,
+#: quote marks) and that are stripped before it is compared.
+_HEADING_DECORATION: Final[str] = "#*_`> \t"
+
+#: Bullet marks an entry line starts with. A bulleted line is always an entry,
+#: even when its text begins with a section's name.
 _ENTRY_BULLETS: Final[tuple[str, ...]] = ("- ", "* ", "\u2022 ", "\u2013 ", "\u2014 ", "+ ")
+
+#: Entries that say "there is nothing here" in the words a model uses for an
+#: empty section. Compared case-folded, with punctuation and spaces removed.
+_NULL_ENTRIES: Final[frozenset[str]] = frozenset(
+    {"none", "na", "nil", "nothing", "empty", "nothingnew", "нет", "ничего", "нетданных"}
+)
+
+_THINK_OPEN: Final[str] = "<think>"
+_THINK_CLOSE: Final[str] = "</think>"
 
 
 class SectionMerge(StrEnum):
@@ -109,7 +135,8 @@ class SectionMerge(StrEnum):
     """New entries are added after the stored ones (duplicates skipped)."""
     supersede = "supersede"
     """A fold that writes the section replaces its entries; one that leaves it
-    out keeps them. For state that is current, not cumulative."""
+    out keeps them. For state that is current, not cumulative. A reply cut at
+    its output bound never supersedes: its list may be the cut one."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,7 +180,8 @@ SUMMARY_DELTA_SYSTEM: Final[str] = (
     "  PENDING / NEXT:\n"
     "  ARTIFACTS:\n"
     "Leave out a heading you have nothing new for. Do not write placeholder "
-    "entries such as \"none\".\n"
+    "entries such as \"none\". If the NEW TURNS add nothing at all, reply with "
+    f"exactly: {NOTHING_NEW}\n"
     "RULES:\n"
     "- REQUESTS: what the user asked for in the NEW TURNS, one entry per "
     "request, in the user's own words where they are short.\n"
@@ -161,13 +189,15 @@ SUMMARY_DELTA_SYSTEM: Final[str] = (
     "user or the agent stated.\n"
     "- KEY FACTS & IDENTIFIERS: facts the agent found or stated that a later "
     "answer may need — names, titles, numbers, dates, ids, codes, URLs, paths, "
-    "versions, and which item was which in any list the agent gave — copied "
-    "VERBATIM, exact characters.\n"
+    "versions, citation lines, and which item was which in any list the agent "
+    "gave — copied VERBATIM, exact characters.\n"
     "- PENDING / NEXT: the complete list of what is still open after the NEW "
     "TURNS. It replaces the previous list, so write it whole, or leave the "
     "heading out if nothing changed.\n"
     "- ARTIFACTS: files created or edited, one line each: the path and what it "
     "is. Not their contents; those are kept elsewhere.\n"
+    "- Parts of tool output marked as not carried are gone; record only what "
+    "is shown.\n"
     "- One fact per entry, self-contained: it must make sense without the "
     "transcript.\n"
     "- The conversation may be in Russian, English or mixed (Русский, English "
@@ -204,19 +234,28 @@ def _entry_key(entry: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class SessionSummary:
-    """The running summary: entries per section, and how many each section shed.
+    """The running summary: entries per section, shed counts, and what it covers.
 
     Immutable; every operation returns a new value. ``entries`` holds only the
     sections that have entries, in no particular order (rendering imposes the
-    fixed one).
+    fixed one). ``covered_through`` is the session position of the last
+    message of the turns this summary records — the host's positions, opaque
+    here. A summary built fresh covers nothing, which is what makes a reset
+    safe: the seed carries every turn again.
     """
 
     entries: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     shed: Mapping[str, int] = field(default_factory=dict)
     """Entries a section no longer carries because of the cap."""
+    covered_through: int = NOTHING_COVERED
 
     def is_empty(self) -> bool:
-        return not any(self.entries.values())
+        """No entries and no shed note — it renders to nothing. Coverage aside."""
+        return not any(self.entries.values()) and not any(self.shed.values())
+
+    def covers(self, position: int | None) -> bool:
+        """Whether the message at session ``position`` is recorded here."""
+        return position is not None and position <= self.covered_through
 
     def section(self, heading: str) -> tuple[str, ...]:
         return tuple(self.entries.get(heading, ()))
@@ -225,7 +264,9 @@ class SessionSummary:
         """The summary as the seed shows it and the summariser is shown it.
 
         Deterministic: the same summary renders to the same bytes, which is
-        what keeps the seed's prefix stable between folds.
+        what keeps the seed's prefix stable between folds. Every entry line
+        starts with ``- ``, so an entry that begins with a section's name is
+        never read back as a heading (:meth:`from_text`).
         """
         lines: list[str] = []
         for section in SUMMARY_SECTIONS:
@@ -240,27 +281,52 @@ class SessionSummary:
         return "\n".join(lines)
 
     @classmethod
-    def from_text(cls, text: str) -> SessionSummary:
-        """The summary :meth:`render` wrote, read back exactly — shed counts included.
+    def from_text(cls, text: str, *, covered_through: int) -> SessionSummary:
+        """Read back exactly what :meth:`render` wrote, for a host that stores text.
 
-        For a host that stores the summary as text. Lines under no known
-        heading are ignored; :class:`SummaryDeltaError` when the text has
-        content and none of the headings.
+        Strict: every non-blank line must be a heading line (``HEADING:``), an
+        entry line (``- …``) or a shed note, as :meth:`render` writes them.
+        Anything else — text stored by an earlier format of this summary, or
+        not by this module at all — raises :class:`SummaryDeltaError`; the
+        host's answer to that is ``SessionSummary()``, which covers nothing,
+        so every turn is carried again rather than any being dropped.
+        ``covered_through`` is the coverage the host stored beside the text.
         """
-        parsed = _parse_sections(text)
+        entries: dict[str, list[str]] = {}
+        shed: dict[str, int] = {}
+        current: str | None = None
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            if line.endswith(":") and line[:-1] in _SECTION_BY_HEADING:
+                current = line[:-1]
+                entries.setdefault(current, [])
+                continue
+            if current is None:
+                raise SummaryDeltaError("stored summary text has a line outside every section")
+            if line.startswith("- "):
+                entries[current].append(line[2:])
+                continue
+            count = _shed_count(line)
+            if count is None:
+                raise SummaryDeltaError("stored summary text is not in the current format")
+            shed[current] = shed.get(current, 0) + count
         return cls(
-            entries={k: tuple(v) for k, v in parsed.entries.items() if v},
-            shed={k: v for k, v in parsed.shed.items() if v},
+            entries={k: tuple(v) for k, v in entries.items() if v},
+            shed={k: v for k, v in shed.items() if v},
+            covered_through=covered_through,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "entries": {k: list(v) for k, v in self.entries.items() if v},
             "shed": {k: int(v) for k, v in self.shed.items() if v},
+            "covered_through": self.covered_through,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any] | None) -> SessionSummary:
+        """The summary :meth:`to_dict` wrote. ``None`` or ``{}`` is a fresh summary."""
         if not data:
             return cls()
         raw_entries = data.get("entries") or {}
@@ -275,11 +341,16 @@ class SessionSummary:
             for k, v in raw_shed.items()
             if str(k) in _SECTION_BY_HEADING and isinstance(v, int) and v > 0
         }
-        return cls(entries=entries, shed=shed)
+        covered = data.get("covered_through")
+        return cls(
+            entries=entries,
+            shed=shed,
+            covered_through=covered if isinstance(covered, int) else NOTHING_COVERED,
+        )
 
 
 class SummaryDeltaError(ValueError):
-    """A summariser reply that is not a delta: text with none of the headings."""
+    """Text that is not a usable fold reply (or not a stored summary)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,6 +360,11 @@ class SummaryDelta:
     entries: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     unattributed_lines: int = 0
     """Non-empty lines outside any known heading (dropped; worth logging)."""
+    truncated: bool = False
+    """The reply was cut at its output bound; its last entry was dropped and it
+    supersedes no section."""
+    nothing_new: bool = False
+    """The summariser said the turns add nothing (:data:`NOTHING_NEW`)."""
 
     def is_empty(self) -> bool:
         return not any(self.entries.values())
@@ -297,12 +373,15 @@ class SummaryDelta:
 def _heading_of(line: str) -> tuple[str, str] | None:
     """``(heading, rest of the line)`` when ``line`` opens a section, else ``None``.
 
-    Presentation a model varies freely is folded away first: markdown marks,
-    bullets, an ordinal, case, ``and`` for ``&``, spacing around ``/`` and a
-    trailing colon. Text after the colon on the same line is the section's
-    first entry.
+    A bulleted line is never a heading. Presentation a model varies freely is
+    folded away first: markdown marks, an ordinal, case, ``and`` for ``&``,
+    spacing around ``/`` and a trailing colon. Text after the colon on the same
+    line is the section's first entry.
     """
-    text = line.strip().lstrip(_HEADING_DECORATION)
+    stripped = line.strip()
+    if any(stripped.startswith(bullet) for bullet in _ENTRY_BULLETS):
+        return None
+    text = stripped.lstrip(_HEADING_DECORATION)
     digits = len(text) - len(text.lstrip("0123456789"))
     if digits and text[digits : digits + 1] in {".", ")"}:
         text = text[digits + 1 :]
@@ -328,6 +407,8 @@ def _entry_of(line: str) -> str:
             text = text[digits + 2 :].strip()
     if not any(ch.isalnum() for ch in text):
         return ""
+    if "".join(ch for ch in text.casefold() if ch.isalnum()) in _NULL_ENTRIES:
+        return ""
     return _clip(text, _ENTRY_MAX_CHARS)
 
 
@@ -340,66 +421,77 @@ def _shed_count(line: str) -> int | None:
     return int(number) if number.isdigit() else None
 
 
-@dataclass(slots=True)
-class _Parsed:
-    entries: dict[str, list[str]] = field(default_factory=dict)
-    shed: dict[str, int] = field(default_factory=dict)
-    order: list[tuple[str, int]] = field(default_factory=list)
-    unattributed: int = 0
+def _without_reasoning(text: str) -> str:
+    """The reply after a leading reasoning block; empty when the reply is all reasoning."""
+    close = text.rfind(_THINK_CLOSE)
+    if close >= 0:
+        return text[close + len(_THINK_CLOSE) :]
+    if text.lstrip().startswith(_THINK_OPEN):
+        return ""
+    return text
 
 
-def _parse_sections(text: str) -> _Parsed:
-    parsed = _Parsed()
+def parse_summary_delta(text: str, *, truncated: bool = False) -> SummaryDelta:
+    """Parse a delta fold's reply into new entries per section — PURE.
+
+    Each non-empty line under a known heading is one entry; a bulleted line is
+    always an entry. Placeholder entries ("none", "n/a", "—") are dropped. A
+    leading reasoning block (``<think>…</think>``) is not part of the reply.
+    Headings may come in any order and more than once. A reply of exactly
+    :data:`NOTHING_NEW` is a valid empty delta.
+
+    ``truncated`` says the reply was cut at its output bound: its last entry
+    is probably cut mid-sentence and is dropped; the delta is marked
+    :attr:`SummaryDelta.truncated` and supersedes no section.
+
+    Raises :class:`SummaryDeltaError` when nothing usable is left, so the host
+    advances no coverage and the planned turns stay in the seed:
+
+    * an empty reply, or one that is all reasoning — the output bound spent
+      thinking leaves exactly this;
+    * text with none of the headings;
+    * a truncated reply with no complete entry left.
+    """
+    body = _without_reasoning(text)
+    if not body.strip():
+        raise SummaryDeltaError("the reply is empty")
+    if " ".join(body.split()).upper().strip(".") == NOTHING_NEW and not truncated:
+        return SummaryDelta(nothing_new=True)
+    entries: dict[str, list[str]] = {}
+    order: list[tuple[str, int]] = []
     current: str | None = None
+    unattributed = 0
     seen_heading = False
-    for line in text.splitlines():
+    for line in body.splitlines():
         if not line.strip():
             continue
         heading = _heading_of(line)
         if heading is not None:
             seen_heading = True
             current, rest = heading
-            parsed.entries.setdefault(current, [])
-            line = rest
-            if not line:
+            entries.setdefault(current, [])
+            if not rest:
                 continue
+            line = rest
         elif current is None:
-            parsed.unattributed += 1
-            continue
-        shed = _shed_count(line)
-        if shed is not None:
-            parsed.shed[current] = parsed.shed.get(current, 0) + shed
+            unattributed += 1
             continue
         entry = _entry_of(line)
         if entry:
-            parsed.entries[current].append(entry)
-            parsed.order.append((current, len(parsed.entries[current]) - 1))
-    if not seen_heading and text.strip():
+            entries[current].append(entry)
+            order.append((current, len(entries[current]) - 1))
+    if not seen_heading:
         raise SummaryDeltaError("the reply names none of the summary sections")
-    return parsed
-
-
-def parse_summary_delta(text: str, *, truncated: bool = False) -> SummaryDelta:
-    """Parse a delta fold's reply into new entries per section — PURE.
-
-    Each non-empty line under a known heading is one entry; a line with no
-    letter or digit is not an entry. Headings may come in any order and more
-    than once. An empty reply is an empty delta (the turns added nothing).
-
-    ``truncated`` says the reply was cut at the output bound: its last entry
-    is probably cut mid-sentence and is dropped, the rest stands.
-
-    Raises :class:`SummaryDeltaError` when the reply has text but none of the
-    headings — not a delta at all, and storing nothing from it is the right
-    answer; the host keeps the turns uncovered and folds them again.
-    """
-    parsed = _parse_sections(text)
-    if truncated and parsed.order:
-        last_heading, last_index = parsed.order[-1]
-        del parsed.entries[last_heading][last_index]
+    if truncated:
+        if order:
+            last_heading, last_index = order[-1]
+            del entries[last_heading][last_index]
+        if not any(entries.values()):
+            raise SummaryDeltaError("the reply was cut off before its first complete entry")
     return SummaryDelta(
-        entries={k: tuple(v) for k, v in parsed.entries.items() if v},
-        unattributed_lines=parsed.unattributed,
+        entries={k: tuple(v) for k, v in entries.items() if v},
+        unattributed_lines=unattributed,
+        truncated=truncated,
     )
 
 
@@ -410,8 +502,12 @@ class MergeReport:
     added: int = 0
     duplicates: int = 0
     replaced_sections: tuple[str, ...] = ()
+    kept_on_truncation: tuple[str, ...] = ()
+    """Supersede sections a truncated reply wrote and that were left as stored."""
     shed: int = 0
     clipped: int = 0
+    already_applied: bool = False
+    """The memory already covered what the delta covers; nothing was merged."""
 
 
 def _over_cap(summary: SessionSummary, cap: int, rc: LoopConstants) -> bool:
@@ -442,7 +538,7 @@ def cap_summary(summary: SessionSummary, rc: LoopConstants) -> tuple[SessionSumm
     Whole entries go first, oldest first, in shed order. Only when the summary
     is down to a single entry and still over the cap is that entry clipped,
     by halves, to no less than a short floor — a cap set below one short entry
-    leaves the summary as close to it as that allows.
+    leaves the summary as close to it as that allows. Coverage is kept.
     Returns the summary, the number of entries shed and of entries clipped.
     """
     cap = rc.session_memory_running_summary_token_cap
@@ -455,7 +551,9 @@ def cap_summary(summary: SessionSummary, rc: LoopConstants) -> tuple[SessionSumm
 
     def current() -> SessionSummary:
         return SessionSummary(
-            entries={k: tuple(v) for k, v in entries.items() if v}, shed=dict(shed)
+            entries={k: tuple(v) for k, v in entries.items() if v},
+            shed=dict(shed),
+            covered_through=summary.covered_through,
         )
 
     while _over_cap(current(), cap, rc) and sum(len(v) for v in entries.values()) > 1:
@@ -483,19 +581,25 @@ def merge_summary_delta(
 ) -> tuple[SessionSummary, MergeReport]:
     """Append ``delta`` to ``summary`` and hold the result to the cap — PURE.
 
-    Append sections skip an entry already present (case and spacing aside);
-    replace sections take the delta's entries whole when it has any. Then
-    :func:`cap_summary`.
+    Accumulating sections skip an entry already present (case and spacing
+    aside); a superseding section takes the delta's entries whole when it has
+    any — unless the delta is :attr:`~SummaryDelta.truncated`, when it is left
+    as stored and named in :attr:`MergeReport.kept_on_truncation`. Then
+    :func:`cap_summary`. Coverage is the caller's (:func:`fold_run`).
     """
     entries = {k: list(v) for k, v in summary.entries.items()}
     added = 0
     duplicates = 0
     replaced: list[str] = []
+    kept: list[str] = []
     for section in SUMMARY_SECTIONS:
         new = list(delta.entries.get(section.heading, ()))
         if not new:
             continue
         if section.merge is SectionMerge.supersede:
+            if delta.truncated:
+                kept.append(section.heading)
+                continue
             entries[section.heading] = []
             replaced.append(section.heading)
         items = entries.setdefault(section.heading, [])
@@ -511,12 +615,17 @@ def merge_summary_delta(
     shed = dict(summary.shed)
     for heading in replaced:
         shed.pop(heading, None)
-    merged = SessionSummary(entries={k: tuple(v) for k, v in entries.items() if v}, shed=shed)
+    merged = SessionSummary(
+        entries={k: tuple(v) for k, v in entries.items() if v},
+        shed=shed,
+        covered_through=summary.covered_through,
+    )
     capped, shed_count, clipped = cap_summary(merged, rc)
     return capped, MergeReport(
         added=added,
         duplicates=duplicates,
         replaced_sections=tuple(replaced),
+        kept_on_truncation=tuple(kept),
         shed=shed_count,
         clipped=clipped,
     )
@@ -528,10 +637,12 @@ def merge_summary_delta(
 
 
 def _serialize_message(message: Message) -> str:
-    """Render a message as ``[ROLE] text [calls Tool(args)] [tool result …]``.
+    """Render a message as ``[ROLE] text [calls Tool(args)] [tool result: …]``.
 
     Summary INPUT, so the model treats it as material, not as a chat to
-    continue. Tool arguments and results are length-capped by slicing.
+    continue. Nothing is cut here: the messages handed in are the masked form
+    the seed carried (:attr:`~protocore.runtime.context.session_seed.FoldPlan.source`),
+    already bounded, with the lines masking kept.
     """
     role = message.role.value.upper()
     pieces: list[str] = []
@@ -540,15 +651,9 @@ def _serialize_message(message: Message) -> str:
             if block.text:
                 pieces.append(block.text)
         elif isinstance(block, ToolUseBlock):
-            args = block.arguments_json
-            if len(args) > _SERIALIZE_TOOL_ARGS_MAX_CHARS:
-                args = args[:_SERIALIZE_TOOL_ARGS_MAX_CHARS] + " …"
-            pieces.append(f"[calls {block.name}({args})]")
+            pieces.append(f"[calls {block.name}({block.arguments_json})]")
         elif isinstance(block, ToolResultBlock):
-            content = block.content
-            if len(content) > _SERIALIZE_TOOL_RESULT_MAX_CHARS:
-                content = content[:_SERIALIZE_TOOL_RESULT_MAX_CHARS] + " …[truncated]"
-            pieces.append(f"[tool result: {content}]")
+            pieces.append(f"[tool result: {block.content}]")
     return f"[{role}] " + " ".join(p for p in pieces if p).strip()
 
 
@@ -562,9 +667,10 @@ def build_summary_delta_message(
 ) -> str | None:
     """The user message of a delta fold, to send under :data:`SUMMARY_DELTA_SYSTEM` — PURE.
 
-    ``turn_messages`` are the turns leaving the raw window, oldest first — the
-    messages of :attr:`~protocore.runtime.context.session_seed.FoldPlan.turns`,
-    flattened. ``None`` when they render to nothing: there is no call to make.
+    ``turn_messages`` are the turns leaving the raw window, oldest first, in
+    the form the seed carried them —
+    :attr:`~protocore.runtime.context.session_seed.FoldPlan.source_messages`.
+    ``None`` when they render to nothing: there is no call to make.
     """
     serialized = _serialize_turns(turn_messages).strip()
     if not serialized:
@@ -582,15 +688,18 @@ def build_summary_delta_request(
     rc: LoopConstants,
     *,
     model: str,
+    thinking: bool | None,
     temperature: float | None = None,
 ) -> LLMRequest | None:
     """The whole delta-fold request, ready for a provider's ``complete_text`` — PURE.
 
     System prompt :data:`SUMMARY_DELTA_SYSTEM`, the user message of
     :func:`build_summary_delta_message`, no tools, and an output bound of
-    ``session_memory_fold_max_output_tokens``: a delta is a few hundred
-    tokens, and a reply longer than what the summary can store would be paid
-    for and then shed. ``None`` when there is nothing to fold.
+    ``session_memory_fold_max_output_tokens``. ``thinking`` is the request's
+    reasoning switch (``extra["enable_thinking"]``) and the host must decide
+    it: ``False`` keeps a reasoning model from spending the bound thinking and
+    replying with nothing; ``None`` leaves it to the provider's default.
+    ``None`` when there is nothing to fold.
     """
     user = build_summary_delta_message(summary, turn_messages)
     if user is None:
@@ -604,6 +713,7 @@ def build_summary_delta_request(
         tools=[],
         max_tokens=rc.session_memory_fold_max_output_tokens,
         temperature=temperature,
+        extra={} if thinking is None else {"enable_thinking": thinking},
     )
 
 
@@ -668,7 +778,8 @@ def extract_artifacts(
 
     Reads the ``path`` and ``content`` argument slots of workspace-mutating
     tool calls. Order-preserving and de-duplicated; the latest write of a path
-    wins its snapshot.
+    wins its snapshot. Hand it the run's messages as they happened, never a
+    seed: a masked call's long arguments are no longer there.
     """
     ledger = ArtifactLedger(
         files=list(base.files) if base else [],
@@ -717,12 +828,19 @@ class SessionMemory:
     """The durable, per-session memory carried across runs.
 
     ``turn_index`` counts the runs recorded (0 = a fresh memory). Which turns
-    the summary covers is the host's record — a position in its own store —
-    and reaches the seed builder as a predicate; it is not kept here.
+    the summary covers is part of the summary
+    (:attr:`SessionSummary.covered_through`), so the two are stored, rolled
+    back and reset together.
 
     ``stale_fold_count`` counts consecutive folds that tried to add to the
     summary and could not (a refused reply). The host, which knows which kind
     of fold ran, owns the increment; :func:`fold_run` carries it through.
+
+    Loading a memory stored by an earlier format: :meth:`from_dict` reads only
+    the keys :meth:`to_dict` writes, so a dict without ``"summary"`` loads with
+    a fresh summary that covers nothing (its registry and counters still
+    load), and :meth:`SessionSummary.from_text` refuses text it did not
+    write. Either way every stored turn is carried in the next seed again.
     """
 
     summary: SessionSummary = field(default_factory=SessionSummary)
@@ -731,7 +849,12 @@ class SessionMemory:
     stale_fold_count: int = 0
 
     def is_empty(self) -> bool:
-        return self.turn_index == 0 and self.summary.is_empty() and self.ledger.is_empty()
+        return (
+            self.turn_index == 0
+            and self.summary.is_empty()
+            and self.summary.covered_through == NOTHING_COVERED
+            and self.ledger.is_empty()
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -759,7 +882,7 @@ class FoldResult:
 
     memory: SessionMemory
     summary_updated: bool = False
-    """The delta added, replaced or shed something."""
+    """The delta added, replaced or shed something, or advanced coverage."""
     report: MergeReport = field(default_factory=MergeReport)
     notes: dict[str, Any] = field(default_factory=dict)
 
@@ -770,20 +893,37 @@ def fold_run(
     delta: SummaryDelta | None,
     rc: LoopConstants,
     roles: ToolRoleMap = EMPTY_TOOL_ROLE_MAP,
+    *,
+    covers_through: int | None = None,
 ) -> FoldResult:
     """Record one finished run in ``memory`` — PURE; the input is not mutated.
 
+    Called ONCE per run, with or without a fold:
+
     * The artifact registry takes the run's file writes (always; no model).
-    * ``delta`` — the parsed reply of a fold the planner asked for, or
-      ``None`` when no fold ran (the usual case) or it failed — is appended to
-      the summary and the result held to its cap.
+    * ``delta`` — the parsed reply of the fold the planner asked for, or
+      ``None`` when no fold ran or it failed (an unparsable reply raised
+      :class:`SummaryDeltaError` before this point and must be passed as
+      ``None``) — is appended to the summary and the result held to its cap,
+      and the summary's coverage advances to ``covers_through``
+      (:attr:`~protocore.runtime.context.session_seed.FoldPlan.covers_through`),
+      which a delta requires. A delta whose ``covers_through`` the summary
+      already reaches is not applied again (:attr:`MergeReport.already_applied`).
     * ``turn_index`` advances.
     """
     ledger = extract_artifacts(run_messages, base=memory.ledger, roles=roles)
     summary = memory.summary
     report = MergeReport()
     if delta is not None:
-        summary, report = merge_summary_delta(summary, delta, rc)
+        if covers_through is None:
+            raise ValueError("a delta needs the coverage it advances to (covers_through)")
+        if covers_through <= summary.covered_through:
+            report = MergeReport(already_applied=True)
+        else:
+            merged, report = merge_summary_delta(summary, delta, rc)
+            summary = SessionSummary(
+                entries=merged.entries, shed=merged.shed, covered_through=covers_through
+            )
     updated = summary != memory.summary
     new_memory = SessionMemory(
         summary=summary,
@@ -799,6 +939,7 @@ def fold_run(
             "folded_messages": len(run_messages),
             "ledger_files": len(ledger.files),
             "summary_tokens": estimate_tokens(summary.render(), rc),
+            "covered_through": summary.covered_through,
             "entries_added": report.added,
             "entries_shed": report.shed,
         },
@@ -807,6 +948,8 @@ def fold_run(
 
 __all__ = [
     "END_OF_SUMMARY_MARKER",
+    "NOTHING_COVERED",
+    "NOTHING_NEW",
     "SUMMARY_DELTA_SYSTEM",
     "SUMMARY_SECTIONS",
     "ArtifactLedger",

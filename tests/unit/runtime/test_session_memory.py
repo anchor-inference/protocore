@@ -20,6 +20,7 @@ from protocore.contracts.types import (
     ToolUseBlock,
 )
 from protocore.runtime.context.session_memory import (
+    NOTHING_COVERED,
     SUMMARY_DELTA_SYSTEM,
     SUMMARY_SECTIONS,
     ArtifactLedger,
@@ -161,10 +162,10 @@ def test_delta_prompt_asks_only_for_what_is_new_and_is_multilingual() -> None:
 
 
 def test_delta_message_carries_the_existing_summary_and_the_turns() -> None:
-    summary = SessionSummary(entries={"REQUESTS": ("find books on topic 1",)})
+    summary = SessionSummary(entries={"REQUESTS": ("find items on topic 1",)})
     text = build_summary_delta_message(summary, [_user("new question"), _tool_result("result body")])
     assert text is not None
-    assert "EXISTING SUMMARY (already recorded — do not repeat):\nREQUESTS:\n- find books on topic 1" in text
+    assert "EXISTING SUMMARY (already recorded — do not repeat):\nREQUESTS:\n- find items on topic 1" in text
     assert "NEW TURNS" in text and "new question" in text and "[tool result: result body]" in text
 
 
@@ -175,21 +176,27 @@ def test_delta_message_with_no_summary_says_empty() -> None:
 
 def test_delta_request_is_bounded_by_what_the_summary_can_store() -> None:
     rc = LoopConstants(session_memory_fold_max_output_tokens=700)
-    request = build_summary_delta_request(SessionSummary(), [_user("task")], rc, model="m", temperature=0.1)
+    request = build_summary_delta_request(SessionSummary(), [_user("task")], rc, model="m", thinking=False, temperature=0.1)
     assert request is not None
     assert request.max_tokens == 700 and request.temperature == 0.1 and not request.tools
+    assert request.extra == {"enable_thinking": False}
     assert request.messages[0].role is MessageRole.system
     assert request.messages[0].text == SUMMARY_DELTA_SYSTEM
-    assert build_summary_delta_request(SessionSummary(), [], rc, model="m") is None
+    default = build_summary_delta_request(SessionSummary(), [_user("task")], rc, model="m", thinking=None)
+    assert default is not None and "enable_thinking" not in default.extra
+    assert build_summary_delta_request(SessionSummary(), [], rc, model="m", thinking=False) is None
 
 
 def test_delta_message_for_nothing_is_none() -> None:
     assert build_summary_delta_message(SessionSummary(), []) is None
 
 
-def test_delta_message_caps_long_tool_blocks() -> None:
-    text = build_summary_delta_message(SessionSummary(), [_write_call("a.py", "x" * 5000), _tool_result("y" * 5000)])
-    assert text is not None and len(text) < 2000
+def test_delta_message_renders_what_it_is_handed_without_cutting() -> None:
+    # The fold is handed the masked turns (already bounded, kept lines
+    # included); cutting them again here is what lost deep citation lines.
+    tail = "Cite: deep line 9"
+    text = build_summary_delta_message(SessionSummary(), [_tool_result("y" * 3000 + "\n" + tail)])
+    assert text is not None and tail in text
 
 
 # --- parsing a reply -------------------------------------------------------------
@@ -197,13 +204,13 @@ def test_delta_message_caps_long_tool_blocks() -> None:
 
 def test_parse_reads_entries_under_headings_in_any_order() -> None:
     reply = (
-        "KEY FACTS & IDENTIFIERS:\n- The second book is B1 (ISBN 978-5-0000-0000-1)\n"
-        "REQUESTS:\n- find books on topic 1\n\n"
+        "KEY FACTS & IDENTIFIERS:\n- The second item is I1 (code 12-3456-7)\n"
+        "REQUESTS:\n- find items on topic 1\n\n"
         "PENDING / NEXT:\n- compare editions\n"
     )
     delta = parse_summary_delta(reply)
-    assert delta.entries["KEY FACTS & IDENTIFIERS"] == ("The second book is B1 (ISBN 978-5-0000-0000-1)",)
-    assert delta.entries["REQUESTS"] == ("find books on topic 1",)
+    assert delta.entries["KEY FACTS & IDENTIFIERS"] == ("The second item is I1 (code 12-3456-7)",)
+    assert delta.entries["REQUESTS"] == ("find items on topic 1",)
     assert delta.entries["PENDING / NEXT"] == ("compare editions",)
 
 
@@ -212,7 +219,7 @@ def test_parse_tolerates_presentation() -> None:
         "## 1. **Constraints and Decisions**\n* answer in Russian\n"
         "**key facts & identifiers:** port 8080\n"
         "3) Pending/Next:\n1. check the index\n"
-        "• ARTIFACTS\n\u2013 notes.md: draft\n"
+        "> ARTIFACTS\n\u2013 notes.md: draft\n"
     )
     delta = parse_summary_delta(reply)
     assert delta.entries["CONSTRAINTS & DECISIONS"] == ("answer in Russian",)
@@ -227,9 +234,44 @@ def test_parse_drops_punctuation_only_entries_and_counts_stray_lines() -> None:
     assert delta.unattributed_lines == 1
 
 
-def test_parse_empty_reply_is_an_empty_delta() -> None:
-    assert parse_summary_delta("").is_empty()
+def test_an_empty_or_all_reasoning_reply_is_not_a_fold() -> None:
+    for reply in ("", "   \n", "<think>the bound ran out while thinking", "<think>done</think>\n  "):
+        with pytest.raises(SummaryDeltaError):
+            parse_summary_delta(reply)
+        with pytest.raises(SummaryDeltaError):
+            parse_summary_delta(reply, truncated=True)
+
+
+def test_nothing_new_is_a_valid_empty_delta() -> None:
+    delta = parse_summary_delta("NOTHING NEW")
+    assert delta.is_empty() and delta.nothing_new
+    assert parse_summary_delta("<think>checked</think>\nNothing new.").nothing_new
     assert parse_summary_delta("REQUESTS:\n\nARTIFACTS:\n").is_empty()
+
+
+def test_a_truncated_reply_without_a_complete_entry_is_not_a_fold() -> None:
+    with pytest.raises(SummaryDeltaError):
+        parse_summary_delta("REQUESTS:\n- find th", truncated=True)
+    with pytest.raises(SummaryDeltaError):
+        parse_summary_delta("NOTHING NEW", truncated=True)
+
+
+def test_reasoning_before_the_reply_is_not_an_entry() -> None:
+    delta = parse_summary_delta("<think>REQUESTS:\n- not a real one</think>\nREQUESTS:\n- real one")
+    assert delta.entries == {"REQUESTS": ("real one",)}
+
+
+def test_placeholder_entries_are_dropped() -> None:
+    delta = parse_summary_delta("PENDING / NEXT:\n- none\n- None.\n- N/A\n- нет\nREQUESTS:\n- keep this")
+    assert delta.entries == {"REQUESTS": ("keep this",)}
+
+
+def test_a_bulleted_entry_naming_a_section_stays_in_its_section() -> None:
+    reply = "KEY FACTS & IDENTIFIERS:\n- Requests: limited to 3 per minute\n- LP-1234\n- db-7.internal:5432"
+    delta = parse_summary_delta(reply)
+    assert delta.entries == {
+        "KEY FACTS & IDENTIFIERS": ("Requests: limited to 3 per minute", "LP-1234", "db-7.internal:5432")
+    }
 
 
 def test_parse_refuses_a_reply_with_no_heading() -> None:
@@ -247,12 +289,30 @@ def test_parse_clips_a_huge_entry() -> None:
     assert len(delta.entries["KEY FACTS & IDENTIFIERS"][0]) <= 1000
 
 
-def test_summary_text_round_trip_keeps_shed_counts() -> None:
-    summary = SessionSummary(entries={"REQUESTS": ("a",), "KEY FACTS & IDENTIFIERS": ("b",)}, shed={"ARTIFACTS": 4, "REQUESTS": 2})
-    assert SessionSummary.from_text(summary.render()) == summary
-    assert SessionSummary.from_text("") == SessionSummary()
+def test_summary_text_round_trip_is_exact() -> None:
+    summary = SessionSummary(
+        entries={"REQUESTS": ("a",), "KEY FACTS & IDENTIFIERS": ("b", "PENDING / NEXT: was discussed")},
+        shed={"ARTIFACTS": 4, "REQUESTS": 2},
+        covered_through=17,
+    )
+    assert SessionSummary.from_text(summary.render(), covered_through=17) == summary
+    assert SessionSummary.from_text("", covered_through=3) == SessionSummary(covered_through=3)
+
+
+def test_text_of_an_earlier_format_is_refused_not_half_read() -> None:
+    legacy = "ORIGINAL ASK:\nfind the items\nCONSTRAINTS & DECISIONS:\nanswer briefly\n"
     with pytest.raises(SummaryDeltaError):
-        SessionSummary.from_text("free prose")
+        SessionSummary.from_text(legacy, covered_through=40)
+    with pytest.raises(SummaryDeltaError):
+        SessionSummary.from_text("free prose", covered_through=0)
+
+
+def test_a_memory_dict_of_an_earlier_format_loads_covering_nothing() -> None:
+    legacy = {"running_summary": "ORIGINAL ASK: x", "ledger": {"files": ["a.md"]}, "turn_index": 4, "cumulative_raw_tokens": 9}
+    memory = SessionMemory.from_dict(legacy)
+    assert memory.summary == SessionSummary()
+    assert memory.summary.covered_through == NOTHING_COVERED
+    assert memory.ledger.files == ["a.md"] and memory.turn_index == 4
 
 
 def test_parse_reads_its_own_rendering_back() -> None:
@@ -266,10 +326,10 @@ def test_parse_reads_its_own_rendering_back() -> None:
 
 
 def test_merge_appends_and_skips_duplicates() -> None:
-    summary = SessionSummary(entries={"KEY FACTS & IDENTIFIERS": ("B1 is the second book",)})
-    delta = SummaryDelta(entries={"KEY FACTS & IDENTIFIERS": ("b1  is the SECOND book", "B2 is the third")})
+    summary = SessionSummary(entries={"KEY FACTS & IDENTIFIERS": ("I1 is the second item",)})
+    delta = SummaryDelta(entries={"KEY FACTS & IDENTIFIERS": ("i1  is the SECOND item", "I2 is the third")})
     merged, report = merge_summary_delta(summary, delta, RC)
-    assert merged.section("KEY FACTS & IDENTIFIERS") == ("B1 is the second book", "B2 is the third")
+    assert merged.section("KEY FACTS & IDENTIFIERS") == ("I1 is the second item", "I2 is the third")
     assert (report.added, report.duplicates) == (1, 1)
 
 
@@ -363,24 +423,51 @@ def test_fold_run_without_a_delta_updates_only_the_registry_and_turn() -> None:
     assert result.memory.stale_fold_count == 1  # the host owns this counter
 
 
-def test_fold_run_appends_a_delta() -> None:
-    memory = SessionMemory(summary=SessionSummary(entries={"REQUESTS": ("r",)}), turn_index=2)
-    result = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("r2",)}), RC)
+def test_fold_run_appends_a_delta_and_advances_coverage() -> None:
+    memory = SessionMemory(summary=SessionSummary(entries={"REQUESTS": ("r",)}, covered_through=3), turn_index=2)
+    result = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("r2",)}), RC, covers_through=9)
     assert result.summary_updated
     assert result.memory.summary.section("REQUESTS") == ("r", "r2")
+    assert result.memory.summary.covered_through == 9
     assert result.report.added == 1
     assert result.notes["entries_added"] == 1
 
 
-def test_fold_run_with_an_empty_delta_changes_nothing_in_the_summary() -> None:
+def test_fold_run_needs_the_coverage_a_delta_advances_to() -> None:
+    with pytest.raises(ValueError, match="covers_through"):
+        fold_run(SessionMemory(), [], SummaryDelta(entries={"REQUESTS": ("r",)}), RC)
+
+
+def test_applying_the_same_delta_twice_changes_nothing_the_second_time() -> None:
+    rc = LoopConstants(session_memory_running_summary_token_cap=200, session_memory_fold_max_output_tokens=200)
+    delta = SummaryDelta(entries={"ARTIFACTS": tuple(f"file{i}.md: " + "a" * 100 for i in range(6))})
+    once = fold_run(SessionMemory(), [], delta, rc, covers_through=10).memory
+    twice = fold_run(once, [], delta, rc, covers_through=10)
+    assert twice.report.already_applied
+    assert twice.memory.summary == once.summary
+    assert twice.memory.turn_index == once.turn_index + 1
+
+
+def test_a_truncated_reply_does_not_supersede_pending() -> None:
+    stored = SessionSummary(entries={"PENDING / NEXT": ("report to the lead", "fix LP-9", "reserve the room")})
+    delta = parse_summary_delta("PENDING / NEXT:\n- report to the lead\n- fix LP-9\n- reserve the ro", truncated=True)
+    assert delta.truncated
+    merged, report = merge_summary_delta(stored, delta, RC)
+    assert merged.section("PENDING / NEXT") == ("report to the lead", "fix LP-9", "reserve the room")
+    assert report.kept_on_truncation == ("PENDING / NEXT",)
+    assert report.replaced_sections == ()
+
+
+def test_fold_run_with_nothing_new_advances_only_coverage() -> None:
     memory = SessionMemory(summary=SessionSummary(entries={"REQUESTS": ("r",)}), turn_index=2)
-    result = fold_run(memory, [], SummaryDelta(), RC)
-    assert not result.summary_updated
+    result = fold_run(memory, [], parse_summary_delta("NOTHING NEW"), RC, covers_through=5)
+    assert result.memory.summary.entries == memory.summary.entries
+    assert result.memory.summary.covered_through == 5
 
 
 def test_fold_run_does_not_mutate_its_input() -> None:
     memory = SessionMemory(turn_index=1)
-    fold_run(memory, [_write_call("a.py", "x")], SummaryDelta(entries={"REQUESTS": ("r",)}), RC, roles=CONVENTIONAL_TOOL_ROLES)
+    fold_run(memory, [_write_call("a.py", "x")], SummaryDelta(entries={"REQUESTS": ("r",)}), RC, roles=CONVENTIONAL_TOOL_ROLES, covers_through=1)
     assert memory.summary.is_empty() and memory.ledger.is_empty() and memory.turn_index == 1
 
 

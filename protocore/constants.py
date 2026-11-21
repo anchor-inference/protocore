@@ -78,6 +78,12 @@ DEFAULT_MODEL: Final[str] = "qwen3.6-35b-a3b"
 # run carries, so a full re-estimate of that history never evicts its own head.
 MAX_TOKEN_ESTIMATE_CACHE_ENTRIES: Final[int] = 4096
 
+# How many prepared turns one session's seed cache keeps (each holds a turn's
+# full and masked messages). Far past the turns a seed carries, so a session
+# that is seeded and planned every run never evicts its own window; a turn
+# that falls out is only prepared again.
+MAX_SESSION_SEED_CACHE_ENTRIES: Final[int] = 1024
+
 # How many distinct tool surfaces one process remembers — the token estimates
 # and the descriptions it can answer a reader with. A deployment advertises one
 # surface, or a few where scopes differ; the bound is there so a process that
@@ -102,6 +108,7 @@ __all__ = [
     "MAX_INLINE_TOOL_IMAGE_BYTES",
     "MAX_LLM_CALL_DETAILS",
     "MAX_REPORT_EVENTS",
+    "MAX_SESSION_SEED_CACHE_ENTRIES",
     "MAX_STRUCTURED_JSON_CHARS",
     "MAX_SUBAGENT_RUNS",
     "MAX_TOKEN_ESTIMATE_CACHE_ENTRIES",

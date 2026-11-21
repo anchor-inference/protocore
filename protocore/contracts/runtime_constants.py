@@ -958,14 +958,19 @@ class LoopConstants(BaseModel):
         default=1000,
         gt=0,
         description=(
-            "Output bound for one summary fold. A fold writes only the facts "
-            "the turns leaving the raw window add (a few hundred tokens in a "
-            "tool-heavy chat), never the whole summary again, so the bound is "
-            "sized on that delta: it stops a runaway reply early instead of "
-            "decoding thousands of tokens that the summary cap would shed at "
-            "once. Must not exceed session_memory_running_summary_token_cap "
-            "when that cap is set: a delta larger than what can be stored is "
-            "paid for and then thrown away."
+            "Output bound, in the provider's tokens, for one summary fold. A "
+            "fold writes only the facts the turns leaving the raw window add "
+            "(a few hundred tokens in a tool-heavy chat), never the whole "
+            "summary again, so the bound is sized on that delta: it stops a "
+            "runaway reply early instead of decoding thousands of tokens the "
+            "summary cap would shed at once. Validated to be at most "
+            "session_memory_running_summary_token_cap when that cap is set. "
+            "The comparison is approximate: the cap is the core's estimate, "
+            "calibrated to the provider's count by "
+            "token_estimate_calibration, and this bound is the provider's own "
+            "count; it guards against a bound far past what can be stored, "
+            "not against a few tokens either way. Send the fold with thinking "
+            "off, or a reasoning model can spend the bound before it writes."
         ),
     )
     session_memory_head_protect_turns: int = Field(
@@ -998,13 +1003,13 @@ class LoopConstants(BaseModel):
         ge=0,
         description=(
             "How many of the newest prior turns the seed carries with their "
-            "tool results in full. Older turns keep every user and assistant "
-            "word and every tool call, and their tool results are replaced by "
-            "a short placeholder (tool, arguments, the lines the masking rule "
-            "keeps). Full turns are carried when they fit the seed budget; "
-            "otherwise the older ones are masked and the newest is cut to fit. "
-            "They never cause a fold: the fold planner sizes the history on "
-            "its masked form."
+            "tool exchanges in full. Older turns keep every user and assistant "
+            "word and every tool call; their long tool results become a short "
+            "placeholder (tool, size, the lines the masking rule keeps, a "
+            "head), their images and reasoning are dropped and long call "
+            "arguments are cut to a head. The fold planner keeps room for the "
+            "full turns: it folds older turns early rather than cut them, as "
+            "long as the budget can hold them at all."
         ),
     )
     session_seed_mask_batch_turns: int = Field(
@@ -1020,13 +1025,14 @@ class LoopConstants(BaseModel):
             "where two full tool-heavy turns do not fit the seed anyway."
         ),
     )
-    session_seed_mask_min_tokens: int = Field(
-        default=150,
+    session_seed_mask_min_chars: int = Field(
+        default=600,
         ge=0,
         description=(
-            "Tool results smaller than this, in estimated tokens, are carried "
-            "whole in masked turns: the placeholder would cost about what it "
-            "saves."
+            "Tool results shorter than this many characters are carried whole "
+            "in masked turns (their images still go): the placeholder would "
+            "cost about what it saves. A placeholder is also never used when "
+            "it would be longer than the result it replaces."
         ),
     )
     session_seed_mask_preview_chars: int = Field(
@@ -1037,6 +1043,22 @@ class LoopConstants(BaseModel):
             "placeholder, after the lines the masking rule keeps. 0 keeps no "
             "head."
         ),
+    )
+    session_seed_mask_arg_max_chars: int = Field(
+        default=400,
+        gt=0,
+        description=(
+            "In masked turns, a string argument of a tool call longer than "
+            "this is cut to its head and the number of characters not "
+            "carried; keys and shorter values (paths, ids) stay whole and the "
+            "arguments stay valid JSON. A file a call wrote is still in the "
+            "artifact registry, which is built from the run as it happened."
+        ),
+    )
+    session_seed_mask_arg_preview_chars: int = Field(
+        default=120,
+        ge=0,
+        description="Head of a cut tool-call argument kept in a masked turn.",
     )
     session_seed_mask_identifier_lines: int = Field(
         default=8,
@@ -1057,9 +1079,11 @@ class LoopConstants(BaseModel):
         description=(
             "Share of the seed budget at which a fold is planned. After a run, "
             "the planner measures what the next seed would carry — the head, "
-            "the summary at its cap, the artifact registry and every turn "
-            "after the summary in masked form — and plans a fold only when "
-            "that exceeds this share. Below it no summariser call is made."
+            "the summary at its cap, the artifact registry, every older turn "
+            "after the summary in masked form, and the newest full turns at "
+            "their full size when the budget can hold them — and plans a fold "
+            "only when that exceeds this share. Below it no summariser call "
+            "is made."
         ),
     )
     session_seed_fold_target_ratio: float = Field(

@@ -58,12 +58,15 @@ def test_the_seed_and_the_plan_size_turns_on_the_shared_scale() -> None:
     rich = [_question(), _with_thinking_and_image()]
     memory = SessionMemory(turn_index=1)
 
-    plain_seed = build_session_seed(plain, memory, 100_000, rc)
-    rich_seed = build_session_seed(rich, memory, 100_000, rc)
+    def position(message: Message) -> int | None:
+        return None
+
+    plain_seed = build_session_seed(plain, memory, 100_000, rc, position=position)
+    rich_seed = build_session_seed(rich, memory, 100_000, rc, position=position)
     assert rich_seed.tokens == sum(estimate_message_tokens(m, rc) for m in rich_seed.messages)
     assert rich_seed.tokens > plain_seed.tokens
 
     assert (
-        plan_session_fold(rich, memory, 100_000, rc).projected_tokens
-        > plan_session_fold(plain, memory, 100_000, rc).projected_tokens
+        plan_session_fold(rich, memory, 100_000, rc, position=position).projected_tokens
+        > plan_session_fold(plain, memory, 100_000, rc, position=position).projected_tokens
     )

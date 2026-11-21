@@ -10,32 +10,43 @@ All notable changes to this project are recorded here. The format follows
 
 - **A session's next run is seeded from its raw earlier turns, and the
   summary stands in only for what no longer fits.**
-  `runtime/context/session_seed.py` is new: `build_session_seed(history,
-  memory, budget, rc, covered=..., rule=..., drop_uncovered=False)` carries
-  every earlier turn whole — user and assistant text and tool calls verbatim,
-  unpaired calls and results taken out — with the tool results of all but the
-  newest `session_seed_full_turns` turns replaced by a placeholder that keeps
-  the tool, its arguments, the head of the result and the lines a
-  `MaskingRule` names (by default the lines starting with one of
-  `tool_result_stale_trim_protected_prefixes` and lines carrying an
-  identifier). The layout is head turns, summary, window, artifact registry; a
-  turn leaves the window only once the summary covers it, and a masked turn is
-  the same bytes in every seed, so consecutive seeds share everything up to
-  the previous seed's full tail and a provider's prefix cache can serve it.
-  `plan_session_fold(...)` says after a run which turns need folding: none
-  until the masked history passes `session_seed_fold_trigger_ratio` of the
-  seed budget, then the oldest down to `session_seed_fold_target_ratio`. A
-  tool-heavy turn of ten thousand tokens no longer forces a summariser call
-  after every run, and a landed fold no longer replaces the previous turn with
-  a notice that it was too long to carry.
-- **The running summary grows by deltas.** `SessionMemory.summary` is a
-  `SessionSummary` of entries under five fixed sections (REQUESTS,
-  CONSTRAINTS & DECISIONS, KEY FACTS & IDENTIFIERS, PENDING / NEXT,
-  ARTIFACTS). A fold is asked only for what the turns leaving the window add
-  (`SUMMARY_DELTA_SYSTEM`, `build_summary_delta_message`,
-  `build_summary_delta_request` with an output bound of the new
-  `session_memory_fold_max_output_tokens`, 1000); `parse_summary_delta` reads
-  the reply and `fold_run(memory, run_messages, delta, rc)` appends it. Past
+  `runtime/context/session_seed.py` is new.
+  `build_session_seed(history, memory, budget, rc, position=..., rule=...,
+  cache=..., drop_uncovered=False)` carries every earlier turn whole: user and
+  assistant text and tool calls verbatim, calls and results paired in order
+  (an unpaired or out-of-order one is taken out). In all but the newest
+  `session_seed_full_turns` turns a long tool result becomes a placeholder —
+  the tool, the size of what is missing, the lines a `MaskingRule` names (by
+  default lines starting with one of `tool_result_stale_trim_protected_prefixes`
+  and lines carrying an identifier) and the head of the result — used only
+  when it is shorter and worded as a statement, not an instruction; tool
+  images are dropped and counted, string arguments past
+  `session_seed_mask_arg_max_chars` are cut to a head in valid JSON, and the
+  turn's reasoning is dropped. The layout is head turns, summary, window,
+  artifact registry; a masked turn is the same bytes in every seed, so
+  consecutive seeds share everything up to the previous seed's full tail and a
+  provider's prefix cache can serve it. `plan_session_fold(...)` says after a
+  run which turns need folding: it counts the newest turn at its full size
+  when the budget can hold it, and folds older turns once the seed passes
+  `session_seed_fold_trigger_ratio` of the budget, down to
+  `session_seed_fold_target_ratio`. A `SeedCache` kept per session makes a run
+  cost only its new turns; both calls are CPU-bound and belong off an event
+  loop.
+- **The running summary grows by deltas and carries its own coverage.**
+  `SessionMemory.summary` is a `SessionSummary`: entries under five fixed
+  sections (REQUESTS, CONSTRAINTS & DECISIONS, KEY FACTS & IDENTIFIERS,
+  PENDING / NEXT, ARTIFACTS) and `covered_through`, the session position the
+  summary records up to. A summary that is reset covers nothing, so no turn
+  can be dropped from a seed on its strength. A fold is shown the turns
+  leaving the window in their masked form and asked only for what they add
+  (`SUMMARY_DELTA_SYSTEM`, `build_summary_delta_request`, which takes the
+  host's thinking switch and bounds output by the new
+  `session_memory_fold_max_output_tokens`, 1000). `parse_summary_delta`
+  refuses an empty or all-reasoning reply and one cut off before its first
+  complete entry, so no coverage advances on it; a cut-off reply never
+  replaces PENDING / NEXT. `fold_run(memory, run_messages, delta, rc, roles,
+  covers_through=...)` appends the entries and records the coverage, and a
+  delta the memory already covers is not applied twice. Past
   `session_memory_running_summary_token_cap` whole entries are shed oldest
   first — ARTIFACTS, later REQUESTS, KEY FACTS & IDENTIFIERS, CONSTRAINTS &
   DECISIONS, PENDING / NEXT last — instead of cutting characters from the
@@ -52,8 +63,11 @@ All notable changes to this project are recorded here. The format follows
   `SessionMemory.running_summary` and `SessionMemory.cumulative_raw_tokens`,
   and the constants `session_memory_tail_budget_fraction`,
   `session_memory_head_protect_messages` and `session_memory_fold_min_tokens`.
-  The seed builder and the fold planner above replace them; a stored memory
-  from before this change loads with an empty summary.
+  A memory stored by the earlier format loads with a fresh summary that
+  covers nothing (`SessionMemory.from_dict` reads only the new keys, and
+  `SessionSummary.from_text` refuses text it did not write), so the next seed
+  carries every stored turn again; its artifact registry and counters still
+  load.
 
 ## [2.0.0b1] - 2026-11-20
 
