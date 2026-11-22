@@ -973,6 +973,17 @@ class LoopConstants(BaseModel):
             "off, or a reasoning model can spend the bound before it writes."
         ),
     )
+    session_memory_pending_max_items: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            "Most open items PENDING / NEXT keeps. A chat assistant ends most "
+            "answers with an offer, and few of them are ever marked done, so "
+            "the list would otherwise only grow and crowd the facts out of "
+            "the summary; past this count the oldest open items are dropped "
+            "first, and the merge report says how many."
+        ),
+    )
     session_memory_registry_max_tokens: int = Field(
         default=2000,
         ge=0,
@@ -1137,6 +1148,17 @@ class LoopConstants(BaseModel):
             "on, with no further summariser call for it. The planner halves "
             "its batch for every consecutive fold that did not land, so a "
             "summariser that keeps being cut reaches one turn per fold first."
+        ),
+    )
+    session_seed_pin_release_runs: int = Field(
+        default=20,
+        ge=1,
+        description=(
+            "Runs after which a pinned turn — one the summariser was cut off "
+            "on repeatedly, carried masked instead of summarised — is folded "
+            "again. A pin is also released at once when the summary cap, the "
+            "fold output bound or the host's summariser changes, since the "
+            "cut-off may not happen again."
         ),
     )
     session_seed_budget_ratio: float = Field(

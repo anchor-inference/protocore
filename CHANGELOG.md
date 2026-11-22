@@ -29,7 +29,13 @@ All notable changes to this project are recorded here. The format follows
   `plan_session_fold(...)` says after a run which turns need folding, keeps
   folds at least `session_seed_fold_min_turns_between` runs apart, halves
   its batch after every fold that did not land, and pins a turn the
-  summariser was cut off on `session_seed_fold_cuts_before_pin` times. A
+  summariser was cut off on `session_seed_fold_cuts_before_pin` times (that
+  turn only, released after `session_seed_pin_release_runs` runs or when the
+  cap, output bound or summariser changes). The routine compaction gate opens
+  for a seeded full turn and re-masks it oldest first, only as far as needed;
+  `recommend_seed_budget` never gives less than the previous question and
+  answer, and the session's first question is carried even when its turn is
+  too large to protect. A
   thread-safe `SeedCache` per session makes a run cost only its new turns.
 - **The running summary grows by deltas and carries its own coverage.**
   `SessionMemory.summary` is a `SessionSummary`: entries under five fixed
@@ -41,11 +47,14 @@ All notable changes to this project are recorded here. The format follows
   fenced as untrusted data, and asked only for what they add
   (`build_summary_delta_request`, with the host's thinking switch and the
   output bound `session_memory_fold_max_output_tokens`). PENDING / NEXT is a
-  list of open items: `- DONE: <item>` closes the item it names, only
-  `- nothing open` empties it. `parse_summary_delta` refuses an empty,
+  list of open items: a line starting with the exact token `DONE:` closes
+  the one item it names, only the exact entry `NOTHING-OPEN` empties it, at
+  most `session_memory_pending_max_items` open items are kept, and entries
+  are compared without merging distinct numbers or codes.
+  `parse_summary_delta` refuses an empty,
   all-reasoning or cut-before-its-first-entry reply; a later cut reply only
   adds and does not advance coverage. `fold_run(..., step=plan.step,
-  fold_attempted=...)` refuses a step planned against another coverage,
+  fold_attempted=..., summariser=...)` refuses a step planned against another coverage,
   never applies one twice, keeps the stale-fold count, and reports
   `NOTHING NEW` folds over user turns. Past
   `session_memory_running_summary_token_cap` whole entries are shed oldest

@@ -858,6 +858,8 @@ def tier1_has_work(
     """Whether :func:`run_tier1_truncation` would rewrite anything — without rewriting it."""
     if not history:
         return False
+    if any(is_seeded_full(message) for message in history):
+        return True
     keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
     eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index, rc)
     for message in history[:eligible_upper]:
@@ -969,41 +971,88 @@ async def _mask_result(
     return masked, original_tokens - estimate_tokens(text, rc), created
 
 
-def remask_seeded_turns(history: list[Message], rc: LoopConstants) -> int:
-    """Put the masked form of seeded full turns in place — the first thing Tier 1 gives up.
+@dataclass(frozen=True, slots=True)
+class RemaskResult:
+    """What :func:`remask_seeded_turns` did."""
+
+    tokens_freed: int = 0
+    messages_removed: int = 0
+    """Messages deleted (a masked turn leaves out a message that is only
+    reasoning); every one of them lies before the run's own messages."""
+    tagged_left: int = 0
+    """Seeded messages still in their full form (the target was met first)."""
+
+
+def _masked_form(message: Message) -> Message | None:
+    """The form a seed tagged ``message`` with; ``None`` when that form leaves it out."""
+    form = message.metadata.get(SESSION_SEED_MASKED_FORM_METADATA_KEY)
+    metadata = {k: v for k, v in message.metadata.items() if k != SESSION_SEED_MASKED_FORM_METADATA_KEY}
+    if not isinstance(form, dict):
+        return message.model_copy(update={"metadata": metadata})
+    if form.get("drop") is True:
+        return None
+    dumped = form.get("message")
+    if not isinstance(dumped, dict):
+        return message.model_copy(update={"metadata": metadata})
+    return Message.model_validate({**dumped, "created_at": message.created_at, "metadata": metadata})
+
+
+def is_seeded_full(message: Message) -> bool:
+    """Whether ``message`` belongs to a seed's unmasked newest turn and can still be re-masked."""
+    return isinstance(message.metadata.get(SESSION_SEED_MASKED_FORM_METADATA_KEY), dict)
+
+
+def remask_surplus_tokens(history: Sequence[Message], rc: LoopConstants) -> int:
+    """What re-masking every seeded full message would free, without doing it."""
+    surplus = 0
+    for message in history:
+        if not is_seeded_full(message):
+            continue
+        masked = _masked_form(message)
+        surplus += estimate_message_tokens(message, rc) - (0 if masked is None else estimate_message_tokens(masked, rc))
+    return max(0, surplus)
+
+
+def remask_seeded_turns(
+    history: list[Message],
+    rc: LoopConstants,
+    *,
+    free_target_tokens: int | None = None,
+) -> RemaskResult:
+    """Put the masked form of seeded full turns in place — the first thing compaction gives up.
 
     A seed carries its newest earlier turns uncut so that a follow-up can read
     them, and tags every message of them with the form the next seed would
     carry it in (:data:`SESSION_SEED_MASKED_FORM_METADATA_KEY`). When a run's
-    own work needs room, those turns give way before anything of the run's: each
-    tagged message is replaced by exactly that form (or removed, when the
+    own work needs room, those turns give way before anything of the run's:
+    a tagged message is replaced by exactly that form (or removed, when the
     masked turn leaves it out), so what the run keeps is what the next run
-    will see. Mutates ``history`` in place; returns the tokens freed.
+    will see. Oldest first, and only until ``free_target_tokens`` are freed
+    (all of them when ``None``): a follow-up about the previous turn's detail
+    keeps it when a little room is enough. Mutates ``history`` in place.
     """
     freed = 0
+    removed = 0
     index = 0
     while index < len(history):
+        if free_target_tokens is not None and freed >= free_target_tokens:
+            break
         message = history[index]
-        form = message.metadata.get(SESSION_SEED_MASKED_FORM_METADATA_KEY)
-        if not isinstance(form, dict):
+        if not is_seeded_full(message):
             index += 1
             continue
-        metadata = {k: v for k, v in message.metadata.items() if k != SESSION_SEED_MASKED_FORM_METADATA_KEY}
         before = estimate_message_tokens(message, rc)
-        if form.get("drop") is True:
+        masked = _masked_form(message)
+        if masked is None:
             del history[index]
             freed += before
+            removed += 1
             continue
-        dumped = form.get("message")
-        if not isinstance(dumped, dict):
-            history[index] = message.model_copy(update={"metadata": metadata})
-            index += 1
-            continue
-        masked = Message.model_validate({**dumped, "created_at": message.created_at, "metadata": metadata})
         history[index] = masked
         freed += before - estimate_message_tokens(masked, rc)
         index += 1
-    return max(0, freed)
+    left = sum(1 for message in history if is_seeded_full(message))
+    return RemaskResult(tokens_freed=max(0, freed), messages_removed=removed, tagged_left=left)
 
 
 async def run_tier1_truncation(
@@ -1054,8 +1103,13 @@ async def run_tier1_truncation(
         return Tier1Result(tokens_freed=0, blob_refs_created=(), messages_modified=0)
 
     # The seeded previous turn, carried uncut for the follow-up, gives way
-    # first: to exactly the form the next seed will carry it in.
-    remasked = remask_seeded_turns(history, rc)
+    # first: to exactly the form the next seed will carry it in, and only as
+    # far as the pass needs. A message it removes lies before the run's own,
+    # so the protected tail moves up with it.
+    remask = remask_seeded_turns(history, rc, free_target_tokens=free_target_tokens)
+    remasked = remask.tokens_freed
+    if protect_tail_from_index is not None:
+        protect_tail_from_index = max(0, protect_tail_from_index - remask.messages_removed)
 
     keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
     eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index, rc)
@@ -3132,13 +3186,17 @@ __all__ = [
     "CompactionExhaustedError",
     "CompactionState",
     "FloorResult",
+    "RemaskResult",
     "Tier1Result",
     "Tier2Result",
     "Tier3Result",
     "TokenEstimator",
     "compaction_event_payload",
     "floor_has_work",
+    "is_seeded_full",
     "place_ledger",
+    "remask_seeded_turns",
+    "remask_surplus_tokens",
     "removable_indices",
     "render_span_for_summary",
     "run_floor",

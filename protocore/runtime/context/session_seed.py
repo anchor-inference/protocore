@@ -109,7 +109,8 @@ that grew past ``session_memory_head_max_tokens``) moves to the window and is
 folded like any other, never into neither place.
 
 The seed always fits its budget. Under pressure, in this order: older full
-turns are masked; the registry shrinks toward its list of paths; the newest
+turns are masked; the registry shrinks within its bound (to its paths, then
+to a count of its files); the newest
 turn's result text is cut to the longest head that fits (its images stay);
 it is masked; window turns are left out oldest first; head turns are left
 out; the registry is left out; the summary is left out; the newest turn is
@@ -242,7 +243,9 @@ from protocore.runtime.context.session_memory import (
     SessionMemory,
     encodable,
     fold_source_tokens,
+    pin_basis,
     render_ledger,
+    render_ledger_count,
 )
 from protocore.runtime.wire_format import is_compacted_placeholder
 
@@ -1017,10 +1020,8 @@ def _notice_message(dropped: int, registry: bool, summary: bool, words_only: boo
     return _block(f"[{' '.join(parts)}]") if parts else []
 
 
-def _ledger_message(
-    memory: SessionMemory, rc: LoopConstants, max_tokens: int | None = None, *, keep_paths: bool = False
-) -> list[Message]:
-    text = render_ledger(memory.ledger, rc, max_tokens=max_tokens, keep_paths=keep_paths)
+def _ledger_message(memory: SessionMemory, rc: LoopConstants, max_tokens: int | None = None) -> list[Message]:
+    text = render_ledger(memory.ledger, rc, max_tokens=max_tokens)
     return _block(text) if text else []
 
 
@@ -1060,6 +1061,9 @@ class _Layout:
     window: list[int]
     summarized: int
     prepared: dict[int, _Turn]
+    head_question: Message | None
+    """The session's first user message, protected on its own when the first
+    turn is too large to be a protected head turn."""
 
 
 def _layout(
@@ -1095,7 +1099,8 @@ def _layout(
         if index not in prepared:
             prepared[index] = prep.prepare(turns[index])
     summarized = sum(1 for i in range(len(turns)) if recorded[i] and i >= head)
-    return _Layout(turns, fragment, head, known, recorded, pinned, pre, window, summarized, prepared)
+    head_question = turns[0][0] if turns and head == 0 and rc.session_memory_head_protect_turns > 0 else None
+    return _Layout(turns, fragment, head, known, recorded, pinned, pre, window, summarized, prepared, head_question)
 
 
 def mask_boundary(turn_count: int, rc: LoopConstants) -> int:
@@ -1125,32 +1130,78 @@ class SeedBudget:
     """The budget to pass to :func:`build_session_seed` and :func:`plan_session_fold`."""
     run_reserve_tokens: int
     """Room left between the seed and the compaction trigger for the run's
-    own work, before what re-masking the seeded newest turn hands back."""
+    own work, before what re-masking the seeded newest turn hands back
+    (negative when the floor had to take more than the room)."""
     trigger_tokens: int
     overhead_tokens: int
+    floor_tokens: int = 0
+    """The least the seed is given when an earlier turn exists: the newest
+    earlier turn's question and answer, and the notice that its tool work is
+    not shown."""
 
 
-def recommend_seed_budget(rc: LoopConstants, overhead_tokens: int) -> SeedBudget:
+def seed_floor_tokens(history: Sequence[Message], rc: LoopConstants) -> int:
+    """The seed size below which a follow-up cannot see the previous answer — PURE.
+
+    The newest earlier turn reduced to its words (its user message and the
+    assistant's text) plus the one-line notice that its tool work is not in
+    context: the smallest form :func:`build_session_seed` carries it in. 0
+    when there is no earlier turn.
+    """
+    turns = split_turns(history)
+    if not turns or not opens_turn(turns[-1][0]):
+        return 0
+    full, _ = repair_turn(turns[-1])
+    words = _text_only([_dump(m)[0] for m in full])
+    if not words:
+        return 0
+    return _tokens(words, rc) + _tokens(_notice_message(0, False, False, True), rc)
+
+
+def recommend_seed_budget(
+    rc: LoopConstants, overhead_tokens: int, *, history: Sequence[Message] = ()
+) -> SeedBudget:
     """The seed budget for a run, from the model's window and the run's measured overhead — PURE.
 
     ``overhead_tokens`` is what the run's request carries besides the seed:
-    the system prompt, tool definitions, preludes and the new task. The room
-    up to the compaction trigger (``derive_budgets(rc).compaction_trigger_tokens``)
-    is split: ``session_seed_budget_ratio`` of it to the seed, the rest — at
-    least ``session_seed_run_reserve_min_tokens`` — to the run. The seed's
-    newest full turns give their full-minus-masked size back the moment
-    in-run compaction runs (see
+    the system prompt, tool definitions, preludes and the new task (a
+    negative value counts as 0). The room up to the compaction trigger
+    (``derive_budgets(rc).compaction_trigger_tokens``) is split:
+    ``session_seed_budget_ratio`` of it to the seed, the rest — at least
+    ``session_seed_run_reserve_min_tokens``, or half the room when the room is
+    less than twice that — to the run. The seed's newest full turns give their
+    full-minus-masked size back the moment in-run compaction runs (see
     :func:`~protocore.runtime.context.compaction.remask_seeded_turns`), so a
     run that does heavy new tool work has that room too.
+
+    With ``history`` (the session's earlier messages), the seed is never
+    smaller than :func:`seed_floor_tokens` — the previous question and answer
+    — as long as that fits the window beside the overhead: on a tiny window,
+    or when the overhead alone reaches the trigger, the floor is what is
+    given, and the run starts over its trigger (in-run compaction then works
+    on it). Only when not even the floor fits beside the overhead in the
+    window is the seed smaller, down to 0.
 
     Pass the same number to :func:`plan_session_fold` as the base budget;
     pass a smaller one to :func:`build_session_seed` when a run's overhead is
     larger than the one the plan assumed.
     """
-    trigger = derive_budgets(rc).compaction_trigger_tokens
-    room = max(0, trigger - max(0, overhead_tokens))
-    seed = min(int(room * rc.session_seed_budget_ratio), max(0, room - rc.session_seed_run_reserve_min_tokens))
-    return SeedBudget(seed_tokens=seed, run_reserve_tokens=room - seed, trigger_tokens=trigger, overhead_tokens=overhead_tokens)
+    budgets = derive_budgets(rc)
+    trigger = budgets.compaction_trigger_tokens
+    overhead = max(0, overhead_tokens)
+    room = max(0, trigger - overhead)
+    reserve = min(rc.session_seed_run_reserve_min_tokens, room // 2)
+    seed = min(int(room * rc.session_seed_budget_ratio), room - reserve)
+    floor = seed_floor_tokens(history, rc) if history else 0
+    if floor > seed:
+        seed = min(floor, max(0, budgets.max_context - overhead))
+    return SeedBudget(
+        seed_tokens=seed,
+        run_reserve_tokens=room - seed,
+        trigger_tokens=trigger,
+        overhead_tokens=overhead,
+        floor_tokens=floor,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1254,13 +1305,15 @@ def build_session_seed(
     When the budget cannot hold everything, content gives way in this order:
 
     1. older full turns are masked, oldest first;
-    2. the registry shrinks toward its list of paths;
+    2. the registry shrinks within its bound (to its paths, then to a count);
     3. the newest turn's result text is cut to the longest head that fits;
     4. the newest turn is masked;
     5. window turns are left out, oldest first;
     6. head turns are left out;
     7. the registry is left out;
     8. the summary is left out;
+    8a. the session's first question, carried on its own when the first turn
+        is too large to be a protected head turn, is left out;
     9. the newest turn is reduced to its words (question and answer);
     10. the newest turn is left out.
 
@@ -1302,7 +1355,12 @@ def build_session_seed(
     summary = _summary_message(memory, layout.summarized, pinned_count)
     ledger = _ledger_message(memory, rc)
     dropped: list[int] = []
-    flags = {"summary": False, "registry": False, "words": False, "reduced": False}
+    flags = {"summary": False, "registry": False, "words": False, "reduced": False, "question": False}
+
+    def question() -> list[Message]:
+        if layout.head_question is None or flags["question"] or 0 in carried:
+            return []
+        return [layout.head_question]
 
     block_cost: dict[tuple[str, ...], int] = {}
 
@@ -1317,7 +1375,7 @@ def build_session_seed(
 
     def total() -> int:
         fixed_blocks = (0 if flags["summary"] else cost(summary)) + (0 if flags["registry"] else cost(ledger))
-        return fixed_blocks + cost(notice()) + sum(weights[i] for i in carried)
+        return fixed_blocks + cost(notice()) + cost(question()) + sum(weights[i] for i in carried)
 
     full_indices = [i for i in carried if state[i] == "full"]
     for index in full_indices[:-1]:
@@ -1326,7 +1384,9 @@ def build_session_seed(
         mask(index)
     if ledger and total() > budget:
         room = budget - (total() - cost(ledger))
-        shrunk = _ledger_message(memory, rc, max_tokens=max(0, room), keep_paths=True)
+        shrunk = _ledger_message(memory, rc, max_tokens=max(0, min(room, rc.session_memory_registry_max_tokens)))
+        if not shrunk:
+            shrunk = _block(render_ledger_count(memory.ledger))
         if shrunk != ledger:
             ledger = shrunk
             flags["reduced"] = True
@@ -1350,6 +1410,8 @@ def build_session_seed(
         flags["registry"] = True
     if total() > budget and summary:
         flags["summary"] = True
+    if total() > budget:
+        flags["question"] = True
     if newest is not None and total() > budget and prepared[newest].text:
         forms[newest], weights[newest], state[newest] = prepared[newest].text, prepared[newest].text_tokens, "words"
         flags["words"] = True
@@ -1368,7 +1430,8 @@ def build_session_seed(
         else:
             rendered[index] = list(forms[index])
     messages = _ensure_encodable(
-        [_tag_seeded(m) for i in layout.pre if i in kept for m in rendered[i]]
+        [_tag_seeded(m) for m in question()]
+        + [_tag_seeded(m) for i in layout.pre if i in kept for m in rendered[i]]
         + ([] if flags["summary"] else summary)
         + notice()
         + [_tag_seeded(m) for i in layout.window if i in kept for m in rendered[i]]
@@ -1478,6 +1541,7 @@ def plan_session_fold(
     rule: MaskingRule | None = None,
     cache: SeedCache | None = None,
     max_source_tokens: int = 0,
+    summariser: str = "",
 ) -> FoldPlan:
     """Which turns need folding into the summary now — PURE, CPU-bound.
 
@@ -1500,8 +1564,13 @@ def plan_session_fold(
     turns halved once per consecutive fold that did not land
     (``memory.stale_fold_count``), so a summariser that keeps being cut off
     reaches one turn per fold. After ``session_seed_fold_cuts_before_pin``
-    cut folds of that single turn the plan pins it instead (no summariser
-    call).
+    cut folds of one and the same turn (``memory.cut_turn``) the plan pins
+    exactly that turn (no summariser call); a turn that merely comes first
+    after a head lapse or a reset is never pinned for another's cuts. Pins
+    are released — their turns planned again, first — when ``summariser``
+    (the host's name for its summariser model), the summary cap or the fold
+    output bound differ from what they were made under, or after
+    ``session_seed_pin_release_runs`` runs.
 
     Convergence: every needed plan records at least one turn, and the turns
     it leaves stay counted, so a backlog is recorded within
@@ -1521,11 +1590,20 @@ def plan_session_fold(
         sum(prepared[i].masked_tokens for i in carried if i < head)
         + _summary_reserve(memory, rc)
         + _tokens(_ledger_message(memory, rc), rc)
+        + (_tokens([layout.head_question], rc) if layout.head_question is not None else 0)
     )
+    released = bool(memory.summary.pinned) and (
+        memory.pin_basis != pin_basis(rc, summariser)
+        or memory.turn_index - memory.pinned_at_run >= rc.session_seed_pin_release_runs
+    )
+
+    def stuck_pin(index: int) -> bool:
+        return layout.pinned[index] and not released
+
     fresh = [i for i in carried if i >= boundary and i >= head and not layout.pinned[i]]
     fresh_set = set(fresh)
-    stuck = [i for i in carried if layout.pinned[i] or (i >= head and i not in fresh_set and not layout.known[i])]
-    older = [i for i in carried if i >= head and i not in fresh_set and layout.known[i] and not layout.pinned[i]]
+    stuck = [i for i in carried if stuck_pin(i) or (i >= head and i not in fresh_set and not layout.known[i])]
+    older = [i for i in carried if i >= head and i not in fresh_set and layout.known[i] and not stuck_pin(i)]
     hold_full = _fresh_hold([prepared[i] for i in fresh], fixed, budget)
     hold_masked = sum(prepared[i].masked_tokens for i in fresh)
     trigger = int(budget * rc.session_seed_fold_trigger_ratio)
@@ -1552,9 +1630,10 @@ def plan_session_fold(
     if projected <= trigger or not older:
         return base_plan
     base = memory.summary.coverage
-    before = [i for i in older if base is not None and layout.known[i][-1] < base.first]
-    after = [i for i in older if i not in set(before)]
-    candidates = [*reversed(before), *after]
+    inside = [i for i in older if layout.pinned[i]]
+    before = [i for i in older if not layout.pinned[i] and base is not None and layout.known[i][-1] < base.first]
+    after = [i for i in older if not layout.pinned[i] and i not in set(before)]
+    candidates = [*inside, *reversed(before), *after]
     wanted: list[int] = []
     remaining = projected
     for index in candidates:
@@ -1576,9 +1655,14 @@ def plan_session_fold(
         source_tokens += weight
     if not chosen:
         return base_plan
-    pin = memory.single_turn_cuts >= rc.session_seed_fold_cuts_before_pin
-    if pin:
-        chosen = chosen[:1]
+
+    def span(index: int) -> Coverage:
+        return Coverage(layout.known[index][0], layout.known[index][-1])
+
+    cut_index = next((i for i in candidates if memory.cut_turn is not None and span(i) == memory.cut_turn), None)
+    pin = cut_index is not None and memory.cut_count >= rc.session_seed_fold_cuts_before_pin
+    if pin and cut_index is not None:
+        chosen = [cut_index]
     positions = [p for i in chosen for p in layout.known[i]]
     after_range = Coverage(
         min(positions) if base is None else min(base.first, *positions),
@@ -1597,7 +1681,9 @@ def plan_session_fold(
         turns=len(ordered),
         user_turns=sum(prepared[i].user_turns for i in ordered),
         pin=pin,
-        pinned=tuple(Coverage(layout.known[i][0], layout.known[i][-1]) for i in ordered) if pin else (),
+        pinned=tuple(span(i) for i in ordered) if pin else (),
+        spans=tuple(span(i) for i in ordered),
+        unpin=() if pin else tuple(span(i) for i in ordered if layout.pinned[i]),
     )
     return FoldPlan(
         turns=tuple(tuple(turns[i]) for i in ordered),
@@ -1637,5 +1723,6 @@ __all__ = [
     "plan_session_fold",
     "recommend_seed_budget",
     "repair_turn",
+    "seed_floor_tokens",
     "split_turns",
 ]

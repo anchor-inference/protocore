@@ -677,6 +677,15 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "folds the sequence it is handed into durable session memory; it "
         "reaches no engine and does no scoping of its own"
     ),
+    "protocore/runtime/context/compaction.py::remask_surplus_tokens": _whole(
+        "measures the seeded messages it is handed that still carry a masked form"
+    ),
+    "protocore/runtime/context/session_seed.py::seed_floor_tokens": _whole(
+        "measures the newest turn of the earlier messages it is handed"
+    ),
+    "protocore/runtime/context/session_seed.py::recommend_seed_budget": _whole(
+        "hands the earlier messages it is given to seed_floor_tokens"
+    ),
     "protocore/runtime/context/compaction.py::remask_seeded_turns": _whole(
         "puts the masked form of every seeded message that carries one in place; "
         "the tag it reads is written only on a seed's newest unmasked turns"

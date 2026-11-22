@@ -63,6 +63,7 @@ from protocore.runtime.context.session_seed import (
     plan_session_fold,
     recommend_seed_budget,
     repair_turn,
+    seed_floor_tokens,
     split_turns,
 )
 from protocore.runtime.wire_format import render_compacted_placeholder
@@ -1285,7 +1286,7 @@ def test_in_run_compaction_remasks_the_seeded_newest_turn_first_to_the_next_seed
     next_seed = build_session_seed(later, SessionMemory(turn_index=3), 200_000, RC, position=_position)
     run = [*seed.messages, _user("the new task")]
     before = sum(estimate_message_tokens(m, RC) for m in run)
-    freed = remask_seeded_turns(list(run), RC)
+    freed = remask_seeded_turns(list(run), RC).tokens_freed
     assert freed > 5_000
     result = asyncio.run(
         run_tier1_truncation(run, InMemoryBlobStore(), "t", RC, truncation_threshold_tokens=10**9, keep_recent_turns=1)
@@ -1306,8 +1307,25 @@ def test_recommend_seed_budget_splits_the_room_up_to_the_trigger() -> None:
     assert budget.seed_tokens + budget.run_reserve_tokens == 39_117 - 8_000
     assert budget.run_reserve_tokens >= rc.session_seed_run_reserve_min_tokens
     assert budget.seed_tokens == int((39_117 - 8_000) * rc.session_seed_budget_ratio)
-    starved = recommend_seed_budget(rc, 36_000)
-    assert starved.seed_tokens == 0 and starved.run_reserve_tokens == 3_117
+    tight = recommend_seed_budget(rc, 36_000)
+    assert tight.seed_tokens == 1_559 and tight.run_reserve_tokens == 1_558  # the reserve scales down
+    assert recommend_seed_budget(rc, -5).overhead_tokens == 0
+
+
+def test_recommend_seed_budget_never_starves_a_follow_up_of_the_previous_answer() -> None:
+    history = _session(_turn(0, answer_chars=2_000))
+    floor = seed_floor_tokens(history, RC)
+    assert floor > 400
+    for window, overhead in ((8_192, 2_000), (8_192, 8_000), (16_384, 8_000), (49_152, 39_117)):
+        rc = LoopConstants(model_context_window=window)
+        budget = recommend_seed_budget(rc, overhead, history=history)
+        assert budget.floor_tokens == floor
+        if floor <= window - overhead:
+            assert budget.seed_tokens >= floor, (window, overhead)
+            seed = build_session_seed(history, SessionMemory(turn_index=1), budget.seed_tokens, rc, position=_position)
+            assert any(m.text.startswith("Answer 0") for m in seed.messages)
+    assert recommend_seed_budget(LoopConstants(model_context_window=8_192), 8_192, history=history).seed_tokens == 0
+    assert seed_floor_tokens([], RC) == 0
 
 
 def test_without_fold_spacing_a_large_newest_turn_folds_every_run() -> None:
@@ -1347,3 +1365,183 @@ def test_the_convergence_bound_holds() -> None:
     assert folds <= backlog
     if source > largest:
         assert folds <= -(-folded_source // (source - largest)) + 1
+
+
+# --- in-run gate and partial re-mask -------------------------------------------------
+
+
+def _gate_run() -> tuple[list[Message], int, LoopConstants]:
+    rc = LoopConstants(model_context_window=49_152)
+    budget = recommend_seed_budget(rc, 8_000)
+    history = _session(_turn(4, result_chars=3_000), _turn(5, tools=6, result_chars=9_000))
+    seed = build_session_seed(history, SessionMemory(turn_index=2), budget.seed_tokens, rc, position=_position)
+    assert seed.full_turns == 1 and seed.reclaimable_tokens > 10_000
+    run = [*seed.messages, _user("the new task")]
+    run += [_calls(("n0", "Search", {"query": "q0"})), _results(("n0", _bulky("n0", 70_000)))]
+    return run, len(run) - 2, rc
+
+
+def test_the_routine_gate_opens_for_a_seeded_full_turn_and_the_pass_gets_under_the_trigger() -> None:
+    import asyncio
+
+    from protocore.runtime.context.budgets import derive_budgets
+    from protocore.runtime.context.compaction import CompactionState
+    from protocore.runtime.context.manager import ContextManager
+    from protocore.tests_support.adapters import InMemoryBlobStore
+
+    run, protect, rc = _gate_run()
+    trigger = derive_budgets(rc).compaction_trigger_tokens
+    prompt = sum(estimate_message_tokens(m, rc) for m in run) + 8_000
+    assert prompt > trigger
+    manager = ContextManager(rc=rc, blob_store=InMemoryBlobStore(), compaction_llm=None)
+    assert manager.has_proactive_work(run, CompactionState(), force=False, protect_tail_from_index=protect, llm_tiers=False)
+    attempt = asyncio.run(
+        manager.run_compaction(
+            history=run, compaction_state=CompactionState(), tenant_id="t", model_name="m",
+            overhead_tokens=8_000, llm_tiers=False, protect_tail_from_index=protect,
+        )
+    )
+    assert attempt.prompt_after < trigger
+    assert attempt.target_tokens < attempt.prompt_before  # the re-mask counts as removable
+    assert any(isinstance(b, ToolResultBlock) and b.content.startswith("Cite: record n0") for m in run for b in m.content_blocks)
+
+
+def test_remask_gives_back_only_what_is_needed_oldest_first() -> None:
+    from protocore.runtime.context.compaction import is_seeded_full, remask_seeded_turns, remask_surplus_tokens
+
+    history = _session(_turn(0), _turn(1, rounds=3, tools=3))
+    seed = build_session_seed(history, SessionMemory(turn_index=2), 400_000, RC, position=_position)
+    run = list(seed.messages)
+    surplus = remask_surplus_tokens(run, RC)
+    tagged = [i for i, m in enumerate(run) if is_seeded_full(m)]
+    result = remask_seeded_turns(run, RC, free_target_tokens=500)
+    assert 500 <= result.tokens_freed < surplus
+    assert 0 < result.tagged_left < len(tagged)
+    still = [i for i, m in enumerate(run) if is_seeded_full(m)]
+    assert still and min(still) > tagged[0]  # the oldest went first, the rest kept their detail
+
+
+def test_a_removed_reasoning_only_message_does_not_shift_the_protected_batch() -> None:
+    import asyncio
+
+    from protocore.runtime.context.compaction import run_tier1_truncation
+    from protocore.tests_support.adapters import InMemoryBlobStore
+
+    turn = [_user("question 1"), Message(role=MessageRole.assistant, content_blocks=[ThinkingBlock(text="only thinking")])]
+    turn += [_calls(("s1", "Search", {"query": "x"})), _results(("s1", _bulky("s1", 9_000))), _assistant("answer 1")]
+    history = _session(_turn(0), turn)
+    seed = build_session_seed(history, SessionMemory(turn_index=2), 200_000, RC, position=_position)
+    run = [*seed.messages, _user("task"), _calls(("n1", "Search", {"query": "q"}), reasoning="current loop reasoning " * 50)]
+    run.append(_results(("n1", _bulky("n1", 6_000))))
+    protect = len(run) - 2
+    asyncio.run(
+        run_tier1_truncation(
+            run, InMemoryBlobStore(), "t", RC, truncation_threshold_tokens=500, keep_recent_turns=0,
+            protect_tail_from_index=protect, mask_by_age=True,
+        )
+    )
+    call = next(m for m in run if any(isinstance(b, ToolUseBlock) and b.tool_call_id == "n1" for b in m.content_blocks))
+    assert call.reasoning_content is not None
+
+
+# --- head question, registry bound, pins, source halving, registry reserve ------------------
+
+
+def test_the_first_question_is_protected_even_when_the_first_turn_is_too_large() -> None:
+    history = _session(_turn(0, answer_chars=14_000), *(_turn(i) for i in range(1, 14)))
+    memory = SessionMemory(turn_index=14)
+    seed = build_session_seed(history, memory, BUDGET, RC, position=_position)
+    assert seed.head_turns == 0
+    plan = plan_session_fold(history, memory, BUDGET, RC, position=_position)
+    assert plan.turns[0][0].text.startswith("question 0")  # the turn itself is folded
+    memory = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("r",)}), RC, step=plan.step).memory
+    after = build_session_seed(history, memory, BUDGET, RC, position=_position)
+    assert after.messages[0].text == "question 0: find the items about topic 0"
+    assert sum(1 for m in after.messages if m.text.startswith("question 0")) == 1
+
+
+def test_the_registrys_reduced_form_respects_its_bound_and_spares_the_newest_turn() -> None:
+    files = [f"/srv/projects/very/deep/directory/structure/module_{i:02d}/implementation_file_{i}.py" for i in range(60)]
+    ledger = ArtifactLedger(files=files, content={f: "x = 1\n" * 300 for f in files})
+    rc = LoopConstants(session_memory_registry_max_tokens=2_000)
+    history = _session(_turn(0, result_chars=2_000), _turn(1, result_chars=2_000))
+    memory = SessionMemory(ledger=ledger, turn_index=2)
+    roomy = build_session_seed(history, memory, 400_000, rc, position=_position)
+    assert roomy.full_turns == 1
+    for budget in (9_000, 8_000, 6_000):
+        seed = build_session_seed(history, memory, budget, rc, position=_position)
+        registry = next((m for m in seed.messages if m.text.startswith("ARTIFACT REGISTRY")), None)
+        if registry is not None:
+            assert estimate_message_tokens(registry, rc) <= rc.session_memory_registry_max_tokens + 10
+        if roomy.tokens - estimate_message_tokens(next(m for m in roomy.messages if m.text.startswith("ARTIFACT")), rc) + 60 <= budget:
+            assert seed.full_turns == 1, budget
+
+
+def test_a_pin_goes_to_the_turn_that_was_cut_not_the_one_that_comes_first() -> None:
+    history = _session(*(_turn(i) for i in range(16)))
+    size = len(_turn(0))
+    span_3 = Coverage(size * 3, size * 4 - 1)
+    memory = SessionMemory(turn_index=16, cut_turn=span_3, cut_count=RC.session_seed_fold_cuts_before_pin)
+    plan = plan_session_fold(history, memory, BUDGET, RC, position=_position)
+    assert plan.pin and plan.step is not None and plan.step.pinned == (span_3,)  # the cut turn, not turn 1
+    other = SessionMemory(turn_index=16, cut_turn=Coverage(10**6, 10**6 + 1), cut_count=5)
+    assert not plan_session_fold(history, other, BUDGET, RC, position=_position).pin
+    span_1 = Coverage(size, size * 2 - 1)
+    first = SessionMemory(turn_index=16, cut_turn=span_1, cut_count=RC.session_seed_fold_cuts_before_pin)
+    pinned = plan_session_fold(history, first, BUDGET, RC, position=_position)
+    assert pinned.pin and pinned.step is not None and pinned.step.pinned == (span_1,)
+
+
+def test_a_pin_is_released_when_its_basis_changes_or_after_enough_runs() -> None:
+    history = _session(*(_turn(i) for i in range(16)))
+    size = len(_turn(0))
+    span_1 = Coverage(size, size * 2 - 1)
+    memory = SessionMemory(turn_index=16, cut_turn=span_1, cut_count=RC.session_seed_fold_cuts_before_pin)
+    plan = plan_session_fold(history, memory, BUDGET, RC, position=_position, summariser="model-a")
+    memory = fold_run(memory, [], None, RC, step=plan.step, summariser="model-a").memory
+    assert memory.summary.pinned == (span_1,)
+    same = plan_session_fold(history, memory, BUDGET, RC, position=_position, summariser="model-a")
+    assert all(t[0].text != "question 1: find the items about topic 1" for t in same.turns)
+    for released in (
+        plan_session_fold(history, memory, BUDGET, RC, position=_position, summariser="model-b"),
+        plan_session_fold(history, memory, BUDGET, LoopConstants(session_memory_running_summary_token_cap=1_800), position=_position, summariser="model-a"),
+        plan_session_fold(
+            history,
+            replace_memory(memory, turn_index=memory.pinned_at_run + RC.session_seed_pin_release_runs),
+            BUDGET, RC, position=_position, summariser="model-a",
+        ),
+    ):
+        assert released.needed and released.turns[0][0].text.startswith("question 1")
+        assert released.step is not None and released.step.unpin == (span_1,)
+    landed = fold_run(memory, [], SummaryDelta(entries={"REQUESTS": ("q1",)}), RC, step=released.step, summariser="model-a")
+    assert landed.memory.summary.pinned == () and landed.memory.summary.covers(span_1.first)
+
+
+def replace_memory(memory: SessionMemory, **changes: Any) -> SessionMemory:
+    data = memory.to_dict()
+    data.update(changes)
+    return SessionMemory.from_dict(data)
+
+
+def test_the_source_bound_halves_after_a_fold_that_did_not_land() -> None:
+    history = _session(*(_turn(i) for i in range(16)))
+    calm = plan_session_fold(history, SessionMemory(turn_index=16), BUDGET, RC, position=_position, max_source_tokens=6_000)
+    stale = plan_session_fold(
+        history, SessionMemory(turn_index=16, stale_fold_count=1), BUDGET, RC, position=_position, max_source_tokens=6_000
+    )
+    assert fold_source_tokens(calm.source_messages, RC) > 3_000
+    assert fold_source_tokens(stale.source_messages, RC) <= 3_000 or len(stale.turns) == 1
+    assert len(stale.turns) < len(calm.turns)
+
+
+def test_the_planner_reserves_room_for_the_registry() -> None:
+    files = [f"src/module_{i}.py" for i in range(12)]
+    ledger = ArtifactLedger(files=files, content={f: "def f():\n    return 1\n" * 60 for f in files})
+    history = _session(*(_turn(i) for i in range(16)))
+    bare = plan_session_fold(history, SessionMemory(turn_index=16), BUDGET, RC, position=_position)
+    with_files = plan_session_fold(history, SessionMemory(ledger=ledger, turn_index=16), BUDGET, RC, position=_position)
+    assert with_files.projected_tokens - bare.projected_tokens > 1_000
+    roomy = 24_000
+    bare = plan_session_fold(history, SessionMemory(turn_index=16), roomy, RC, position=_position)
+    with_files = plan_session_fold(history, SessionMemory(ledger=ledger, turn_index=16), roomy, RC, position=_position)
+    assert with_files.needed and len(with_files.turns) > len(bare.turns)

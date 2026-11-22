@@ -7,7 +7,7 @@ correctness-affecting decisions).
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from protocore.contracts.blob import IBlobStore
 from protocore.contracts.llm import ILLMProvider, LLMObservabilityContext
@@ -29,7 +29,10 @@ from protocore.runtime.context.compaction import (
     TokenEstimator,
     estimate_history_tokens,
     floor_has_work,
+    is_seeded_full,
     place_ledger,
+    remask_seeded_turns,
+    remask_surplus_tokens,
     removable_indices,
     run_floor,
     run_tier1_truncation,
@@ -589,10 +592,17 @@ class ContextManager:
             protect_tail_from_index=protect_tail_from_index,
             compact_seeded_history=compact_seeded_history,
         )
+        # The seed's unmasked newest turn is protected seeded history, but it
+        # gives its full-minus-masked size back first (remask_seeded_turns):
+        # that part is not fixed.
         fixed = overhead + sum(
             self._token_estimator.estimate_message(message, rc)
             for idx, message in enumerate(history)
             if idx not in removable
+        ) - sum(
+            remask_surplus_tokens([message], rc)
+            for idx, message in enumerate(history)
+            if idx not in removable and is_seeded_full(message)
         )
         ceiling = min(trigger, tokens_before + overhead)
         target = max(1, fixed + int(max(0, ceiling - fixed) * rc.compaction_target_ratio))
@@ -633,6 +643,13 @@ class ContextManager:
             return self._token_estimator.estimate_history(history, rc) + overhead + growth - target
 
         tier_error: Exception | None = None
+        # The seed's unmasked newest turn gives way before anything else, as
+        # far as the pass needs and oldest first. It lies before the run's
+        # own messages, so the protected tail index moves up by what it
+        # removed, for every tier after it.
+        remask = remask_seeded_turns(history, rc, free_target_tokens=max(0, need()))
+        if protect_tail_from_index is not None:
+            protect_tail_from_index = max(0, protect_tail_from_index - remask.messages_removed)
         try:
             attempt.tier1 = await run_tier1_truncation(
                 history=history,
@@ -647,6 +664,7 @@ class ContextManager:
                 ledger=ledger,
             )
             compaction_state.blob_refs_created.extend(attempt.tier1.blob_refs_created)
+            attempt.tier1 = replace(attempt.tier1, tokens_freed=attempt.tier1.tokens_freed + remask.tokens_freed)
         except Exception as exc:
             _logger.warning("compaction tier 1 failed; the pass continues (err=%r)", exc)
             tier_error = exc
