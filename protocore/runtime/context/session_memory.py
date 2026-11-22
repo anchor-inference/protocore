@@ -384,13 +384,24 @@ def _alnum_key(text: str) -> str:
 
 
 #: Characters kept at the edges of a word in :func:`open_item_key`: they
-#: change what a word means ("C++", "C#", "#12", "+7").
-_KEY_KEPT_EDGE_MARKS: Final[str] = "+#"
+#: change what a word means ("C++", "C#", "#12", "+7", "$100", "50%").
+_KEY_KEPT_EDGE_MARKS: Final[str] = "+#$€£¥₽%"
 
 
 def _key_word(word: str) -> str:
     start, end = 0, len(word)
-    while start < end and not (word[start].isalnum() or word[start] in _KEY_KEPT_EDGE_MARKS):
+    while start < end and not (
+        word[start].isalnum()
+        or word[start] in _KEY_KEPT_EDGE_MARKS
+        or (
+            word[start] in "-."
+            and start + 1 < end
+            and (
+                word[start + 1].isdigit()
+                or (word[start] == "-" and word[start + 1] == "." and start + 2 < end and word[start + 2].isdigit())
+            )
+        )
+    ):
         start += 1
     while end > start and not (word[end - 1].isalnum() or word[end - 1] in _KEY_KEPT_EDGE_MARKS):
         end -= 1
@@ -402,10 +413,12 @@ def open_item_key(text: str) -> str:
 
     Unicode NFKC, case-folded, split on whitespace; each word loses the
     punctuation at its edges (quotes, brackets, a final full stop, commas)
-    except ``+`` and ``#``, and keeps everything inside it. So ``Send the
-    report.`` matches ``send the report``, while ``1.5`` and ``15``, ``2.0``
-    and ``2.0.1``, ``Room 10`` and ``Room 101``, ``p. 12`` and ``p. 120``,
-    ``C`` and ``C++``, ``bug 1`` and ``bug #1`` all stay different.
+    except ``+``, ``#``, currency/percent marks (``$€£¥₽%``), and a leading
+    ``-`` or ``.`` before a digit, while keeping everything inside it. So
+    ``Send the report.`` matches ``send the report``, while ``1.5`` and
+    ``15``, ``-5`` and ``5``, ``.5`` and ``5``, ``$100`` and ``€100``,
+    ``50%`` and ``50``, ``C`` and ``C++``, ``bug 1`` and ``bug #1`` all stay
+    different.
     """
     words = (_key_word(word) for word in unicodedata.normalize("NFKC", text).casefold().split())
     return " ".join(word for word in words if word)
@@ -656,7 +669,7 @@ def stored_summary_problem(stored: str | Mapping[str, Any] | None) -> str | None
     marker = stored.get("format")
     if marker is None:
         return "older format"
-    if not isinstance(marker, int):
+    if not isinstance(marker, int) or isinstance(marker, bool):
         return "not a summary"
     if marker != SUMMARY_FORMAT_VERSION:
         return "older format" if marker < SUMMARY_FORMAT_VERSION else "newer format"
@@ -1469,7 +1482,9 @@ def fold_run(
         stored = summary.coverage
         includes = stored is not None and stored.includes(step.after)
         unpinned_already = bool(step.unpin) and not any(span in summary.pinned for span in step.unpin)
-        if (step.unpin and unpinned_already and includes) or (stored != step.base and includes and not step.pin):
+        if (step.unpin and unpinned_already and includes) or (
+            stored != step.base and includes and (not step.pin or set(step.pinned) <= set(summary.pinned))
+        ):
             report = MergeReport(already_applied=True, nothing_new=bool(delta and delta.nothing_new))
             counted = False
         elif stored != step.base:

@@ -664,7 +664,11 @@ class ContextManager:
                 ledger=ledger,
             )
             compaction_state.blob_refs_created.extend(attempt.tier1.blob_refs_created)
-            attempt.tier1 = replace(attempt.tier1, tokens_freed=attempt.tier1.tokens_freed + remask.tokens_freed)
+            attempt.tier1 = replace(
+                attempt.tier1,
+                tokens_freed=attempt.tier1.tokens_freed + remask.tokens_freed,
+                messages_modified=attempt.tier1.messages_modified + remask.messages_modified,
+            )
         except Exception as exc:
             _logger.warning("compaction tier 1 failed; the pass continues (err=%r)", exc)
             tier_error = exc

@@ -1586,11 +1586,13 @@ def plan_session_fold(
     count = len(turns)
     boundary = max(mask_boundary(count, rc), count - max(1, rc.session_seed_full_turns))
     carried = [*layout.pre, *layout.window]
+    head_q_tokens = _tokens([layout.head_question], rc) if layout.head_question is not None else 0
+    carried_set = set(carried)
     fixed = (
         sum(prepared[i].masked_tokens for i in carried if i < head)
         + _summary_reserve(memory, rc)
         + _tokens(_ledger_message(memory, rc), rc)
-        + (_tokens([layout.head_question], rc) if layout.head_question is not None else 0)
+        + (head_q_tokens if layout.head_question is not None and 0 not in carried_set else 0)
     )
     released = bool(memory.summary.pinned) and (
         memory.pin_basis != pin_basis(rc, summariser)
@@ -1641,6 +1643,8 @@ def plan_session_fold(
             break
         wanted.append(index)
         remaining -= prepared[index].masked_tokens
+        if index == 0 and layout.head_question is not None:
+            remaining += head_q_tokens
     limit = max(1, len(wanted) >> min(memory.stale_fold_count, 30))
     source_bound = max_source_tokens >> min(memory.stale_fold_count, 30) if max_source_tokens > 0 else 0
     chosen: list[int] = []
@@ -1692,7 +1696,11 @@ def plan_session_fold(
         needed=not pin,
         pin=pin,
         projected_tokens=projected,
-        remaining_tokens=projected - sum(prepared[i].masked_tokens for i in chosen),
+        remaining_tokens=(
+            projected
+            - sum(prepared[i].masked_tokens for i in chosen)
+            + (head_q_tokens if 0 in chosen and layout.head_question is not None else 0)
+        ),
         fresh_tokens=fresh_tokens,
         newest_counted_full=counted_full,
         trigger_tokens=trigger,

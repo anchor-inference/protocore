@@ -981,6 +981,8 @@ class RemaskResult:
     reasoning); every one of them lies before the run's own messages."""
     tagged_left: int = 0
     """Seeded messages still in their full form (the target was met first)."""
+    messages_modified: int = 0
+    """Seeded messages replaced with their masked form or removed."""
 
 
 def _masked_form(message: Message) -> Message | None:
@@ -1033,6 +1035,7 @@ def remask_seeded_turns(
     """
     freed = 0
     removed = 0
+    modified = 0
     index = 0
     while index < len(history):
         if free_target_tokens is not None and freed >= free_target_tokens:
@@ -1047,12 +1050,19 @@ def remask_seeded_turns(
             del history[index]
             freed += before
             removed += 1
+            modified += 1
             continue
         history[index] = masked
         freed += before - estimate_message_tokens(masked, rc)
+        modified += 1
         index += 1
     left = sum(1 for message in history if is_seeded_full(message))
-    return RemaskResult(tokens_freed=max(0, freed), messages_removed=removed, tagged_left=left)
+    return RemaskResult(
+        tokens_freed=max(0, freed),
+        messages_removed=removed,
+        tagged_left=left,
+        messages_modified=modified,
+    )
 
 
 async def run_tier1_truncation(

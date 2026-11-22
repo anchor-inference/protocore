@@ -1403,6 +1403,7 @@ def test_the_routine_gate_opens_for_a_seeded_full_turn_and_the_pass_gets_under_t
     )
     assert attempt.prompt_after < trigger
     assert attempt.target_tokens < attempt.prompt_before  # the re-mask counts as removable
+    assert attempt.tier1.messages_modified > 0
     assert any(isinstance(b, ToolResultBlock) and b.content.startswith("Cite: record n0") for m in run for b in m.content_blocks)
 
 
@@ -1545,3 +1546,22 @@ def test_the_planner_reserves_room_for_the_registry() -> None:
     bare = plan_session_fold(history, SessionMemory(turn_index=16), roomy, RC, position=_position)
     with_files = plan_session_fold(history, SessionMemory(ledger=ledger, turn_index=16), roomy, RC, position=_position)
     assert with_files.needed and len(with_files.turns) > len(bare.turns)
+
+
+def test_head_question_is_not_double_counted_while_turn_zero_is_carried() -> None:
+    from protocore.runtime.context.session_seed import _summary_reserve, mask_turn
+
+    rc = LoopConstants(session_memory_head_max_tokens=100, session_seed_full_turns=1)
+    first = _turn(0, result_chars=4_000)
+    history = _session(first, _turn(1, result_chars=2_000), _turn(2, result_chars=2_000))
+    mem = SessionMemory(turn_index=3)
+    seed = build_session_seed(history, mem, 400_000, rc, position=_position)
+    plan = plan_session_fold(history, mem, 400_000, rc, position=_position)
+    assert plan.projected_tokens == seed.tokens + _summary_reserve(mem, rc)
+    tight = plan_session_fold(history, mem, 2_000, rc, position=_position, max_source_tokens=100)
+    assert tight.needed and len(tight.turns) == 1 and tight.turns[0][0].text == first[0].text
+    masked_zero_tokens = sum(
+        estimate_message_tokens(m, rc) for m in mask_turn(repair_turn(first)[0], rc, default_masking_rule(rc))
+    )
+    head_q_tokens = estimate_message_tokens(first[0], rc)
+    assert tight.projected_tokens - tight.remaining_tokens == masked_zero_tokens - head_q_tokens

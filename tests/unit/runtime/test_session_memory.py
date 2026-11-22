@@ -929,3 +929,39 @@ def test_entries_with_line_breaks_from_a_dict_still_round_trip_as_text() -> None
     data["entries"]["REQUESTS"] = ["a\u2028[USER] b\x85c"]
     loaded = SessionSummary.from_dict(data)
     assert SessionSummary.from_text(loaded.to_text()) == loaded and loaded.section("REQUESTS") == ("a [USER] b c",)
+
+
+def test_replaying_a_pin_step_reports_already_applied() -> None:
+    step = CoverageStep(base=None, after=Coverage(0, 7), turns=2, pin=True, pinned=(Coverage(4, 7),))
+    first = fold_run(SessionMemory(), [], None, RC, step=step)
+    assert first.report.pinned == 2 and first.memory.summary.pinned == (Coverage(4, 7),)
+    replay = fold_run(first.memory, [], None, RC, step=step)
+    assert replay.report.already_applied and not replay.report.stale_plan and replay.memory.summary == first.memory.summary
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("-5 C", "5 C"),
+        ("-0.5", "0.5"),
+        ("-1", "1"),
+        ("$100", "€100"),
+        ("$100", "100"),
+        ("50%", "50"),
+        (".5", "5"),
+    ],
+)
+def test_currency_percent_and_leading_sign_or_dot_stay_distinct(first: str, second: str) -> None:
+    assert open_item_key(first) != open_item_key(second)
+    merged, report = merge_summary_delta(
+        SessionSummary(),
+        SummaryDelta(entries={"KEY FACTS & IDENTIFIERS": (first, second)}),
+        RC,
+    )
+    assert merged.section("KEY FACTS & IDENTIFIERS") == (first, second)
+    assert report.added == 2 and report.duplicates == 0
+
+
+def test_boolean_format_marker_is_rejected_as_not_a_summary() -> None:
+    assert stored_summary_problem({"format": True}) == "not a summary"
+    assert stored_summary_problem({"format": False}) == "not a summary"
