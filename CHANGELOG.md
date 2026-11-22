@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0b2] - 2026-11-22
+
 ### Changed
 
 - **A session's next run is seeded from its raw earlier turns, and the
