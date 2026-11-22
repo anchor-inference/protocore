@@ -301,6 +301,8 @@ summary they reserve room for is held to
 `session_memory_running_summary_token_cap` (1,900), which also bounds
 `session_memory_fold_max_output_tokens` (1,000) from above (an approximate
 comparison: the cap is the calibrated estimate, the bound the provider's count).
+`session_memory_pending_max_items` (10) bounds the open items;
+`session_seed_pin_release_runs` (20) releases a pin;
 `session_seed_fold_cuts_before_pin` (2) pins a turn the summariser keeps being
 cut off on; `session_memory_registry_max_tokens` (2,000) and
 `session_memory_registry_head_chars` (240) bound the artifact registry;

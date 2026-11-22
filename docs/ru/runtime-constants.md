@@ -317,6 +317,8 @@ if iteration >= 50:
 `session_memory_running_summary_token_cap` (1 900), который же ограничивает
 сверху `session_memory_fold_max_output_tokens` (1 000) (сравнение
 приблизительное: потолок — откалиброванная оценка, предел — счёт провайдера).
+`session_memory_pending_max_items` (10) ограничивает открытые пункты;
+`session_seed_pin_release_runs` (20) снимает закрепление;
 `session_seed_fold_cuts_before_pin` (2) закрепляет ход, на котором
 суммаризатор раз за разом обрывается; `session_memory_registry_max_tokens`
 (2 000) и `session_memory_registry_head_chars` (240) ограничивают реестр

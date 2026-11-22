@@ -420,8 +420,12 @@ turns, and makes the summariser call.
   the coverage it was planned against, and `fold_run` refuses it on any other
   summary (`stale_plan`), so a range can never span a turn it does not
   record.
+- **The first question is always protected.** When the first turn is too
+  large for `session_memory_head_max_tokens`, its user message is still
+  carried verbatim in front of the summary; only the rest of the turn is
+  folded.
 - **Under pressure** the older full turns are masked first; the registry
-  shrinks toward its list of paths; the newest turn's result text is cut to
+  shrinks within its bound (to its paths, then to a count of its files); the newest turn's result text is cut to
   the longest head that fits (its images stay), then masked; then window
   turns are left out oldest first, then the head, the registry and the
   summary; the newest turn is reduced to its question and answer, and only
@@ -438,7 +442,12 @@ turns, and makes the summariser call.
   `recommend_seed_budget(rc, overhead_tokens)` gives the seed
   `session_seed_budget_ratio` of the room between the overhead and the
   compaction trigger, leaving at least `session_seed_run_reserve_min_tokens`
-  to the run.
+  (half the room on a small window) to the run; given the history it never
+  goes below the previous question and answer (`seed_floor_tokens`), so on a
+  tiny window the run starts over its trigger rather than without the last
+  answer. The routine compaction gate opens for a seeded full turn, and the
+  pass counts it as removable: a run that needs room gets it from the re-mask,
+  oldest seeded messages first and only as much as needed.
 - **Prefix-stable.** A masked turn is the same bytes in every seed, and the
   summary only changes when a fold lands, so consecutive seeds share
   everything up to the previous seed's full tail, on the messages and on the
@@ -458,22 +467,27 @@ turns, and makes the summariser call.
   leaving the window in their masked form (`build_summary_delta_request`,
   `SUMMARY_DELTA_SYSTEM`) and writes only new entries under fixed sections,
   or `NOTHING NEW`; tool output reaches it fenced, every line prefixed, as
-  data it must not take instructions from. PENDING / NEXT is a list of open
-  items: new items are appended, `- DONE: <item>` closes the stored item it
-  names (matched case-, space- and punctuation-insensitively; an unmatched
-  one is reported), only `- nothing open` empties it, and "no change" words
-  change nothing. `parse_summary_delta` refuses an empty, all-reasoning or
+  data it must not take instructions from (every Unicode line break is
+  fenced). PENDING / NEXT is a list of open items, at most
+  `session_memory_pending_max_items` of them (oldest dropped first): new items
+  are appended, a line starting with the exact token `DONE:` closes the one
+  stored item it names (matched case-insensitively and ignoring punctuation
+  at word edges, so `1.5` and `15`, `C` and `C++` stay different; an
+  unmatched or ambiguous one closes nothing and is reported), and only the
+  exact entry `NOTHING-OPEN` empties it. Both tokens are copied in English
+  whatever the conversation's language; anything else is an open item. `parse_summary_delta` refuses an empty, all-reasoning or
   cut-off-before-its-first-entry reply, so no coverage advances on it. A
   reply cut off at its output bound only adds: its complete entries are kept,
   nothing is cleared or closed, and coverage does not advance, so the turns
   are folded again in a halved batch; after `session_seed_fold_cuts_before_pin`
-  cut folds of a single turn it is pinned — carried masked for good — rather
-  than retried. `fold_run` merges the entries (never one already stored),
+  cut folds of that same turn it is pinned — carried masked — rather than
+  retried, until the summary cap, the fold output bound or the summariser
+  changes, or `session_seed_pin_release_runs` runs pass. `fold_run` merges the entries (never one already stored),
   records the coverage, keeps the stale-fold count, and applying the same
   step again changes nothing. A held fold changes the summary without moving
   coverage, so it breaks the prefix after the head, like a fold. Over `session_memory_running_summary_token_cap`, whole entries are
-  shed oldest first, ARTIFACTS before later REQUESTS before KEY FACTS &
-  IDENTIFIERS before CONSTRAINTS & DECISIONS, PENDING / NEXT last, and a
+  shed oldest first, ARTIFACTS before later REQUESTS before open items before
+  KEY FACTS & IDENTIFIERS before CONSTRAINTS & DECISIONS, and a
   section says how many it shed. *Why.* A summary rewritten whole on every run
   cost thousands of output tokens per turn, and one capped by cutting
   characters from its end lost its last sections whole.
@@ -635,6 +649,8 @@ nothing or keep nothing; point the same code at a real provider to measure it.
 | `session_seed_fold_target_ratio` | 0.6 | share a planned fold brings the seed down to |
 | `session_seed_fold_min_turns_between` | 1 | runs a fold must leave free, in newest-turn masked sizes |
 | `session_seed_fold_cuts_before_pin` | 2 | cut folds of one turn before it is pinned |
+| `session_seed_pin_release_runs` | 20 | runs after which a pin is released |
+| `session_memory_pending_max_items` | 10 | most open items PENDING / NEXT keeps |
 | `session_seed_budget_ratio` | 0.75 | seed share of the room between overhead and trigger |
 | `session_seed_run_reserve_min_tokens` | 6,000 | least room the recommended budget leaves the run |
 | `session_memory_registry_max_tokens` | 2,000 | bound on the registry block |
