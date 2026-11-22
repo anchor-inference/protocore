@@ -941,67 +941,264 @@ class LoopConstants(BaseModel):
         default=1900,
         ge=0,
         description=(
-            "Drift control on the carried running summary. When the accumulated "
-            "running summary grows past this ESTIMATED-token cap, the assembly "
-            "truncates it (the next fold is still delta-only — the summary is "
-            "NEVER recomputed from raw, which would reintroduce O(K²) cost + "
-            "non-monotonic fidelity). Keeps the carried artifact compact so a "
-            "long session's summary block cannot itself overflow the window. "
-            "Measured in a DIFFERENT unit from ``session_memory_summary_max_tokens`` "
-            "(the per-fold output budget): this cap is an estimate over stored "
-            "characters, that budget is a hard provider-side token bound, and the "
-            "writer must be able to re-emit everything this cap admits — on "
-            "digest-dense content that costs up to ~3.4x this number in real "
-            "tokens. THIS is the side of the pair that gives: the budget is "
-            "pinned by how long a fold may take, so the cap follows from "
-            "``cap x 3.4 <= 0.80 x budget`` and comes DOWN when the worst "
-            "measured ratio rises. Raising it without raising the budget starves "
-            "the fold's delta allowance and stalls the summary. See that field "
-            "for the measured ratios. Note that a session whose summary "
-            "sits AT this cap has stopped absorbing new facts: the fold still "
-            "succeeds, but every addition displaces something. 0 disables the cap."
+            "Ceiling, in estimated tokens, on the running summary of a session "
+            "(the record of the turns that have left the seed's raw window). "
+            "A fold appends what the summariser found new; when the merged "
+            "summary is over this cap, whole entries are shed oldest first, "
+            "section by section in a fixed order (ARTIFACTS, then later "
+            "REQUESTS, then KEY FACTS & IDENTIFIERS, then CONSTRAINTS & "
+            "DECISIONS, PENDING / NEXT last), and each section says how many "
+            "of its entries it no longer carries. Nothing is cut from the end "
+            "by characters, so no section is lost whole. The seed's fold "
+            "planner reserves this much of the seed budget for the summary. "
+            "0 disables the cap."
         ),
     )
-    session_memory_tail_budget_fraction: float = Field(
-        default=0.30,
-        ge=0.0,
+    session_memory_fold_max_output_tokens: int = Field(
+        default=1000,
+        gt=0,
+        description=(
+            "Output bound, in the provider's tokens, for one summary fold. A "
+            "fold writes only the facts the turns leaving the raw window add "
+            "(a few hundred tokens in a tool-heavy chat), never the whole "
+            "summary again, so the bound is sized on that delta: it stops a "
+            "runaway reply early instead of decoding thousands of tokens the "
+            "summary cap would shed at once. Validated to be at most "
+            "session_memory_running_summary_token_cap when that cap is set. "
+            "The comparison is approximate: the cap is the core's estimate, "
+            "calibrated to the provider's count by "
+            "token_estimate_calibration, and this bound is the provider's own "
+            "count; it guards against a bound far past what can be stored, "
+            "not against a few tokens either way. Send the fold with thinking "
+            "off, or a reasoning model can spend the bound before it writes."
+        ),
+    )
+    session_memory_pending_max_items: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            "Most open items PENDING / NEXT keeps. A chat assistant ends most "
+            "answers with an offer, and few of them are ever marked done, so "
+            "the list would otherwise only grow and crowd the facts out of "
+            "the summary; past this count the oldest open items are dropped "
+            "first, and the merge report says how many."
+        ),
+    )
+    session_memory_registry_max_tokens: int = Field(
+        default=2000,
+        ge=0,
+        description=(
+            "Ceiling, in estimated tokens, on the artifact registry block a "
+            "seed carries (the files the session wrote, with their last "
+            "content). Over it, snapshots give way oldest file first: to the "
+            "path, the size and a short head, then to the path alone, then "
+            "the oldest paths are counted instead of listed. The fold planner "
+            "reserves this much of the seed budget for the registry, so it is "
+            "also what keeps a coding session's files from making every run "
+            "fold. 0 carries no registry."
+        ),
+    )
+    session_memory_registry_head_chars: int = Field(
+        default=240,
+        ge=0,
+        description=(
+            "Characters of a file's content the registry keeps when the "
+            "snapshot no longer fits session_memory_registry_max_tokens."
+        ),
+    )
+    session_memory_head_protect_turns: int = Field(
+        default=1,
+        ge=0,
+        description=(
+            "How many leading TURNS of a session the seed always carries "
+            "raw, ahead of the summary — the user's first request, the answer "
+            "and its tool calls (results masked like any older turn). Counted "
+            "in turns, not messages: a first turn that calls a tool is four "
+            "messages or more and a message count never protected it. These "
+            "turns are never folded into the summary. 0 disables head "
+            "protection."
+        ),
+    )
+    session_memory_head_max_tokens: int = Field(
+        default=3000,
+        ge=0,
+        description=(
+            "Largest masked size, in estimated tokens, of the protected head. "
+            "Leading turns are protected only while their masked size stays "
+            "within this; a turn past it is folded like any other. An absolute "
+            "number rather than a share of the seed budget, because the "
+            "budget changes with each run's message and the head must not "
+            "come and go with it."
+        ),
+    )
+    session_seed_full_turns: int = Field(
+        default=1,
+        ge=0,
+        description=(
+            "How many of the newest prior turns the seed carries with their "
+            "tool exchanges in full. Older turns keep every user and assistant "
+            "word and every tool call; their long tool results become a short "
+            "placeholder (tool, size, the lines the masking rule keeps, a "
+            "head), their images and reasoning are dropped and long call "
+            "arguments are cut to a head. The fold planner keeps room for the "
+            "full turns: it folds older turns early rather than cut them, as "
+            "long as the budget can hold them at all."
+        ),
+    )
+    session_seed_mask_batch_turns: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "How many turns cross the masking boundary at once. The seed "
+            "carries between session_seed_full_turns and that plus this minus "
+            "one turns in full, and masks the older ones in steps of this "
+            "many, so the bytes of a turn change form once per step instead "
+            "of on every run. The boundary sits at the end of the seed, so a "
+            "move costs only the re-read of those turns; 1 suits a window "
+            "where two full tool-heavy turns do not fit the seed anyway."
+        ),
+    )
+    session_seed_mask_min_chars: int = Field(
+        default=600,
+        ge=0,
+        description=(
+            "Tool results shorter than this many characters are carried whole "
+            "in masked turns (their images still go): the placeholder would "
+            "cost about what it saves. A placeholder is also never used when "
+            "it would be longer than the result it replaces."
+        ),
+    )
+    session_seed_mask_preview_chars: int = Field(
+        default=300,
+        ge=0,
+        description=(
+            "Characters of a masked tool result's head kept in its "
+            "placeholder, after the lines the masking rule keeps. 0 keeps no "
+            "head."
+        ),
+    )
+    session_seed_mask_arg_max_chars: int = Field(
+        default=400,
+        gt=0,
+        description=(
+            "In masked turns, a string argument (or key) of a tool call "
+            "longer than this is cut to its head and the number of characters "
+            "not carried, and a list whose JSON is longer keeps its leading "
+            "items and a count of the rest; shorter values (paths, ids) stay "
+            "whole and the arguments stay valid JSON. A file a call wrote is still in the "
+            "artifact registry, which is built from the run as it happened."
+        ),
+    )
+    session_seed_mask_arg_preview_chars: int = Field(
+        default=120,
+        ge=0,
+        description="Head of a cut tool-call argument kept in a masked turn.",
+    )
+    session_seed_mask_identifier_lines: int = Field(
+        default=8,
+        ge=0,
+        description=(
+            "How many lines carrying an identifier of recognisable shape (a "
+            "URL, a UUID, an absolute path, a host:port, a version) the "
+            "default masking rule keeps from a masked tool result, on top of "
+            "every line that starts with one of "
+            "tool_result_stale_trim_protected_prefixes. 0 keeps only the "
+            "prefixed lines."
+        ),
+    )
+    session_seed_fold_trigger_ratio: float = Field(
+        default=0.9,
+        gt=0.0,
         le=1.0,
         description=(
-            "Fraction of the seed token budget reserved for the recent RAW tail "
-            "(verbatim, tool-pair-safe) in "
-            ":func:`protocore.runtime.context.session_memory.build_seed`. The "
-            "remaining budget carries the head + running summary + ledger. A "
-            "larger tail keeps more recent turns verbatim (higher fidelity, more "
-            "tokens); a smaller tail leans harder on the summary."
+            "Share of the seed budget at which a fold is planned. After a run, "
+            "the planner measures what the next seed would carry — the head, "
+            "the summary at its cap, the artifact registry, every older turn "
+            "after the summary in masked form, and the newest full turns at "
+            "their full size when the budget can hold them — and plans a fold "
+            "only when that exceeds this share. Below it no summariser call "
+            "is made."
         ),
     )
-    session_memory_head_protect_messages: int = Field(
-        default=3,
+    session_seed_fold_min_turns_between: int = Field(
+        default=1,
         ge=0,
         description=(
-            "Number of leading messages of the FIRST run kept VERBATIM at the "
-            "head of every seed (the original system + first user task + first "
-            "assistant turn), never routed through summarisation. Anchors the "
-            "original ask/constraints across the whole session (head-protection "
-            "— anti lost-in-the-middle). 0 disables head protection."
+            "Runs a fold must leave before the next one, counted in turns of "
+            "the newest turn's masked size. The planner counts the newest "
+            "turn at its full size — folding older turns early so that the "
+            "previous turn's tool results reach the next run uncut — only "
+            "while the head, the summary at its cap, the registry and that "
+            "turn leave room below the trigger for this many more masked "
+            "turns; each run turns the newest turn into one of them. A newest "
+            "turn too large for that would make every run fold, so it is "
+            "counted masked instead and the seed cuts it when the window has "
+            "grown. 1 keeps the newest turn uncut whenever that costs at most "
+            "a fold every second run; larger values fold less often and cut "
+            "large newest turns more often."
         ),
     )
-    session_memory_fold_min_tokens: int = Field(
-        default=0,
+    session_seed_fold_cuts_before_pin: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "Consecutive folds of one single turn that may come back cut off "
+            "at the output bound before that turn is pinned: recorded in the "
+            "summary's range as not summarised and carried masked from then "
+            "on, with no further summariser call for it. The planner halves "
+            "its batch for every consecutive fold that did not land, so a "
+            "summariser that keeps being cut reaches one turn per fold first."
+        ),
+    )
+    session_seed_pin_release_runs: int = Field(
+        default=20,
+        ge=1,
+        description=(
+            "Runs after which a pinned turn — one the summariser was cut off "
+            "on repeatedly, carried masked instead of summarised — is folded "
+            "again. A pin is also released at once when the summary cap, the "
+            "fold output bound or the host's summariser changes, since the "
+            "cut-off may not happen again."
+        ),
+    )
+    session_seed_budget_ratio: float = Field(
+        default=0.75,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Share of the room between the run's fixed overhead (system "
+            "prompt, tools, preludes, the new task) and the compaction "
+            "trigger that recommend_seed_budget gives the seed. The rest is "
+            "the run's own room. The seed's newest full turns are tagged so "
+            "that in-run compaction re-masks them first, to exactly the form "
+            "the next seed would carry, which hands the run their full minus "
+            "masked size back before it touches the run's own work; so the "
+            "seed can carry the previous turn uncut without starving a run "
+            "that does new tool work."
+        ),
+    )
+    session_seed_run_reserve_min_tokens: int = Field(
+        default=6000,
         ge=0,
         description=(
-            "Lazy-fold gate. The post-run structured-memory "
-            "UPDATE skips the LLM running-summary call ENTIRELY (ledger-only, "
-            "ZERO LLM cost) while the whole prior session still fits in the SEED's "
-            "raw tail (``compaction_trigger_tokens * "
-            "session_memory_tail_budget_fraction``) — the running summary would "
-            "never be read, so summarising it is wasted load. The fold only "
-            "summarises once the cumulative session tokens EXCEED this threshold. "
-            "0 (default) DERIVES the threshold from the tail budget so the lazy "
-            "gate and :func:`~protocore.runtime.context.session_memory.build_seed` "
-            "agree by construction; a positive value overrides it with an explicit "
-            "per-tenant token threshold. The deterministic artifact ledger is "
-            "ALWAYS updated (it is free, no LLM), regardless of this gate."
+            "Least room, in estimated tokens, that recommend_seed_budget "
+            "leaves between the seed and the compaction trigger for the run's "
+            "own work, before what re-masking the seeded newest turn hands "
+            "back."
+        ),
+    )
+    session_seed_fold_target_ratio: float = Field(
+        default=0.6,
+        ge=0.0,
+        lt=1.0,
+        description=(
+            "Share of the seed budget a planned fold brings the next seed down "
+            "to: the oldest turns the summary does not record are folded until "
+            "the rest fits this share (or, while the newest turn is counted in "
+            "full, what the head, summary, registry and newest turn need). The gap to session_seed_fold_trigger_ratio is "
+            "the hysteresis: the seed then grows by appending for several "
+            "turns before the next fold moves its front, which is what lets a "
+            "provider's prefix cache serve it. Must be below the trigger."
         ),
     )
 
@@ -3611,7 +3808,8 @@ class LoopConstants(BaseModel):
             "verbatim from the part of a result it cuts. A result that tells "
             "the model how to cite what it read loses that line with the body "
             "otherwise, and a citation the model cannot see is one it invents. "
-            "Empty turns the carry-over off."
+            "The session seed's default masking rule keeps the same lines from "
+            "the tool results of older turns. Empty turns the carry-over off."
         ),
     )
 
@@ -3717,6 +3915,19 @@ class LoopConstants(BaseModel):
             if self.provider_reserves_output_in_context_window
             else 0.0
         )
+        if self.session_seed_fold_target_ratio >= self.session_seed_fold_trigger_ratio:
+            raise ValueError(
+                "session_seed_fold_target_ratio must be < session_seed_fold_trigger_ratio"
+            )
+        if (
+            self.session_memory_running_summary_token_cap > 0
+            and self.session_memory_fold_max_output_tokens
+            > self.session_memory_running_summary_token_cap
+        ):
+            raise ValueError(
+                "session_memory_fold_max_output_tokens must be <= "
+                "session_memory_running_summary_token_cap when the cap is set"
+            )
         if self.compaction_ledger_min_tokens > self.compaction_ledger_max_tokens:
             raise ValueError(
                 "compaction_ledger_min_tokens must be <= compaction_ledger_max_tokens"

@@ -299,6 +299,36 @@ if iteration >= 50:
 стоит `token_count_image_tokens`. См.
 [`contracts.md`](contracts.md#изображения-в-результатах-инструментов).
 
+Поля посева сессии — пятый такой набор. `session_seed_full_turns` (1) и
+`session_seed_mask_batch_turns` (1) решают, сколько новейших прежних ходов
+сессии сеются с результатами инструментов и насколько за раз сдвигается
+граница маскирования; `session_seed_mask_min_chars`,
+`session_seed_mask_preview_chars` и `session_seed_mask_identifier_lines`
+задают вид заглушки маскированного результата, а
+`session_seed_mask_arg_max_chars` и `session_seed_mask_arg_preview_chars` —
+аргументов маскированного вызова.
+`session_seed_fold_trigger_ratio` (0.9) и `session_seed_fold_target_ratio`
+(0.6, ниже триггера) — гистерезис fold выжимки относительно бюджета посева,
+который передаёт хост; планировщик считает новейшие полные ходы в полном
+размере, так что старшие ходы сворачиваются раньше, чем режется новейший, если это
+оставляет до следующего fold не меньше `session_seed_fold_min_turns_between`
+(1) запусков.
+Выжимка, под которую они резервируют место, держится в
+`session_memory_running_summary_token_cap` (1 900), который же ограничивает
+сверху `session_memory_fold_max_output_tokens` (1 000) (сравнение
+приблизительное: потолок — откалиброванная оценка, предел — счёт провайдера).
+`session_memory_pending_max_items` (10) ограничивает открытые пункты;
+`session_seed_pin_release_runs` (20) снимает закрепление;
+`session_seed_fold_cuts_before_pin` (2) закрепляет ход, на котором
+суммаризатор раз за разом обрывается; `session_memory_registry_max_tokens`
+(2 000) и `session_memory_registry_head_chars` (240) ограничивают реестр
+артефактов; `session_seed_budget_ratio` (0.75) и
+`session_seed_run_reserve_min_tokens` (6 000) задают рекомендованный бюджет посева (см. [`compaction.md`](compaction.md#посев-следующего-запуска)).
+`session_memory_head_protect_turns` (1) и `session_memory_head_max_tokens`
+(3 000) защищают первые ходы сессии. Значения по умолчанию подобраны под окно
+в несколько десятков тысяч токенов и диалоги из нескольких ходов с инструментами. См.
+[`compaction.md`](compaction.md#посев-следующего-запуска).
+
 ## Смотрите также
 
 - [`architecture.md`](architecture.md) — система LoopConstants в полной

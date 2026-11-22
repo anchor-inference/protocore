@@ -6,6 +6,78 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0b2] - 2026-11-22
+
+### Changed
+
+- **A session's next run is seeded from its raw earlier turns, and the
+  summary stands in only for what no longer fits.**
+  `runtime/context/session_seed.py` is new.
+  `build_session_seed(history, memory, budget, rc, position=..., rule=...,
+  cache=...)` carries every earlier turn whole: user and assistant text and
+  tool calls verbatim, calls and results paired in order. In all but the
+  newest `session_seed_full_turns` turns a long tool result becomes a short
+  placeholder that keeps the lines a `MaskingRule` names, images are dropped
+  and counted, long call arguments are cut in valid JSON (the marker is
+  exported as `CUT_ARGUMENT_SUFFIX` / `has_cut_marker`) and reasoning is
+  dropped. A masked turn is the same bytes in every seed, so consecutive
+  seeds share their prefix. The seed always fits its budget and always
+  encodes as UTF-8; under pressure the previous answer outranks the
+  registry, the summary and every older turn, and one notice says what is
+  missing. The seed's newest turns carry their masked form, and in-run
+  compaction puts it in place first (`remask_seeded_turns`), so the previous
+  turn is carried uncut without starving the run. `recommend_seed_budget`
+  sizes the seed from the window and the run's overhead.
+  `plan_session_fold(...)` says after a run which turns need folding, keeps
+  folds at least `session_seed_fold_min_turns_between` runs apart, halves
+  its batch after every fold that did not land, and pins a turn the
+  summariser was cut off on `session_seed_fold_cuts_before_pin` times (that
+  turn only, released after `session_seed_pin_release_runs` runs or when the
+  cap, output bound or summariser changes). The routine compaction gate opens
+  for a seeded full turn and re-masks it oldest first, only as far as needed;
+  `recommend_seed_budget` never gives less than the previous question and
+  answer, and the session's first question is carried even when its turn is
+  too large to protect. A
+  thread-safe `SeedCache` per session makes a run cost only its new turns.
+- **The running summary grows by deltas and carries its own coverage.**
+  `SessionMemory.summary` is a `SessionSummary`: entries under five fixed
+  sections, a contiguous `coverage` range of the host's message positions
+  that starts after the protected head, and the pinned ranges inside it.
+  Its stored forms carry a format marker, the entry count and a digest;
+  anything else loads as a fresh summary that covers nothing. A fold is
+  shown the turns leaving the window in their masked form, tool output
+  fenced as untrusted data, and asked only for what they add
+  (`build_summary_delta_request`, with the host's thinking switch and the
+  output bound `session_memory_fold_max_output_tokens`). PENDING / NEXT is a
+  list of open items: a line starting with the exact token `DONE:` closes
+  the one item it names, only the exact entry `NOTHING-OPEN` empties it, at
+  most `session_memory_pending_max_items` open items are kept, and entries
+  are compared without merging distinct numbers or codes.
+  `parse_summary_delta` refuses an empty,
+  all-reasoning or cut-before-its-first-entry reply; a later cut reply only
+  adds and does not advance coverage. `fold_run(..., step=plan.step,
+  fold_attempted=..., summariser=...)` refuses a step planned against another coverage,
+  never applies one twice, keeps the stale-fold count, and reports
+  `NOTHING NEW` folds over user turns. Past
+  `session_memory_running_summary_token_cap` whole entries are shed oldest
+  first instead of cutting characters from the end. The artifact registry
+  is held to `session_memory_registry_max_tokens`.
+- **Head protection counts turns.** `session_memory_head_protect_turns` (1)
+  and `session_memory_head_max_tokens` (3000) replace
+  `session_memory_head_protect_messages`, whose count of 3 never held a first
+  turn that called a tool.
+
+### Removed
+
+- `build_seed`, `build_summary_user_message`, `bound_catchup_source`,
+  `running_summary_needed`, `summary_fold_threshold_tokens`, `SUMMARY_SYSTEM`,
+  `SessionMemory.running_summary` and `SessionMemory.cumulative_raw_tokens`,
+  and the constants `session_memory_tail_budget_fraction`,
+  `session_memory_head_protect_messages` and `session_memory_fold_min_tokens`.
+  A memory stored by the earlier format loads with a fresh summary that
+  covers nothing; its turns are carried again as far as the budget allows,
+  with a notice for the rest, and folded back over the following runs.
+
 ## [2.0.0b1] - 2026-11-20
 
 ### Added

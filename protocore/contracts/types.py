@@ -602,6 +602,20 @@ Survives snapshot/resume via ``model_dump``/``model_validate``. Tier-1 shedding
 preserves it (``model_copy`` keeps ``metadata``); seeded turns are added to the
 Tier-2 protected set so a summary never silently drops the tag."""
 
+SESSION_SEED_MASKED_FORM_METADATA_KEY = "protocore.session_seed_masked_form"
+"""``Message.metadata`` entry on a message of a seed's newest, unmasked turns:
+the masked form the next seed would carry for that message, as
+``{"drop": bool, "message": <Message dumped in JSON mode, without metadata and
+timestamp> | None}`` (``drop`` when the masked turn leaves the message out,
+which it does for a message that is only reasoning).
+
+In-run compaction reads it before anything else
+(:func:`protocore.runtime.context.compaction.remask_seeded_turns`): the
+seeded previous turn is carried uncut so the follow-up can read it, and when
+the run's own work needs room, that turn gives way first — to exactly the
+bytes the next seed will carry it in, so nothing is lost that the next run
+would have had."""
+
 
 class RunStatus(StrEnum):
     """Persistent run state. Mirrors PG ``runs.status`` column.
@@ -2027,6 +2041,7 @@ __all__ = [
     "IMAGE_REFS_METADATA_KEY",
     "ORIGIN_METADATA_KEY",
     "QUEUED_ITEMS_METADATA_KEY",
+    "SESSION_SEED_MASKED_FORM_METADATA_KEY",
     "TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY",
     "TERMINAL_TOOL_METADATA_KEY",
     "TERMINAL_TOOL_STATUS_COMPLETED",

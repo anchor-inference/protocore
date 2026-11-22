@@ -285,6 +285,34 @@ carries more images between breaks; each image is priced at
 `token_count_image_tokens` either way. See
 [`contracts.md`](contracts.md#images-in-tool-results).
 
+The session-seed fields are a fifth. `session_seed_full_turns` (1) and
+`session_seed_mask_batch_turns` (1) decide how many of a session's newest
+earlier turns are seeded with their tool results and how far the masking
+boundary moves at once; `session_seed_mask_min_chars`,
+`session_seed_mask_preview_chars` and `session_seed_mask_identifier_lines`
+shape a masked result's placeholder, and `session_seed_mask_arg_max_chars`
+and `session_seed_mask_arg_preview_chars` a masked call's arguments. `session_seed_fold_trigger_ratio` (0.9)
+and `session_seed_fold_target_ratio` (0.6, below the trigger) are the
+hysteresis of the summary fold, against the seed budget the host passes; the
+planner counts the newest full turns at their full size, so older turns are
+folded before the newest is cut, unless that would leave room for fewer than
+`session_seed_fold_min_turns_between` (1) runs before the next fold. The
+summary they reserve room for is held to
+`session_memory_running_summary_token_cap` (1,900), which also bounds
+`session_memory_fold_max_output_tokens` (1,000) from above (an approximate
+comparison: the cap is the calibrated estimate, the bound the provider's count).
+`session_memory_pending_max_items` (10) bounds the open items;
+`session_seed_pin_release_runs` (20) releases a pin;
+`session_seed_fold_cuts_before_pin` (2) pins a turn the summariser keeps being
+cut off on; `session_memory_registry_max_tokens` (2,000) and
+`session_memory_registry_head_chars` (240) bound the artifact registry;
+`session_seed_budget_ratio` (0.75) and `session_seed_run_reserve_min_tokens`
+(6,000) drive the recommended seed budget (see [`compaction.md`](compaction.md#seeding-the-next-run)).
+`session_memory_head_protect_turns` (1) and `session_memory_head_max_tokens`
+(3,000) protect the session's first turns. The defaults suit a window of
+a few tens of thousands of tokens and chats of a few tool-heavy turns. See
+[`compaction.md`](compaction.md#seeding-the-next-run).
+
 ## See also
 
 - [`architecture.md`](architecture.md) — the LoopConstants system in the

@@ -332,7 +332,7 @@ async def test_untagged_user_turn_never_shed_as_reference() -> None:
 
 @pytest.mark.asyncio
 async def test_sheds_summary_seed_block_via_reference_path() -> None:
-    """Engagement test: a ``build_seed`` summary block
+    """Engagement test: a session-seed summary block
     (dual-tagged seed + reference) is actually blob-shed by the Tier-1
     reference path when over budget — proving the previously-immovable large
     user-text seed block now has a real shed path (and survives as a recoverable
@@ -340,18 +340,25 @@ async def test_sheds_summary_seed_block_via_reference_path() -> None:
     from protocore.runtime.context.session_memory import (
         ArtifactLedger,
         SessionMemory,
-        build_seed,
+        SessionSummary,
     )
+    from protocore.runtime.context.session_seed import build_session_seed
 
     rc = LoopConstants(model_context_window=4_096)
     blobs = InMemoryBlobStore()
     mem = SessionMemory(
-        running_summary="DECISION: port 8080. " + ("carried fact line. " * 4000),
+        summary=SessionSummary(
+            entries={
+                "KEY FACTS & IDENTIFIERS": (
+                    "DECISION: port 8080. " + ("carried fact line. " * 4000),
+                )
+            }
+        ),
         ledger=ArtifactLedger(files=["a.py"], content={"a.py": "x = 1\n" * 2000}),
         turn_index=3,
     )
     head = [Message(role=MessageRole.user, content_blocks=[TextBlock(text="ORIGINAL TASK")])]
-    seed = build_seed(mem, [], head, 40_000, rc)
+    seed = build_session_seed(head, mem, 40_000, rc, position=lambda message: None).messages
     # A fresh task turn after the seed (the recent window the guard keeps).
     history = [
         *seed,

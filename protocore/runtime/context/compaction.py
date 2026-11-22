@@ -60,6 +60,7 @@ from protocore.contracts.types import (
     COMPACTION_SUMMARY_METADATA_KEY,
     OPERATOR_WORDS_METADATA_KEY,
     SESSION_HISTORY_SEED_METADATA_KEY,
+    SESSION_SEED_MASKED_FORM_METADATA_KEY,
     SYNTHETIC_RECOVERY_METADATA_KEY,
     CompactionSourceRef,
     ContentBlock,
@@ -857,6 +858,8 @@ def tier1_has_work(
     """Whether :func:`run_tier1_truncation` would rewrite anything — without rewriting it."""
     if not history:
         return False
+    if any(is_seeded_full(message) for message in history):
+        return True
     keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
     eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index, rc)
     for message in history[:eligible_upper]:
@@ -968,6 +971,100 @@ async def _mask_result(
     return masked, original_tokens - estimate_tokens(text, rc), created
 
 
+@dataclass(frozen=True, slots=True)
+class RemaskResult:
+    """What :func:`remask_seeded_turns` did."""
+
+    tokens_freed: int = 0
+    messages_removed: int = 0
+    """Messages deleted (a masked turn leaves out a message that is only
+    reasoning); every one of them lies before the run's own messages."""
+    tagged_left: int = 0
+    """Seeded messages still in their full form (the target was met first)."""
+    messages_modified: int = 0
+    """Seeded messages replaced with their masked form or removed."""
+
+
+def _masked_form(message: Message) -> Message | None:
+    """The form a seed tagged ``message`` with; ``None`` when that form leaves it out."""
+    form = message.metadata.get(SESSION_SEED_MASKED_FORM_METADATA_KEY)
+    metadata = {k: v for k, v in message.metadata.items() if k != SESSION_SEED_MASKED_FORM_METADATA_KEY}
+    if not isinstance(form, dict):
+        return message.model_copy(update={"metadata": metadata})
+    if form.get("drop") is True:
+        return None
+    dumped = form.get("message")
+    if not isinstance(dumped, dict):
+        return message.model_copy(update={"metadata": metadata})
+    return Message.model_validate({**dumped, "created_at": message.created_at, "metadata": metadata})
+
+
+def is_seeded_full(message: Message) -> bool:
+    """Whether ``message`` belongs to a seed's unmasked newest turn and can still be re-masked."""
+    return isinstance(message.metadata.get(SESSION_SEED_MASKED_FORM_METADATA_KEY), dict)
+
+
+def remask_surplus_tokens(history: Sequence[Message], rc: LoopConstants) -> int:
+    """What re-masking every seeded full message would free, without doing it."""
+    surplus = 0
+    for message in history:
+        if not is_seeded_full(message):
+            continue
+        masked = _masked_form(message)
+        surplus += estimate_message_tokens(message, rc) - (0 if masked is None else estimate_message_tokens(masked, rc))
+    return max(0, surplus)
+
+
+def remask_seeded_turns(
+    history: list[Message],
+    rc: LoopConstants,
+    *,
+    free_target_tokens: int | None = None,
+) -> RemaskResult:
+    """Put the masked form of seeded full turns in place — the first thing compaction gives up.
+
+    A seed carries its newest earlier turns uncut so that a follow-up can read
+    them, and tags every message of them with the form the next seed would
+    carry it in (:data:`SESSION_SEED_MASKED_FORM_METADATA_KEY`). When a run's
+    own work needs room, those turns give way before anything of the run's:
+    a tagged message is replaced by exactly that form (or removed, when the
+    masked turn leaves it out), so what the run keeps is what the next run
+    will see. Oldest first, and only until ``free_target_tokens`` are freed
+    (all of them when ``None``): a follow-up about the previous turn's detail
+    keeps it when a little room is enough. Mutates ``history`` in place.
+    """
+    freed = 0
+    removed = 0
+    modified = 0
+    index = 0
+    while index < len(history):
+        if free_target_tokens is not None and freed >= free_target_tokens:
+            break
+        message = history[index]
+        if not is_seeded_full(message):
+            index += 1
+            continue
+        before = estimate_message_tokens(message, rc)
+        masked = _masked_form(message)
+        if masked is None:
+            del history[index]
+            freed += before
+            removed += 1
+            modified += 1
+            continue
+        history[index] = masked
+        freed += before - estimate_message_tokens(masked, rc)
+        modified += 1
+        index += 1
+    left = sum(1 for message in history if is_seeded_full(message))
+    return RemaskResult(
+        tokens_freed=max(0, freed),
+        messages_removed=removed,
+        tagged_left=left,
+        messages_modified=modified,
+    )
+
+
 async def run_tier1_truncation(
     history: list[Message],
     blob_store: IBlobStore,
@@ -983,8 +1080,10 @@ async def run_tier1_truncation(
 ) -> Tier1Result:
     """Mask tool outputs, shed aged reasoning and bound reference blocks — no model involved.
 
-    Mutates ``history`` in place, oldest first. Three passes over the region
-    outside the kept tail:
+    Mutates ``history`` in place, oldest first. First the seeded turns a
+    session seed carried uncut are put in their masked form
+    (:func:`remask_seeded_turns`). Then three passes over the region outside
+    the kept tail:
 
     * ``compaction_shed_reasoning_enabled`` — strip ``reasoning_content`` from
       aged assistant turns: re-emitted chain-of-thought is single-turn
@@ -1013,6 +1112,15 @@ async def run_tier1_truncation(
     if not history:
         return Tier1Result(tokens_freed=0, blob_refs_created=(), messages_modified=0)
 
+    # The seeded previous turn, carried uncut for the follow-up, gives way
+    # first: to exactly the form the next seed will carry it in, and only as
+    # far as the pass needs. A message it removes lies before the run's own,
+    # so the protected tail moves up with it.
+    remask = remask_seeded_turns(history, rc, free_target_tokens=free_target_tokens)
+    remasked = remask.tokens_freed
+    if protect_tail_from_index is not None:
+        protect_tail_from_index = max(0, protect_tail_from_index - remask.messages_removed)
+
     keep = rc.compaction_keep_recent_turns if keep_recent_turns is None else keep_recent_turns
     eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index, rc)
     preview_cap = rc.compaction_placeholder_preview_chars
@@ -1023,7 +1131,7 @@ async def run_tier1_truncation(
     # reasoning_content are rewritten below, so no tool_use block moves.
     tool_names = tool_names_by_call_id(history)
 
-    tokens_freed = 0
+    tokens_freed = remasked
     refs_created: list[str] = []
     modified: set[int] = set()
 
@@ -1221,7 +1329,7 @@ def _session_history_seed_indices(history: list[Message]) -> frozenset[int]:
       ``role=user`` ``TextBlock`` messages that DUAL-TAG
       :data:`SESSION_HISTORY_SEED_METADATA_KEY` AND
       :data:`COMPACTION_REFERENCE_METADATA_KEY` (see
-      ``session_memory._tag_seeded_reference``), so the Tier-1 A2(2)
+      ``session_seed._tag_seeded_reference``), so the Tier-1 A2(2)
       reference-block path blobs THEM to a recoverable placeholder when they
       exceed the truncation threshold. Without the reference dual-tag these
       large user-text blocks had NO shed path and were permanently immovable.
@@ -3088,13 +3196,17 @@ __all__ = [
     "CompactionExhaustedError",
     "CompactionState",
     "FloorResult",
+    "RemaskResult",
     "Tier1Result",
     "Tier2Result",
     "Tier3Result",
     "TokenEstimator",
     "compaction_event_payload",
     "floor_has_work",
+    "is_seeded_full",
     "place_ledger",
+    "remask_seeded_turns",
+    "remask_surplus_tokens",
     "removable_indices",
     "render_span_for_summary",
     "run_floor",
