@@ -18,7 +18,7 @@
 | `protocore.providers.openai_compat` | `OpenAICompatibleProvider`, `ILLMProvider` для любого сервера с API OpenAI chat-completions | набор `openai` |
 
 ```bash
-pip install "protocore[openai]==2.0.0b2"   # добавляет httpx
+pip install "protocore[openai]==2.0.0b3"   # добавляет httpx
 ```
 
 Ничто в ядре не импортирует адаптер, так что хост со своим адаптером без

@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0b3] - 2026-11-27
+
 ### Fixed
 
 - **Refusals say what actually happened.** The refusal a wind-down gives a
