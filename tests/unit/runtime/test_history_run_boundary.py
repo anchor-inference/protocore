@@ -613,6 +613,10 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/context/ledger.py::ledger_from_history": _whole(
         "merges every ledger message the transcript carries, whichever run wrote it"
     ),
+    "protocore/contracts/runtime_constants.py::override_text": _Declaration(
+        reason="reads a text constant off the run's constants by name",
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
     "protocore/runtime/context/compaction.py::render_span_for_summary": _Declaration(
         reason="renders one span a pass is about to replace, for the summariser",
         claim=_Claim.NOT_THE_TRANSCRIPT,

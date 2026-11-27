@@ -1393,6 +1393,7 @@ The principal extension points:
 | `IRequestManifestSink` | `contracts/observability.py` | Where a `RequestManifest` is kept, and for how long. |
 | `IDelegationTool` | `contracts/agent_dispatch.py` | The tool shape a delegated run is started through. |
 | `IRunToolErrorCounter` | `contracts/run.py` | Durable per-run tool-error counting across processes. |
+| `IRunRefusedCallCounter` | `contracts/run.py` | Durable per-run tally of calls the wind-down refused; not a tool error. |
 | `ITurnPolicy` | `contracts/turn_policy.py` | A product decision about a turn, substituted into the core's set by name. |
 | `IToolSafetyPolicy` | `runtime/tool_permission.py` | Extra permission policies (`HttpDnsAllowlistPolicy`, `WorkspacePathPolicy`) registered via `register_policy`. |
 | `ToolRoleMap` | `contracts/tool_roles.py` | Which of the host's tool names carry which `ToolRole`, and the argument spellings that go with them. Passed as `QueryEngineConfig.tool_roles`. |

@@ -163,6 +163,11 @@ _RESET_ON_REARM: frozenset[str] = frozenset(
         "_circuit_broken_tools",
         "_circuit_breaker_notified_tools",
         "_circuit_breaker_streak",
+        "_circuit_breaker_trip_caps",
+        # The refused-call tally counts what ONE run's wind-down turned away; the
+        # wind-down itself starts over with the turn, and so does what it refused.
+        "_refused_tool_call_ids",
+        "_refused_calls_unreported",
         # Run-level tool obligations: the preconditions are what the agent owes
         # before it is free to ANSWER, and every turn produces an answer.
         "_tool_precondition_index",

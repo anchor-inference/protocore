@@ -6,6 +6,65 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Refusals say what actually happened.** The refusal a wind-down gives a
+  call it turns away (`terminal-only mode: …`) now names the bound the run
+  reached — tool-call budget, turn limit, output-token budget, wall-clock
+  deadline, provider failure or no progress — read from the wind-down's cause
+  (`soft_stop.refusal_reason`), where it used to say the deadline had been
+  reached whatever had ended the run. It is given whenever the wind-down has
+  withdrawn the tool surface: also to a run with no terminal tool (the message
+  then says the run is finishing and to answer now with what was gathered), and
+  to a run continued with `run(None)` after its wind-down began, both of which
+  used to fall through to the permission gate and be told the tool was "not in
+  the tenant visible set" — a refusal that also fed the repeated-error breaker.
+  Wind-down refusals never feed the breaker or the error streak.
+- A tool the repeated-error breaker took out of the run is refused as *disabled
+  for the rest of this run after N consecutive failures* instead of "on the
+  tenant blocked list". `ToolVisibilityPolicy.run_disabled` maps each such tool
+  to the streak length that tripped the breaker (the number quoted is the one
+  the breaker used, persisted in the snapshot), must be a subset of `blocked`,
+  and is derived by the engine from the breaker's own record only; a tool the
+  host blocked keeps the host's wording.
+- The descriptions of `leader_tool_call_soft_cap` and
+  `subagent_tool_call_soft_cap` no longer say the cap never blocks: reaching
+  it starts the wind-down and withdraws every tool but the terminal one.
+
+### Added
+
+- **Refused calls are counted, apart from tool errors.** A call the wind-down
+  refuses never ran, so it is not a tool failure and does **not** change
+  `tool_errors_count` (a host that downgrades a run to `partial` on that count
+  sees no difference). The refusals go to a separate tally: the new
+  `IRunRefusedCallCounter` contract (`increment_refused_tool_calls_count`),
+  wired through `RunScopedState.refused_call_counter` and attributed to the root
+  run for a subagent; `QueryEngine.refused_tool_calls_count`; and a
+  `refused_tool_calls_count` field on the terminal `message_stop`. A call is
+  counted once per call id (idempotent on a replay after a pod change) and
+  reported to the host's counter only after the snapshot that records it.
+- **The refusal texts are run constants**, overridable per tenant, English by
+  default: `soft_stop_refusal_text`, `soft_stop_refusal_text_no_terminal`,
+  `soft_stop_refusal_reason` and one `soft_stop_refusal_reason_<cause>` per
+  wind-down cause, `tool_disabled_refusal_text` and
+  `tool_disabled_refusal_text_no_count`. An empty or whitespace-only override
+  means the default; a cleared per-cause reason means that cause's own default
+  wording, not the general reason, so resetting one never loses the cause.
+- **The wind-down refuses exactly what it withdrew.** A call is refused when
+  its tool is not on the surface the wind-down kept (the terminal tool and,
+  while an artifact is open, the tool that seals it), so the artifact sealer
+  the model is shown is also callable. A run whose host configured no terminal
+  tool keeps no tools, including a subagent: the host sets
+  `expected_terminal_tool` on the subagent's engine config for it to keep its
+  answer tool.
+- **No snapshot schema bump.** The snapshot gains two optional keys,
+  `circuit_breaker_trip_caps` and `refused_tool_call_ids`. A snapshot written
+  without them restores with empty values, and an older build that reads a
+  newer snapshot drops them at its next write. What is lost then is only the
+  refused-call tally (a replayed refusal can be counted again) and the streak
+  length the disabled-tool refusal quotes (it says "after repeated failures"),
+  so a rolling deploy or a rollback does not stop in-flight runs.
+
 ## [2.0.0b2] - 2026-11-22
 
 ### Changed

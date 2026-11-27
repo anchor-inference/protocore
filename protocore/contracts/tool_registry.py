@@ -12,9 +12,9 @@ fits, and name in the system prompt instead (see
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Final, Literal, Protocol, cast, runtime_checkable
+from typing import Final, Literal, Protocol, Self, cast, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from protocore.contracts.tool_retrieval import RetrievalSettings
 from protocore.contracts.tools import Tool
@@ -124,6 +124,23 @@ class ToolVisibilityPolicy(BaseModel):
     blocked: set[str] = Field(default_factory=set)
     """Explicit deny list (overrides visible)."""
 
+    run_disabled: dict[str, int | None] = Field(default_factory=dict)
+    """Tools the run itself stopped offering after repeated failures.
+
+    Maps each tool to the length of the failure streak that tripped the
+    repeated-error breaker for it, or ``None`` when that length was not
+    recorded. Every key is also in :attr:`blocked` — that is what removes the
+    tool from the surface and denies it at dispatch, and a key outside it is
+    refused when the policy is built. The check runs at construction only:
+    ``model_copy`` does not re-run it, so a copy that shrinks ``blocked`` must
+    shrink this mapping with it (the gate reads a key only inside its
+    ``blocked`` branch, so a stray one is inert, never an extra denial). This mapping only says WHY, so the
+    refusal the model reads names the real cause (a stop that lasts until the
+    run ends, after that many failures) instead of a deny list the operator
+    never wrote. A tool the operator blocked as well stays out of it: that
+    block is theirs.
+    """
+
     pinned: set[str] = Field(default_factory=set)
     """Always-include tools (always in surface, even with clipping)."""
 
@@ -141,6 +158,16 @@ class ToolVisibilityPolicy(BaseModel):
     tenant-policy floor that prevents catastrophic RU-prompt zero-score
     collapse. ``compute_effective_surface`` unions the two before clipping.
     """
+
+    @model_validator(mode="after")
+    def _run_disabled_is_blocked(self) -> Self:
+        stray = sorted(set(self.run_disabled) - self.blocked)
+        if stray:
+            raise ValueError(
+                "run_disabled names tools that are not blocked: "
+                + ", ".join(stray)
+            )
+        return self
 
 
 def policy_admits(policy: ToolVisibilityPolicy | None, name: str) -> bool:

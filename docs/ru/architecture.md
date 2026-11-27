@@ -1358,6 +1358,7 @@ magic numbers**. Каждое настраиваемое значение — э
 | `IRequestManifestSink` | `contracts/observability.py` | Где хранится `RequestManifest` и как долго. |
 | `IDelegationTool` | `contracts/agent_dispatch.py` | Форма инструмента, через который запускается делегированный прогон. |
 | `IRunToolErrorCounter` | `contracts/run.py` | Долговечный счёт ошибок инструментов на прогон, переживающий смену процесса. |
+| `IRunRefusedCallCounter` | `contracts/run.py` | Долговечный счёт вызовов, отклонённых режимом завершения; не ошибка инструмента. |
 | `ITurnPolicy` | `contracts/turn_policy.py` | Продуктовое решение о ходе, подставляемое в набор ядра по имени. |
 | `IToolSafetyPolicy` | `runtime/tool_permission.py` | Extra permission policies (`HttpDnsAllowlistPolicy`, `WorkspacePathPolicy`) registered via `register_policy`. |
 | `ToolRoleMap` | `contracts/tool_roles.py` | Какие имена инструментов хоста несут какие `ToolRole`, и написания аргументов, которые к ним прилагаются. Передаётся как `QueryEngineConfig.tool_roles`. |

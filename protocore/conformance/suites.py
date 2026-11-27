@@ -47,7 +47,11 @@ from protocore.contracts.resilience import (
     IResilienceClassifier,
     IToolTransport,
 )
-from protocore.contracts.run import IRunStore, IRunToolErrorCounter
+from protocore.contracts.run import (
+    IRunRefusedCallCounter,
+    IRunStore,
+    IRunToolErrorCounter,
+)
 from protocore.contracts.runtime_constants import RuntimeConstantsProvider
 from protocore.contracts.search import ISearchIndex
 from protocore.contracts.session import ISessionStore
@@ -240,6 +244,12 @@ class RunToolErrorCounterConformance(ContractSuite):
     protocol = IRunToolErrorCounter
 
 
+class RunRefusedCallCounterConformance(ContractSuite):
+    """The run-scoped tally of calls the wind-down turned away."""
+
+    protocol = IRunRefusedCallCounter
+
+
 class RuntimeConstantsProviderConformance(ContractSuite):
     """The source of a scope's runtime constants."""
 
@@ -328,6 +338,7 @@ SUITES: tuple[type[ContractSuite], ...] = (
     RequestManifestSinkConformance,
     RunStoreConformance,
     RunToolErrorCounterConformance,
+    RunRefusedCallCounterConformance,
     RuntimeConstantsProviderConformance,
     SearchIndexConformance,
     SessionStoreConformance,

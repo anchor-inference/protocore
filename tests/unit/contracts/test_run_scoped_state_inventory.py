@@ -77,6 +77,10 @@ _PROCESS_LOCAL: dict[str, str] = {
         "a telemetry sink is a handle the host wires into the process that is "
         "running, not a value about the run."
     ),
+    "refused_call_counter": (
+        "the refused-call tally is a telemetry handle the host wires into the "
+        "process that is running, exactly as the error counter above is."
+    ),
     "adaptive_safety_band": (
         "the band is a telemetry handle the host wires per process, exactly as "
         "the error counter above is."

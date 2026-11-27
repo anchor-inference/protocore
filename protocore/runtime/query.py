@@ -4599,6 +4599,7 @@ async def _stream_one_assistant_message(
                 # parity with the serial path's per-tool persist but
                 # batched to amortise the PG/Redis round-trip.
                 await engine._persist_snapshot()
+                await _report_refused_tool_calls(engine)
                 if flags.approval_pending or flags.terminal_tool_completed or self_verify_injected:
                     break
                 continue
@@ -4829,6 +4830,7 @@ async def _stream_one_assistant_message(
                             batch_drained = True
                     # One snapshot per batch (parity with the read fan-out).
                     await engine._persist_snapshot()
+                    await _report_refused_tool_calls(engine)
                     if (
                         flags.approval_pending
                         or flags.terminal_tool_completed
@@ -6968,6 +6970,7 @@ async def _drain_dispatch_tool_deferred(
     # still emits the structured error blocked envelope.
     if _terminal_only_blocks(engine, tool_call):
         error_message = _terminal_only_error_message(engine, tool_call.name)
+        _count_refused_tool_call(engine, tool_call)
         synthetic_event = TurnEvent(
             type=EventType.TOOL_RESULT,
             run_id=engine.config.run_id,
@@ -10553,37 +10556,51 @@ def _terminal_only_enforced(engine: QueryEngine) -> bool:
 def _terminal_only_blocks(
     engine: QueryEngine, tool_call: ToolCall
 ) -> bool:
-    """Return True iff ``tool_call`` should be rejected because terminal
-    finalisation is in effect.
+    """Return True iff ``tool_call`` should be refused because the wind-down
+    has withdrawn the tool surface.
 
     Predicate is True iff ALL of:
-      * STRICT terminal-only finalisation is in force for this tenant
-        (:func:`_terminal_only_enforced`: the durable deadline-finalize
-        latch). The best-effort error backstop turn is intentionally NOT
-        blocked.
-      * the terminal nudge latch ``engine._terminal_only_active``
-        is set (the per-turn loop flipped it when the deadline-finalize /
-        contract-repair nudge fired)
-      * a terminal tool name actually resolves
-        (:func:`_resolved_terminal_tool_name` is not None; honours the
-        per-tenant ``expected_terminal_tool``). With no resolvable terminal
-        tool there is nothing to force, so the guard never blocks.
+      * the wind-down has withdrawn the surface
+        (:func:`_terminal_only_enforced`). That is the fact the refusal is
+        about, and it is read directly rather than through the per-turn
+        terminal-only latch: the latch is cleared on every ``run()`` entry, so
+        a run continued after its wind-down began (a re-drive on another pod)
+        would otherwise fall through to the permission gate, whose "not in the
+        tenant visible set" is not what happened and which feeds the repeated-
+        error breaker. The best-effort error backstop turn is intentionally
+        NOT blocked: it does not withdraw the surface.
       * no successful terminal tool result is in history yet
-      * the tool being dispatched is NOT that resolved terminal tool name.
-
-    The single allowed tool while the latch is active is exactly
-    ``_resolved_terminal_tool_name(engine)``.
+      * the tool being dispatched is NOT on the surface the wind-down kept
+        (:func:`protocore.runtime.soft_stop.terminal_surface`): the configured
+        terminal tool and, while an artifact is open, the tool that seals it.
+        Reading the same set the model was shown keeps what it may call and
+        what it can call the same. A run with no terminal tool has nothing
+        callable left at all, so every call is refused: it ends by writing its
+        answer, and the refusal says so.
     """
     if not _terminal_only_enforced(engine):
         return False
-    if not getattr(engine, "_terminal_only_active", False):
-        return False
     if _history_has_terminal_tool_result(engine):
         return False
-    terminal_tool_name = _resolved_terminal_tool_name(engine)
-    if terminal_tool_name is None:
-        return False
-    return tool_call.name != terminal_tool_name
+    return tool_call.name not in _soft_stop.terminal_surface(engine)
+
+
+def _count_refused_tool_call(engine: QueryEngine, tool_call: ToolCall) -> None:
+    """Note a call the wind-down refused, to be reported once its snapshot is out.
+
+    The refusal runs without the dispatcher, which is where a failed call is
+    counted as a tool error — and this is not one: the tool was withdrawn, it
+    did not fail. So the call goes into its own tally, never into
+    ``tool_errors_count``, the repeated-error breaker or the error streak, and
+    the host is told with :func:`_report_refused_tool_calls` AFTER the snapshot
+    that holds the call's id has been written.
+    """
+    _soft_stop.record_refusal(engine, tool_call.id)
+
+
+async def _report_refused_tool_calls(engine: QueryEngine) -> None:
+    """Hand the calls refused since the last report to the host's counter."""
+    await _soft_stop.report_refusals(engine)
 
 
 def _terminal_only_error_message(
@@ -10592,19 +10609,21 @@ def _terminal_only_error_message(
     """Structured, model-visible error surfaced when the terminal-only
     guard blocks a non-terminal tool dispatch.
 
-    The message names BOTH the blocked tool and the resolved terminal tool
-    so the model gets an actionable instruction (call the terminal tool
-    now) rather than a silent drop. Keyed on the generic
-    ``expected_terminal_tool`` slot (NOT on any benchmark token); the guard
-    only fires once a terminal tool resolves, so the name is always present.
+    With a terminal tool the message names BOTH the blocked tool and that
+    tool, so the model gets an actionable instruction (call the terminal tool
+    now) rather than a silent drop. Without one there is nothing left to call,
+    and the message says the run is finishing and the answer is to be written
+    now from what was gathered. Keyed on the generic ``expected_terminal_tool``
+    slot (NOT on any benchmark token).
+
+    The reason is the bound the run actually reached (tool-call budget, turn
+    limit, deadline, ...), read off the wind-down's own cause. The message used
+    to blame the deadline whatever had ended the run, which sent every later
+    reader of a transcript looking for a clock that never ran out. Every text
+    is a run constant, overridable per tenant.
     """
-    terminal_tool_name = (
-        _resolved_terminal_tool_name(engine) or "the configured terminal tool"
-    )
-    return (
-        f"tool '{blocked_tool_name}' execution blocked: [terminal-only mode: "
-        f"deadline reached — call {terminal_tool_name} now with your "
-        "best-evidence answer]"
+    return _soft_stop.refusal_message(
+        engine, blocked_tool_name, _resolved_terminal_tool_name(engine)
     )
 
 
@@ -11100,6 +11119,10 @@ def _circuit_breaker_track_and_maybe_trip(
     # TRIP — hard-stop the tool for the rest of the run and inject ONE corrective
     # convergence turn.
     engine._circuit_broken_tools.add(tool_name)
+    # The refusal the model reads later quotes this number, so it is recorded
+    # here, from the value that decided the trip, rather than read again from
+    # constants that may have changed by then.
+    engine._circuit_breaker_trip_caps[tool_name] = cap
     _logger.warning(
         "DIAG query.circuit_breaker.tripped run=%s tenant=%s tool=%s "
         "error_class=%s count=%d cap=%d",
@@ -11799,6 +11822,7 @@ async def _dispatch_tool(
     # :func:`_terminal_only_blocks` for the full predicate.
     if _terminal_only_blocks(engine, tool_call):
         error_message = _terminal_only_error_message(engine, tool_call.name)
+        _count_refused_tool_call(engine, tool_call)
         yield TurnEvent(
             type=EventType.TOOL_RESULT,
             run_id=engine.config.run_id,
@@ -11827,6 +11851,7 @@ async def _dispatch_tool(
         )
         engine.forget_tool_name(tool_call.id)
         await engine._persist_snapshot()
+        await _report_refused_tool_calls(engine)
         return
 
     # Cumulative total-work guard — the serial twin of the one on the deferred

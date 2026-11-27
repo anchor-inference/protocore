@@ -1250,29 +1250,39 @@ class LoopConstants(BaseModel):
         default=80,
         ge=0,
         description=(
-            "Advisory SOFT cap on the cumulative number of tool calls the LEADER "
-            "agent makes in one run (NOT counting tool calls made inside "
-            "subagents — those run in their own engine and are counted against "
-            "``subagent_tool_call_soft_cap`` instead). When the leader's running "
-            "total reaches this, an advisory wrap-up notice is appended to the "
-            "tool result nudging the agent to finalize rather than start new "
-            "work, and the notice is repeated on every further call past the "
-            "cap. NEVER blocks execution — the hard bounds are "
-            "``max_turns_per_run`` and ``run_max_output_tokens_budget``. 0 "
-            "disables. Per-tenant overridable."
+            "Cumulative number of tool calls the LEADER agent may dispatch in "
+            "one run (NOT counting tool calls made inside subagents — those run "
+            "in their own engine and are counted against "
+            "``subagent_tool_call_soft_cap`` instead). The cap is checked at the "
+            "start of each assistant turn, not before each call: once the "
+            "running total has reached it, the run enters the wind-down "
+            "(``soft_stop_enabled``) — the model is told the budget is spent, "
+            "every tool except the terminal one is REMOVED from its surface, and "
+            "it must write its answer. A call refused after that is answered "
+            "with a terminal-only error that names the tool-call budget as the "
+            "cause. The calls of the assistant message that crossed the cap "
+            "still run, so the observed total can exceed the cap by up to one "
+            "message's worth of calls (``max_tool_calls_per_turn``). With "
+            "``soft_stop_enabled`` off the cap withdraws nothing and the run "
+            "continues past it; the hard bounds are then ``max_turns_per_run`` "
+            "and ``run_max_output_tokens_budget``. 0 disables the cap. "
+            "Per-tenant overridable."
         ),
     )
     subagent_tool_call_soft_cap: int = Field(
         default=40,
         ge=0,
         description=(
-            "Advisory SOFT cap on the cumulative number of tool calls a SUBAGENT "
-            "makes within its delegated run. On reaching it the subagent gets an "
-            "advisory wrap-up notice nudging it to call SubmitAnswer, and the "
-            "notice is repeated on every further call past the cap. "
-            "Separate from ``leader_tool_call_soft_cap`` so "
-            "subagent budgets are tuned independently. NEVER blocks. 0 disables. "
-            "Per-tenant overridable."
+            "Cumulative number of tool calls a SUBAGENT may dispatch within its "
+            "delegated run. Same mechanism as ``leader_tool_call_soft_cap``: "
+            "checked at the start of each assistant turn, and once reached the "
+            "subagent enters the wind-down — every tool is removed except the "
+            "terminal one the host configured for it (``expected_terminal_tool``; "
+            "a subagent with none keeps no tools) and it must answer from what "
+            "it has. "
+            "The calls of the message that crossed the cap still run. Separate "
+            "from ``leader_tool_call_soft_cap`` so subagent budgets are tuned "
+            "independently. 0 disables. Per-tenant overridable."
         ),
     )
     soft_stop_enabled: bool = Field(
@@ -1447,6 +1457,96 @@ class LoopConstants(BaseModel):
             "text (which tells the model the endpoint failed) would have it "
             "report an outage that did not happen. Empty string falls back to "
             "``soft_stop_notice_text``. Per-tenant overridable."
+        ),
+    )
+    soft_stop_refusal_text: str = Field(
+        default=(
+            "tool '{tool}' execution blocked: [terminal-only mode: {reason} — "
+            "call {terminal_tool} now with your best-evidence answer]"
+        ),
+        description=(
+            "What a call the wind-down refuses is answered with, when the run has "
+            "a terminal tool. The call is refused because the surface was "
+            "withdrawn when a bound was reached — the model reaches it from a "
+            "stale schema in its own context — and a bare \"not permitted\" would "
+            "leave it guessing. ``{tool}`` is the refused tool, ``{reason}`` the "
+            "bound that ended the run (``soft_stop_refusal_reason_<cause>``), "
+            "``{terminal_tool}`` the one tool still callable. Empty string "
+            "restores the default. Per-tenant overridable."
+        ),
+    )
+    soft_stop_refusal_text_no_terminal: str = Field(
+        default=(
+            "tool '{tool}' execution blocked: [the run is finishing ({reason}) "
+            "and no tools remain — answer now, in plain text, with what you "
+            "have already gathered]"
+        ),
+        description=(
+            "What a call the wind-down refuses is answered with, when the run has "
+            "NO terminal tool: such a run ends by writing its answer, so there "
+            "is nothing left to call and the model has to be told to answer "
+            "instead. Placeholders as in ``soft_stop_refusal_text`` except "
+            "``{terminal_tool}``, which does not apply. Empty string restores "
+            "the default. Per-tenant overridable."
+        ),
+    )
+    soft_stop_refusal_reason: str = Field(
+        default="the run is winding down",
+        description=(
+            "The ``{reason}`` given to a refused call when the wind-down names "
+            "no known cause (a snapshot written by a build that kept none). A "
+            "per-cause reason has its own default and does not fall back to "
+            "this one. Empty string restores the default. Per-tenant "
+            "overridable."
+        ),
+    )
+    soft_stop_refusal_reason_tool_call_budget: str = Field(
+        default="tool-call budget spent",
+        description=(
+            "The ``{reason}`` of a refused call when the wind-down began because "
+            "the tool-call budget was spent. Empty string restores "
+            "this default. Per-tenant overridable."
+        ),
+    )
+    soft_stop_refusal_reason_max_turns: str = Field(
+        default="turn limit reached",
+        description=(
+            "The ``{reason}`` of a refused call when the wind-down began because "
+            "the turn limit was reached. Empty string restores "
+            "this default. Per-tenant overridable."
+        ),
+    )
+    soft_stop_refusal_reason_output_token_budget: str = Field(
+        default="output-token budget spent",
+        description=(
+            "The ``{reason}`` of a refused call when the wind-down began because "
+            "the output-token budget was spent. Empty string restores "
+            "this default. Per-tenant overridable."
+        ),
+    )
+    soft_stop_refusal_reason_deadline: str = Field(
+        default="wall-clock deadline reached",
+        description=(
+            "The ``{reason}`` of a refused call when the wind-down began because "
+            "the wall-clock deadline was reached. Empty string restores "
+            "this default. Per-tenant overridable."
+        ),
+    )
+    soft_stop_refusal_reason_provider_error: str = Field(
+        default="the model provider stopped answering",
+        description=(
+            "The ``{reason}`` of a refused call when the wind-down began because "
+            "the model provider failed. Empty string restores "
+            "this default. Per-tenant overridable."
+        ),
+    )
+    soft_stop_refusal_reason_model_no_progress: str = Field(
+        default="the run stopped making progress",
+        description=(
+            "The ``{reason}`` of a refused call when the wind-down began because "
+            "the model kept returning reasoning with neither an answer nor a "
+            "tool call. Empty string restores this default. Per-tenant "
+            "overridable."
         ),
     )
     run_tool_call_ledger_max_entries: int = Field(
@@ -1770,6 +1870,29 @@ class LoopConstants(BaseModel):
             "this nudge earlier than the generic cap. The streak resets on a "
             "successful tool call or on any other error, so a brief outage "
             "does not lock the model out of the tool for the rest of the run."
+        ),
+    )
+    tool_disabled_refusal_text: str = Field(
+        default=(
+            "tool '{tool}' is disabled for the rest of this run after {count} "
+            "consecutive failures"
+        ),
+        description=(
+            "What a call to a tool the repeated-error breaker disabled is "
+            "answered with (``max_consecutive_tool_errors``). The tool is out of "
+            "the run for good, which is a different fact from a deny list the "
+            "operator maintains, and the model has to read it as one. ``{tool}`` "
+            "is the tool, ``{count}`` the streak length that tripped the breaker "
+            "for it. Empty string restores the default. Per-tenant overridable."
+        ),
+    )
+    tool_disabled_refusal_text_no_count: str = Field(
+        default="tool '{tool}' is disabled for the rest of this run after repeated failures",
+        description=(
+            "The same refusal as ``tool_disabled_refusal_text`` for a tool whose "
+            "tripping streak length was not recorded (a snapshot written by a "
+            "build that kept none). Empty string restores the default. "
+            "Per-tenant overridable."
         ),
     )
     max_consecutive_tool_errors: int = Field(
@@ -3986,6 +4109,21 @@ class LoopConstants(BaseModel):
             )
         return self
 
+
+def override_text(rc: object, name: str) -> str:
+    """The model-facing text constant ``name`` of ``rc``, its default when blank.
+
+    A text the host overrides to the empty string, or to whitespace only, means
+    "the default", not "say nothing": a refusal the model reads must say something. ``rc`` is
+    duck-typed — a run wired without constants gets the defaults.
+    """
+    value = getattr(rc, name, None)
+    if isinstance(value, str) and value.strip():
+        return value
+    default = LoopConstants.model_fields[name].default
+    return default if isinstance(default, str) else ""
+
+
 @runtime_checkable
 class RuntimeConstantsProvider(Protocol):
     """Provider Protocol — the host reads PG, watches Redis, builds snapshots.
@@ -3999,4 +4137,9 @@ class RuntimeConstantsProvider(Protocol):
         ...
 
 
-__all__ = ["LONG_RUN_LOOP_GUARD", "LoopConstants", "RuntimeConstantsProvider"]
+__all__ = [
+    "LONG_RUN_LOOP_GUARD",
+    "LoopConstants",
+    "RuntimeConstantsProvider",
+    "override_text",
+]

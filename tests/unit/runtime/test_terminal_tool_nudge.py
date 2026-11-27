@@ -486,11 +486,13 @@ def test_terminal_only_is_not_enforced_by_the_per_turn_latch_alone() -> None:
     assert _terminal_only_blocks(engine, non_terminal) is False
 
 
-def test_terminal_only_inert_for_default_tenant() -> None:
-    """Negative — a default tenant (no ``expected_terminal_tool``, no generic
-    RC) MUST never block, even if both latch fields are somehow set.
-    Universal-core opt-in only — there is no resolvable terminal tool to
-    force."""
+def test_terminal_only_without_a_terminal_tool_refuses_everything() -> None:
+    """A wound-down run with no terminal tool has nothing left to call.
+
+    The wind-down withdraws the whole surface of such a run, so every call is
+    a call off a stale schema: it is refused, with a message that says to
+    answer instead of naming a tool to call.
+    """
 
     from protocore.runtime import soft_stop as _soft_stop
 
@@ -498,11 +500,21 @@ def test_terminal_only_inert_for_default_tenant() -> None:
     engine = _build_engine(rc=rc, expected_terminal_tool=None)
     _soft_stop.enter(engine, cause_name=_soft_stop.CAUSE_DEADLINE)
     engine._terminal_only_active = True
-    # Enforce latch is set, but with no resolvable terminal tool the guard
-    # still cannot block.
     assert _resolved_terminal_tool_name(engine) is None
     non_terminal = ToolCall(name="remote_tree", arguments={})
-    assert _terminal_only_blocks(engine, non_terminal) is False
+    assert _terminal_only_blocks(engine, non_terminal) is True
+    assert "answer now" in _terminal_only_error_message(engine, "remote_tree")
+
+
+def test_terminal_only_is_inert_before_the_wind_down_withdraws_the_surface() -> None:
+    """A latch on its own, with no wind-down, blocks nothing."""
+    rc = LoopConstants(model_context_window=4_096)
+    engine = _build_engine(rc=rc, expected_terminal_tool=None)
+    engine._terminal_only_active = True
+
+    assert _terminal_only_blocks(
+        engine, ToolCall(name="remote_tree", arguments={})
+    ) is False
 
 
 # ---------------------------------------------------------------------------

@@ -1663,6 +1663,20 @@ class QueryEngine:
         self._circuit_broken_tools: set[str] = set()
         self._circuit_breaker_notified_tools: set[str] = set()
         self._circuit_breaker_streak: dict[str, Any] | None = None
+        # The streak length that tripped the breaker for each tool in
+        # ``_circuit_broken_tools``: the number the refusal quotes must be the
+        # one the breaker used, not whatever the cap reads as later.
+        self._circuit_breaker_trip_caps: dict[str, int] = {}
+
+        # Calls the wind-down refused, by call id — the run's refused-call
+        # tally (``refused_tool_calls_count``). A set of ids rather than a bare
+        # number so a call re-driven after a pod change is counted once.
+        # ``_refused_calls_unreported`` is what has not yet been handed to the
+        # host's counter; it is handed over only after the snapshot that holds
+        # the ids is written, so a pod lost in between loses a telemetry
+        # increment instead of counting the call twice.
+        self._refused_tool_call_ids: set[str] = set()
+        self._refused_calls_unreported: int = 0
 
         # Tool-precondition progress. ``_tool_precondition_index`` points at the
         # entry of ``config.tool_preconditions`` currently being forced; it
@@ -2304,6 +2318,7 @@ class QueryEngine:
 
         payload = dict(event.payload)
         payload["has_final_answer"] = self.has_final_answer
+        payload["refused_tool_calls_count"] = self.refused_tool_calls_count
         windup_cause = _soft_stop.cause(self)
         if windup_cause is not None:
             payload["soft_stop_cause"] = windup_cause
@@ -2450,6 +2465,17 @@ class QueryEngine:
         )
 
     @property
+    def refused_tool_calls_count(self) -> int:
+        """How many calls the wind-down turned away in this run.
+
+        Kept apart from the tool-error count on purpose: a withdrawn tool did
+        not fail, and a host that reports a run as partial when a tool failed
+        must not see that change because a model asked for a tool it was told
+        it no longer had.
+        """
+        return len(self._refused_tool_call_ids)
+
+    @property
     def has_final_answer(self) -> bool:
         """True iff this run has produced a visible assistant answer in prose.
 
@@ -2493,6 +2519,17 @@ class QueryEngine:
         # (``ToolPermissionGate.check`` Stage-1 reads ``policy.blocked``). Empty
         # for every run that never tripped the breaker ⇒ no-op.
         merged_blocked = base.blocked | frozenset(self._circuit_broken_tools)
+        # The refusal a gate stage hands the model must say WHY the tool is
+        # gone: a tool the breaker stopped is disabled until the run ends,
+        # which is not the same fact as a deny list someone maintains. A tool
+        # the host blocked as well keeps the host's wording.
+        # Derived from the breaker's own record and from nothing the host put on
+        # the base policy, so a host cannot relabel its block as the run's.
+        merged_run_disabled = {
+            name: self._circuit_breaker_trip_caps.get(name)
+            for name in self._circuit_broken_tools
+            if name not in base.blocked
+        }
         # Discovered tools join ``pinned`` so dispatch admits them under a
         # ``visible`` whitelist, exactly as it admits what it advertises — but
         # only the ones the host's policy admits on its own. ``pinned`` is
@@ -2516,6 +2553,7 @@ class QueryEngine:
             merged_floor == base.forced_pinned
             and merged_pins == base.pinned
             and merged_blocked == base.blocked
+            and merged_run_disabled == base.run_disabled
         ):
             policy = base
         else:
@@ -2524,6 +2562,7 @@ class QueryEngine:
                     "forced_pinned": merged_floor,
                     "pinned": merged_pins,
                     "blocked": merged_blocked,
+                    "run_disabled": merged_run_disabled,
                 }
             )
         from protocore.runtime.execution_profile import apply_execution_profile
@@ -3297,6 +3336,10 @@ class QueryEngine:
             # convergence turn. Sorted lists for deterministic snapshots (JSON has
             # no set type).
             "circuit_broken_tools": sorted(self._circuit_broken_tools),
+            "circuit_breaker_trip_caps": dict(
+                sorted(self._circuit_breaker_trip_caps.items())
+            ),
+            "refused_tool_call_ids": sorted(self._refused_tool_call_ids),
             "circuit_breaker_notified_tools": sorted(
                 self._circuit_breaker_notified_tools
             ),
@@ -3939,6 +3982,26 @@ class QueryEngine:
             if isinstance(restored_broken, list)
             else set()
         )
+        restored_caps = snapshot.get("circuit_breaker_trip_caps")
+        self._circuit_breaker_trip_caps = (
+            {
+                name: cap
+                for name, cap in restored_caps.items()
+                if isinstance(name, str)
+                and isinstance(cap, int)
+                and not isinstance(cap, bool)
+                and cap >= 2
+            }
+            if isinstance(restored_caps, dict)
+            else {}
+        )
+        restored_refused = snapshot.get("refused_tool_call_ids")
+        self._refused_tool_call_ids = (
+            {cid for cid in restored_refused if isinstance(cid, str)}
+            if isinstance(restored_refused, list)
+            else set()
+        )
+        self._refused_calls_unreported = 0
         restored_notified = snapshot.get("circuit_breaker_notified_tools")
         self._circuit_breaker_notified_tools = (
             {name for name in restored_notified if isinstance(name, str)}

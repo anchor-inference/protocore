@@ -85,7 +85,35 @@ class IRunToolErrorCounter(Protocol):
         ...
 
 
+@runtime_checkable
+class IRunRefusedCallCounter(Protocol):
+    """Adapter Protocol for atomic increments of a run's refused-call tally.
+
+    A call the run's wind-down turned away never reached a tool: nothing
+    failed, the tool was withdrawn. It is therefore NOT a tool error and is not
+    counted in ``tool_errors_count`` — a host that reports a run as partial
+    when a tool failed keeps reading that count as it always did. The refusals
+    are tallied here instead, so a run whose model kept asking for withdrawn
+    tools can still be told apart from one that simply finished.
+
+    Implementations MUST be atomic and non-raising, like
+    :class:`IRunToolErrorCounter`; the loop swallows a failure of this
+    telemetry rather than let it reach the run.
+    """
+
+    async def increment_refused_tool_calls_count(
+        self, run_id: str, by: int = 1
+    ) -> None:
+        """Add ``by`` (a positive integer) to the refused-call tally of ``run_id``.
+
+        A subagent's refusals are attributed to the root run, the id the host
+        keeps a row for. A missing ``run_id`` is a no-op.
+        """
+        ...
+
+
 __all__ = [
+    "IRunRefusedCallCounter",
     "IRunStore",
     "IRunToolErrorCounter",
     "RunNotFoundError",

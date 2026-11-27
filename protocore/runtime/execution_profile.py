@@ -67,6 +67,7 @@ def apply_execution_profile(
         forced_pinned=frozenset(
             name for name in policy.forced_pinned if name in allowed or name not in writing
         ),
+        run_disabled=policy.run_disabled,
     )
 
 
