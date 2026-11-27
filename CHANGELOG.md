@@ -32,6 +32,9 @@ All notable changes to this project are recorded here. The format follows
 - The descriptions of `leader_tool_call_soft_cap` and
   `subagent_tool_call_soft_cap` no longer say the cap never blocks: reaching
   it starts the wind-down and withdraws every tool but the terminal one.
+- The signature the consecutive-error counter hashes no longer changes between
+  retries that differ only in a value after a quoted URL. The URL match used to
+  swallow the closing quote, shifting the pairing of every later quoted span.
 
 ### Added
 
