@@ -600,9 +600,11 @@ _FILE_PATH_REGEX = re.compile(r"(?:/[a-zA-Z0-9_.-]+)+")
 # line then embeds a different one — so a single outage reads as a stream of
 # distinct errors to a counter that hashes the text. The classifier normally
 # collapses those failures first; this is what keeps the hash path honest
-# when it does not.
+# when it does not. The match stops at a quote character: a URL inside a quoted
+# value must leave the closing quote in place, or the quote pairing of the
+# text after it shifts and a later value is no longer recognised as quoted.
 _ERROR_URL_PATTERN = re.compile(
-    r"\b[a-z][a-z0-9+.-]*://\S+",
+    r"\b[a-z][a-z0-9+.-]*://[^\s'\"`]+",
     re.IGNORECASE,
 )
 

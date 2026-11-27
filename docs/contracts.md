@@ -91,7 +91,7 @@ the typed models that cross them. Two `__all__` lists matter:
 > Import them from `protocore.contracts` (or the specific module) rather than
 > the top-level package. `IProviderChain`, `IConstantsRegistry`,
 > `ICoreConstantsProvider`, `IRequestManifestSink`, `IDelegationTool`,
-> `IMemoryContentScanner`, `IRunToolErrorCounter`, `ITurnPolicy` and
+> `IMemoryContentScanner`, `IRunToolErrorCounter`, `IRunRefusedCallCounter`, `ITurnPolicy` and
 > `SkillFileRef` are not in `protocore.contracts.__all__` either — import them
 > from their own module.
 
@@ -139,6 +139,7 @@ concrete adapter. Each is one line: the contract and what a host supplies.
 | `ICoreConstantsProvider` | `contracts/config.py` | The `LoopConstants` snapshot in force for a scope, fresh as of the moment it is asked for. |
 | `IResilienceClassifier` | `contracts/resilience.py` | Which neutral `ResilienceErrorClass` a failure message describes. The wordings belong to whatever the host put behind its tools, and a pattern for them in core is a copy of another codebase that goes stale without a build ever failing. A host that binds none keeps the neutral behaviour: every failure is told apart by its own text and none is recognised as a transport being down. |
 | `IRunToolErrorCounter` | `contracts/run.py` | Durable per-run tool-error counting that survives a process change. |
+| `IRunRefusedCallCounter` | `contracts/run.py` | Durable per-run tally of the calls the wind-down turned away. Kept apart from the tool-error count on purpose: a withdrawn tool did not fail, so a host that reports a run as partial when a tool failed is not affected by it. Wired through `RunScopedState.refused_call_counter`; the run's own total is `QueryEngine.refused_tool_calls_count` and rides on the terminal `message_stop` as `refused_tool_calls_count`. |
 | `IMemoryContentScanner` | `contracts/memory.py` | Injection-scanning of memory content on the way in. |
 | `IProvenanceMemory` | `contracts/memory.py` | An `IMemory` whose `write` also takes `provenance=` and keeps it on the record. A separate contract so a store written against `IMemory` alone still conforms; `RememberTool(record_provenance=True)` requires it. |
 | `IMemoryWritePolicy` | `contracts/memory.py` | The host's say over a memory write before it lands: `async review(MemoryWriteRequest) -> MemoryWriteVerdict` classifies (kind, metadata, source refs, salience) or refuses with a message the model reads. Optional; `None` writes as before. |

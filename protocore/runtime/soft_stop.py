@@ -39,10 +39,13 @@ entering MEANS is this module's.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
 from protocore.contracts.llm import ProviderFailure
 from protocore.contracts.outcome import RunCause, RunOutcome
+from protocore.contracts.runtime_constants import LoopConstants, override_text
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.types import (
     SYNTHETIC_RECOVERY_METADATA_KEY,
@@ -92,6 +95,119 @@ CAUSES: Final[frozenset[str]] = frozenset(
 FAILING_CAUSES: Final[frozenset[str]] = frozenset(
     {CAUSE_PROVIDER_ERROR, CAUSE_MODEL_NO_PROGRESS}
 )
+
+
+#: The run-constant name of the general refusal reason; a cause's own is this
+#: with ``_<cause>`` appended.
+_REFUSAL_REASON_FIELD: Final[str] = "soft_stop_refusal_reason"
+
+#: The default wording of what each cause says about itself where a refused
+#: call is explained to the model. The refusal used to say "deadline reached"
+#: for every one of them, and a model told the clock ran out when it was the
+#: tool-call budget draws the wrong conclusion about what it can still ask for.
+#: Read-only, and read off the run constants' own defaults so the words live in
+#: one place; a run's own wording is :func:`refusal_reason`.
+CAUSE_REFUSAL_REASONS: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        name: str(LoopConstants.model_fields[f"{_REFUSAL_REASON_FIELD}_{name}"].default)
+        for name in sorted(CAUSES)
+    }
+)
+
+#: The default reason given when the wind-down is in force but names no known
+#: cause (a snapshot written by a build that kept none).
+REFUSAL_REASON_UNKNOWN: Final[str] = str(
+    LoopConstants.model_fields[_REFUSAL_REASON_FIELD].default
+)
+
+
+def refusal_reason(engine: QueryEngine) -> str:
+    """The reason to give a model whose call the wind-down refuses.
+
+    The run's constant for the bound that ended it. A cause whose own constant
+    is blank takes that cause's default wording, so clearing an override never
+    loses the cause; a wind-down that recorded no cause takes the general
+    reason, which itself falls back to its default.
+    """
+    rc = engine.config.rc
+    name = cause(engine)
+    if name == CAUSE_TOOL_CALL_BUDGET:
+        own = rc.soft_stop_refusal_reason_tool_call_budget
+    elif name == CAUSE_MAX_TURNS:
+        own = rc.soft_stop_refusal_reason_max_turns
+    elif name == CAUSE_OUTPUT_TOKEN_BUDGET:
+        own = rc.soft_stop_refusal_reason_output_token_budget
+    elif name == CAUSE_DEADLINE:
+        own = rc.soft_stop_refusal_reason_deadline
+    elif name == CAUSE_PROVIDER_ERROR:
+        own = rc.soft_stop_refusal_reason_provider_error
+    elif name == CAUSE_MODEL_NO_PROGRESS:
+        own = rc.soft_stop_refusal_reason_model_no_progress
+    else:
+        return override_text(rc, _REFUSAL_REASON_FIELD)
+    # A cleared field is its cause's own default, never the general reason: the
+    # cause is the fact the refusal exists to state.
+    return own if own.strip() else CAUSE_REFUSAL_REASONS[name]
+
+
+def refusal_message(
+    engine: QueryEngine, tool_name: str, terminal_tool: str | None
+) -> str:
+    """What a call the wind-down refuses is answered with.
+
+    With a terminal tool the model is told to call it; without one there is
+    nothing left to call, and it is told to write its answer instead.
+    """
+    rc = engine.config.rc
+    template = override_text(
+        rc,
+        "soft_stop_refusal_text"
+        if terminal_tool
+        else "soft_stop_refusal_text_no_terminal",
+    )
+    return (
+        template.replace("{tool}", tool_name)
+        .replace("{reason}", refusal_reason(engine))
+        .replace("{terminal_tool}", terminal_tool or "")
+    )
+
+
+def record_refusal(engine: QueryEngine, tool_call_id: str) -> None:
+    """Note that the wind-down refused the call ``tool_call_id``.
+
+    Idempotent per call id: a call re-driven after a pod change, with the id it
+    already had, is the same refusal and counts once.
+    """
+    ids = engine._refused_tool_call_ids
+    if tool_call_id in ids:
+        return
+    ids.add(tool_call_id)
+    engine._refused_calls_unreported += 1
+
+
+async def report_refusals(engine: QueryEngine) -> None:
+    """Hand the refusals not yet reported to the host's refused-call counter.
+
+    Called after the snapshot holding the call ids was written, never before:
+    reporting first and persisting second would, on a pod lost in between,
+    report the call again when the run is re-driven. Attributed to the root
+    run, like the tool-error count. Never raises — it is telemetry.
+    """
+    pending = engine._refused_calls_unreported
+    if pending <= 0:
+        return
+    engine._refused_calls_unreported = 0
+    state = engine.run_state
+    counter = state.refused_call_counter
+    if counter is None:
+        return
+    target = state.root_run_id or engine.config.run_id
+    try:
+        await counter.increment_refused_tool_calls_count(target, pending)
+    except Exception:
+        _logger.warning(
+            "refused_call_counter increment failed run_id=%s", target, exc_info=True
+        )
 
 
 def outcome_of(cause_name: str) -> RunOutcome:
@@ -427,12 +543,14 @@ __all__ = [
     "CAUSE_MODEL_NO_PROGRESS",
     "CAUSE_OUTPUT_TOKEN_BUDGET",
     "CAUSE_PROVIDER_ERROR",
+    "CAUSE_REFUSAL_REASONS",
     "CAUSE_TOOL_CALL_BUDGET",
     "FAILING_CAUSES",
     "NO_TOOL_SENTINEL",
     "REASON_FINALIZED",
     "REASON_NOTIFIED",
     "REASON_WITHDRAWN",
+    "REFUSAL_REASON_UNKNOWN",
     "STAGE_FINALIZED",
     "STAGE_NONE",
     "STAGE_NOTIFIED",

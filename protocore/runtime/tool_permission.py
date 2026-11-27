@@ -32,6 +32,7 @@ from typing import Any, Final, Protocol, runtime_checkable
 from urllib.parse import urlparse
 
 from protocore.contracts.hooks import HookActionKind, HookResult, IHookManager
+from protocore.contracts.runtime_constants import override_text
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.tool_roles import (
     EMPTY_TOOL_ROLE_MAP,
@@ -93,6 +94,27 @@ SIDE_EFFECT_SANDBOX: Final[str] = "sandbox"
 SIDE_EFFECT_HTTP: Final[str] = "http"
 SIDE_EFFECT_WORKSPACE: Final[str] = "workspace"
 SIDE_EFFECT_STATE_ONLY: Final[str] = "state_only"
+
+
+def _run_disabled_reason(
+    tool_name: str, streak: int | None, ctx: ToolContext
+) -> str:
+    """Why a tool the repeated-error breaker stopped is refused.
+
+    The breaker takes a tool out for the rest of the run after a streak of
+    consecutive failures; the model must read that, not a deny list it cannot
+    change. ``streak`` is the length that tripped the breaker for this tool,
+    recorded when it did, so the number quoted is the one the breaker used; a
+    tool whose streak was not recorded is described without a number. The
+    wording is the run's own constant.
+    """
+    rc = None if ctx.run_state is None else ctx.run_state.rc
+    if streak is None:
+        template = override_text(rc, "tool_disabled_refusal_text_no_count")
+    else:
+        template = override_text(rc, "tool_disabled_refusal_text")
+    return template.replace("{tool}", tool_name).replace("{count}", str(streak))
+
 
 def side_effect_class_for_roles(held: frozenset[ToolRole]) -> str | None:
     """The side-effect class a set of roles implies, or None when they imply none.
@@ -521,6 +543,14 @@ class ToolPermissionGate:
         """
         # Apply the whitelist.
         if visibility_policy.blocked and tool.name in visibility_policy.blocked:
+            if tool.name in visibility_policy.run_disabled:
+                return ToolPermissionDecision(
+                    outcome=ToolPermissionOutcome.deny,
+                    reason=_run_disabled_reason(
+                        tool.name, visibility_policy.run_disabled[tool.name], ctx
+                    ),
+                    stage=PermissionStage.whitelist,
+                )
             return ToolPermissionDecision(
                 outcome=ToolPermissionOutcome.deny,
                 reason=f"tool {tool.name!r} is on the tenant blocked list",

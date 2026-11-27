@@ -139,6 +139,7 @@ class RunScopedState:
 
     #: Telemetry sinks a host may wire. Duck-typed; absent means no telemetry.
     tool_error_counter: Any | None = None
+    refused_call_counter: Any | None = None
     adaptive_safety_band: Any | None = None
 
     #: The operator-supplied per-run envelope. Merged onto tool metadata with

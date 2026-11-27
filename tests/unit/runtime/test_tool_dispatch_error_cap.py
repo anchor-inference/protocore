@@ -840,6 +840,39 @@ def test_url_collapse_is_not_limited_to_one_address_family() -> None:
     assert a == b
 
 
+def test_url_in_quoted_value_keeps_later_quoted_spans_aligned() -> None:
+    """A quoted URL must not swallow its closing quote, or the quote pairing
+    after it shifts and a retry differing only in a later value hashes
+    differently.
+    """
+    a = ToolDispatcher._normalize_error_text(
+        "invalid arguments: {\"callback\": \"http://a.example/x\", \"limit\": \"ten\"}"
+    )
+    b = ToolDispatcher._normalize_error_text(
+        "invalid arguments: {\"callback\": \"http://a.example/x\", \"limit\": \"eleven\"}"
+    )
+    assert a == b
+    assert "http" not in a
+
+
+@pytest.mark.parametrize("quote", ["'", "`"])
+def test_url_inside_single_quotes_and_backticks(quote: str) -> None:
+    a = ToolDispatcher._normalize_error_text(
+        f"bad {quote}http://a.example/x{quote} then {quote}ten{quote}"
+    )
+    b = ToolDispatcher._normalize_error_text(
+        f"bad {quote}http://b.example/y{quote} then {quote}eleven{quote}"
+    )
+    assert a == b
+    assert "http" not in a
+
+
+def test_url_at_end_of_text_collapses() -> None:
+    a = ToolDispatcher._normalize_error_text("cannot reach http://a.example/x?q=1")
+    b = ToolDispatcher._normalize_error_text("cannot reach https://b.example:8443/y")
+    assert a == b == "cannot reach <url>"
+
+
 # ----------------------------------------------------------------------
 # Transport-down injection signal
 # ----------------------------------------------------------------------

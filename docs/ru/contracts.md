@@ -94,7 +94,7 @@ protocore/contracts/
 > пакета верхнего уровня `protocore`. Импортируйте их из `protocore.contracts`
 > (или из конкретного модуля), а не из пакета верхнего уровня. `IProviderChain`,
 > `IConstantsRegistry`, `ICoreConstantsProvider`, `IRequestManifestSink`,
-> `IDelegationTool`, `IMemoryContentScanner`, `IRunToolErrorCounter`,
+> `IDelegationTool`, `IMemoryContentScanner`, `IRunToolErrorCounter`, `IRunRefusedCallCounter`,
 > `ITurnPolicy` и `SkillFileRef` также не входят в
 > `protocore.contracts.__all__` — импортируйте их из собственного модуля.
 
@@ -142,6 +142,7 @@ protocore/contracts/
 | `ICoreConstantsProvider` | `contracts/config.py` | Снимок `LoopConstants`, действующий для области, свежий на момент запроса. |
 | `IResilienceClassifier` | `contracts/resilience.py` | К какому нейтральному `ResilienceErrorClass` относится сообщение об отказе. Формулировки принадлежат тому, что хост поставил за своими инструментами, и шаблон для них в ядре — копия чужой кодовой базы, которая протухает, ни разу не уронив сборку. Хост, не привязавший классификатор, сохраняет нейтральное поведение: каждый отказ различается по собственному тексту, и ни один не считается «транспорт лежит». |
 | `IRunToolErrorCounter` | `contracts/run.py` | Долговечный счёт ошибок инструментов на прогон, переживающий смену процесса. |
+| `IRunRefusedCallCounter` | `contracts/run.py` | Долговечный счёт вызовов, которые отклонил режим завершения. Отдельно от счёта ошибок инструментов: снятый инструмент не отказал, поэтому хост, помечающий прогон частичным при отказе инструмента, этим счётом не затрагивается. Подключается через `RunScopedState.refused_call_counter`; итог прогона — `QueryEngine.refused_tool_calls_count`, он же поле `refused_tool_calls_count` терминального `message_stop`. |
 | `IMemoryContentScanner` | `contracts/memory.py` | Сканирование содержимого памяти на инъекции при записи. |
 | `IProvenanceMemory` | `contracts/memory.py` | `IMemory`, чей `write` принимает ещё и `provenance=` и хранит его на записи. Отдельный контракт, чтобы хранилище, написанное только под `IMemory`, по-прежнему проходило проверку соответствия; его требует `RememberTool(record_provenance=True)`. |
 | `IMemoryWritePolicy` | `contracts/memory.py` | Слово хоста о записи в память до того, как она ляжет: `async review(MemoryWriteRequest) -> MemoryWriteVerdict` классифицирует (kind, metadata, source refs, salience) или отказывает с сообщением, которое прочтёт модель. Необязательна; `None` пишет как раньше. |
